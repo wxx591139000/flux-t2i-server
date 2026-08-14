@@ -1,0 +1,14 @@
+# 产物
+output/
+*.log
+__pycache__/
+*.pyc
+
+# 密钥/配置（绝不入库）
+.env
+*.token
+server/prompts.json        # 业务提示词不入库，用 example 模板
+
+# 系统
+.DS_Store
+Thumbs.db

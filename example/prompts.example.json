@@ -1,0 +1,21 @@
+{
+  "style_prefix": "cinematic, photorealistic, warm golden-hour light, 8k, detailed",
+  "ratio": "3:4",
+  "negative_prompt": "blurry, low quality, distorted, deformed, ugly, bad anatomy, bad hands, extra limbs, watermark, text, logo, signature, jpeg artifacts, oversaturated, overexposed, grainy, fake, cartoon",
+  "notes": [
+    {
+      "note": "示例：山中小屋",
+      "images": [
+        {"key": "cover", "prompt": "A cozy wooden cabin in a misty pine forest at golden hour, warm light glowing from windows, snow-capped mountains in background, cinematic wide shot"},
+        {"key": "P1", "prompt": "Close-up of a steaming mug of coffee on a rustic wooden table by a window, snow falling outside, warm cozy atmosphere, shallow depth of field"}
+      ]
+    },
+    {
+      "note": "示例：城市夜景",
+      "images": [
+        {"key": "cover", "prompt": "A bustling neon-lit city street at night in the rain, glowing signs reflecting on wet pavement, cinematic cyberpunk mood"},
+        {"key": "P1", "prompt": "A lone silhouette walking across a rooftop overlooking a sparkling city skyline at night, dramatic clouds, moody blue tones"}
+      ]
+    }
+  ]
+}
