@@ -24,6 +24,7 @@ if str(BASE_DIR) not in sys.path:
 from manager.flux_db import FluxDB
 from manager.feishu_notify import notify_owner
 from manager.flux_quota import current_ym
+from manager.prompt_translator import translate_to_flux_prompt, has_chinese
 import manager.flux_server_manager as fsm
 
 logger = logging.getLogger('manager.flux_queue')
@@ -55,6 +56,13 @@ class FluxQueueScheduler:
         if not prompt:
             return {'error': '提示词不能为空'}
 
+        # 0. 中文提示词 → FLUX 友好英文提示词（借鉴短剧 FLUX 方法论；LLM 失败返回原文）
+        original_prompt = prompt if has_chinese(prompt) else None
+        if original_prompt:
+            prompt = translate_to_flux_prompt(prompt)
+            if prompt != original_prompt:
+                logger.info(f'🌐 中文已转换: {original_prompt[:30]} → {prompt[:50]}...')
+
         # 1. 去重（同用户同提示词在排队/生成中）
         key = f'{user_id}:{prompt}'
         if key in self._inflight:
@@ -68,7 +76,7 @@ class FluxQueueScheduler:
             return {'error': f'队列已满（{QUEUE_MAX}），请稍后再试'}
 
         job_id = f'{int(time.time()*1000)}'
-        self.db.job_insert(job_id, user_id, prompt, priority)
+        self.db.job_insert(job_id, user_id, prompt, priority, original_prompt)
         self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
         self._inflight.add(key)
         self._seq += 1

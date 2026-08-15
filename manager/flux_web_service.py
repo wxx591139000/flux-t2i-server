@@ -84,7 +84,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _read_body(self):
         length = int(self.headers.get('Content-Length') or 0)
-        return self.rfile.read(length).decode('utf-8') if length else ''
+        if not length:
+            return ''
+        raw = self.rfile.read(length)
+        # 浏览器用 UTF-8，Windows curl 可能是 GBK；兜底 replace 避免崩溃
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return raw.decode('utf-8', errors='replace')
 
     def _get_token(self, q) -> str:
         """从 cookie / query 取 api token，无则生成。"""
@@ -262,8 +269,13 @@ def _render_jobs(jobs, token=''):
         else:
             img = '—'
         err = html.escape((j['error'] or '')[:60])
+        # 展示原始中文提示词（若有），英文为次要信息
+        disp = j.get('original_prompt') or j.get('prompt') or ''
+        full = html.escape(str(disp))[:60]
+        if j.get('original_prompt') and j.get('prompt') and j['original_prompt'] != j['prompt']:
+            full = f'{html.escape(str(j["original_prompt"])[:30])}<br><small style="color:#888">{html.escape(str(j["prompt"])[:40])}</small>'
         rows.append(f'<tr><td>{j["job_id"]}</td><td>{status}</td>'
-                    f'<td>{html.escape(j["prompt"][:60])}</td>'
+                    f'<td>{full}</td>'
                     f'<td>{img}</td><td>{err}</td>'
                     f'<td>{j["created_at"]}</td></tr>')
     if not rows:

@@ -2,12 +2,16 @@
 
 ## [v1.2] - 2026-08-15
 
-**对外文生图服务完善 + 二次归档**：新增网页下载按钮，更新 5 份核心文档与使用指南。
+**对外文生图服务完善 + 中文提示词智能转换**：网页下载按钮 + 借鉴短剧 FLUX 方法论的中文→英文提示词翻译。
 
 - 新增 `manager/flux_web_service.py`：每个已完成任务网页带「⬇ 下载」按钮；修图片 URL token 写死 `X` 的隐患，改为显式带当前用户 token
+- **新增 `manager/prompt_translator.py`**：中文提示词 → FLUX 友好英文提示词翻译器（借鉴短剧 `FLUX_SYSTEM_PROMPT` 方法论：静态场景/镜头/光线/构图/30-80词/技术质量标记；LLM 失败返回原文兜底）
+- **`flux_queue.py`**：submit() 入队前检测中文，自动调用转换
+- **`flux_db.py`**：jobs 表加 `original_prompt` 列（存原始中文）+ 幂等迁移
+- **`flux_web_service.py`**：任务表格展示原始中文 + FLUX 实际英文用词；`_read_body` 加 UTF-8 兜底（Windows curl GBK 中文 body）
 - 新增 `docs/USER_GUIDE.md`：用户使用指南（浏览器操作 + owner/API + 配额规则）
 - 新增 `docs/WEB_SERVICE.md`：对外服务架构文档
-- 更新 `docs/`：SPEC / ARCHITECTURE / TEST_PLAN / PITFALLS / PROGRESS 补 v1.1 对外服务内容
+- 更新 `docs/`：SPEC / ARCHITECTURE / TEST_PLAN / PITFALLS / PROGRESS 补 v1.1 对外服务 + v1.2 中文转换
 - 更新 `README.md`：v1.1 对外服务能力 + manager/ 目录结构
 
 **commit**: `归档: flux-t2i-server 2026-08-15`（v1.2） · **tag**: `archive-20260815-v2`

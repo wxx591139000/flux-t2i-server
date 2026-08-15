@@ -18,6 +18,14 @@
 - [x] `example/prompts.example.json`：通用提示词模板
 - [x] 山西旅游 7 篇 36 张配图全流程跑通并插入笔记
 
+### 中文提示词转换（v1.2）
+- [x] `manager/prompt_translator.py`：中文→FLUX 英文提示词翻译器（借鉴短剧 FLUX 方法论，LLM 失败返回原文）
+- [x] `flux_queue.py` submit() 入队前检测中文自动转换
+- [x] `flux_db.py` jobs 表加 `original_prompt` 列（存原始中文）
+- [x] `flux_web_service.py` 任务表格展示原始中文 + FLUX 实际用词
+- [x] E2E 验证：中文"一只橘猫坐在窗台上"→ 转英文 → FLUX 生成成功（PNG 有效）
+- [x] 修 `_read_body` UTF-8 兜底（Windows curl GBK 中文 body）
+
 ### 对外服务（v1.1）
 - [x] `manager/flux_service.py`：main 入口（wiring DB→quota→queue→web）
 - [x] `manager/flux_web_service.py`：网页提交页 + API + 认证（cookie/token）

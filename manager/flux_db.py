@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_id       TEXT PRIMARY KEY,
     user_id      TEXT NOT NULL,
     prompt       TEXT NOT NULL,
+    original_prompt TEXT,          -- 客户原始中文提示词（若经 LLM 转换）
     status       TEXT NOT NULL DEFAULT 'queued',
     priority     INTEGER NOT NULL DEFAULT 0,
     image_path   TEXT,
@@ -61,8 +62,20 @@ class FluxDB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._lock = threading_lock()
         logger.info(f'🗄️  数据库就绪: {self.path}')
+
+    def _migrate(self):
+        """幂等迁移：给已存在的表补缺失列（CREATE TABLE IF NOT EXISTS 不会改已有表）"""
+        try:
+            cols = {r[1] for r in self._conn.execute('PRAGMA table_info(jobs)')}
+            if 'original_prompt' not in cols:
+                self._conn.execute('ALTER TABLE jobs ADD COLUMN original_prompt TEXT')
+                self._conn.commit()
+                logger.info('🗄️  jobs 表已加 original_prompt 列')
+        except Exception as e:
+            logger.warning(f'数据库迁移跳过: {e}')
 
     def _exec(self, sql, params=()):
         with self._lock:
@@ -115,10 +128,10 @@ class FluxDB:
         return True
 
     # ── jobs ──
-    def job_insert(self, job_id, user_id, prompt, priority=0):
-        self._exec('INSERT INTO jobs(job_id, user_id, prompt, status, priority, created_at) '
-                   'VALUES(?,?,?,?,?,?)',
-                   (job_id, user_id, prompt, 'queued', priority, int(time.time())))
+    def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None):
+        self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, created_at) '
+                   'VALUES(?,?,?,?,?,?,?)',
+                   (job_id, user_id, prompt, original_prompt, 'queued', priority, int(time.time())))
 
     def job_update(self, job_id, **fields):
         sets = ', '.join(f'{k}=?' for k in fields)
