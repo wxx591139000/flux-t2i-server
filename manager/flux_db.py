@@ -153,6 +153,10 @@ class FluxDB:
                       (user_id,))
         return r['c'] if r else 0
 
+    def jobs_waiting(self):
+        """查询所有 waiting 状态的任务（服务器 down 等待恢复）"""
+        return self._all("SELECT * FROM jobs WHERE status='waiting' ORDER BY created_at ASC")
+
     # ── usage ──
     def usage_get(self, user_id: str, ym: str) -> int:
         r = self._one('SELECT count FROM usage WHERE user_id=? AND ym=?', (user_id, ym))

@@ -44,6 +44,7 @@ class FluxQueueScheduler:
         self._pq = queue.PriorityQueue()
         self._seq = 0
         self._inflight = set()          # 去重 user:prompt
+        self._waiting = set()           # 服务器 down 等待恢复池
         self._stop = threading.Event()
         self._worker_thread = None
         self._health_thread = None
@@ -86,6 +87,7 @@ class FluxQueueScheduler:
 
     # ── worker ──
     def start(self):
+        self._recover_stale_waiting()   # 启动时恢复上次遗留的 waiting 任务
         self._worker_thread = threading.Thread(target=self._run_worker, daemon=True, name='flux-worker')
         self._health_thread = threading.Thread(target=self._health_loop, daemon=True, name='flux-health')
         self._worker_thread.start()
@@ -115,17 +117,13 @@ class FluxQueueScheduler:
             self.db.job_update(job_id, status='done', completed_at=int(time.time()))
             logger.info(f'✅ {job_id} 完成')
         else:
-            # 服务器 down → 重排队（带重试计数）
+            # 服务器 down → 进等待恢复池（不失败、不立即重排，等健康监控检测到恢复后统一入队）
             if '[SERVER_DOWN]' in err:
                 retry = self._count_retry(job['error'] or '')
                 new_err = f'{err} [RETRY:{retry+1}]'
-                if retry < MAX_RETRY:
-                    self.db.job_update(job_id, status='queued', error=new_err)
-                    self._pq.put((job['priority'], -self._seq, job_id))
-                    self._seq += 1
-                    logger.warning(f'↻ {job_id} 服务器down，重排队({retry+1}/{MAX_RETRY})')
-                else:
-                    self.db.job_update(job_id, status='failed', error=new_err, completed_at=int(time.time()))
+                self.db.job_update(job_id, status='waiting', error=new_err)
+                self._waiting.add(job_id)
+                logger.warning(f'⏸ {job_id} 服务器down，进入等待恢复池 (retry {retry+1})')
             else:
                 self.db.job_update(job_id, status='failed', error=err, completed_at=int(time.time()))
                 logger.error(f'❌ {job_id} 失败: {err[:120]}')
@@ -191,7 +189,7 @@ class FluxQueueScheduler:
         self.db.job_update(job_id, image_path=str(pngs[0]))
         return True, ''
 
-    # ── 健康监控（对标转录bot _health_monitor_loop）──
+    # ── 健康监控（对标转录bot _health_monitor_loop + _recover_failed_tasks）──
     def _health_loop(self):
         while not self._stop.is_set():
             try:
@@ -205,9 +203,40 @@ class FluxQueueScheduler:
                                          f'请到 AutoDL 控制台开机（带卡模式）。')
                         except Exception as e:
                             logger.error(f'飞书通知失败: {e}')
+                elif fsm.server_reachable() and self._waiting:
+                    # 服务器恢复 → 自动重入队等待恢复的任务
+                    self._recover_waiting_tasks()
             except Exception as e:
                 logger.error(f'健康监控异常: {e}')
             time.sleep(30)
+
+    def _recover_waiting_tasks(self):
+        """服务器恢复时，把 waiting 的 [SERVER_DOWN] 任务重新入队。每任务最多恢复 MAX_RETRY 次。"""
+        while self._waiting:
+            job_id = self._waiting.pop()
+            job = self.db.job_get(job_id)
+            if not job:
+                continue
+            retry = self._count_retry(job['error'] or '')
+            if retry >= MAX_RETRY:
+                self.db.job_update(job_id, status='failed',
+                                   error=f'{job["error"] or ""} [RECOVER_SKIP]',
+                                   completed_at=int(time.time()))
+                logger.warning(f'⛔ {job_id} 恢复超限({retry})，标记失败')
+                continue
+            self.db.job_update(job_id, status='queued')
+            self._pq.put((job['priority'], -self._seq, job_id))
+            self._seq += 1
+            logger.info(f'🔄 {job_id} 服务器恢复，重新入队 (retry {retry+1})')
+
+    def _recover_stale_waiting(self):
+        """启动时扫描 DB 里残留的 waiting 任务，加入等待恢复池（防重启丢失）。"""
+        stale = self.db.jobs_waiting()
+        if not stale:
+            return
+        for j in stale:
+            self._waiting.add(j['job_id'])
+        logger.info(f'🔧 启动恢复 {len(stale)} 个遗留 waiting 任务，等待服务器恢复重试')
 
 
 def main():

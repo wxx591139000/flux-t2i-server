@@ -259,7 +259,7 @@ def _render_jobs(jobs, token=''):
     rows = []
     for j in jobs:
         status = j['status']
-        badge = {'queued': '排队中', 'generating': '生成中', 'done': '已完成', 'failed': '失败'}.get(status, status)
+        badge = {'queued': '排队中', 'generating': '生成中', 'waiting': '等待服务恢复', 'done': '已完成', 'failed': '失败'}.get(status, status)
         if status == 'done' and j['image_path']:
             dl = f'/api/download/{j["job_id"]}?token={token}'
             img = (f'<img src="{dl}" style="max-height:120px;border-radius:8px;display:block">'
@@ -269,11 +269,13 @@ def _render_jobs(jobs, token=''):
         else:
             img = '—'
         err = html.escape((j['error'] or '')[:60])
-        # 展示原始中文提示词（若有），英文为次要信息
-        disp = j.get('original_prompt') or j.get('prompt') or ''
-        full = html.escape(str(disp))[:60]
-        if j.get('original_prompt') and j.get('prompt') and j['original_prompt'] != j['prompt']:
-            full = f'{html.escape(str(j["original_prompt"])[:30])}<br><small style="color:#888">{html.escape(str(j["prompt"])[:40])}</small>'
+        # 展示原始中文提示词（若有），英文为次要信息（sqlite3.Row 用索引访问，无 .get()）
+        orig = j['original_prompt'] or ''
+        prompt = j['prompt'] or ''
+        if orig and orig != prompt:
+            full = f'{html.escape(str(orig)[:30])}<br><small style="color:#888">{html.escape(str(prompt)[:40])}</small>'
+        else:
+            full = html.escape(str(prompt))[:60]
         rows.append(f'<tr><td>{j["job_id"]}</td><td>{status}</td>'
                     f'<td>{full}</td>'
                     f'<td>{img}</td><td>{err}</td>'

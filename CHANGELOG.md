@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## [v1.4] - 2026-08-15
+
+**队列服务器恢复自动重试**（对齐转录 orchestrator 机制）：服务器 down 时任务不再失败，恢复后自动重试。
+
+- `flux_queue.py`：服务器 down 时任务进 `waiting` 池（不失败、不立即重排）；健康监控检测到恢复时 `_recover_waiting_tasks` 自动重入队；每任务最多恢复 3 次（防毒瘤）；启动时 `_recover_stale_waiting` 恢复遗留任务
+- `flux_db.py`：新增 `jobs_waiting()` 查询
+- `flux_web_service.py`：任务状态新增「等待服务恢复」
+- 单元测试通过：down→waiting 不失败→up→自动入队→生成完成；重试上限生效
+
 ## [v1.2] - 2026-08-15
 
 **对外文生图服务完善 + 中文提示词智能转换**：网页下载按钮 + 借鉴短剧 FLUX 方法论的中文→英文提示词翻译。

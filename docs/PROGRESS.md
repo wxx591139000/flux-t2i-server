@@ -18,6 +18,14 @@
 - [x] `example/prompts.example.json`：通用提示词模板
 - [x] 山西旅游 7 篇 36 张配图全流程跑通并插入笔记
 
+### 队列服务器恢复（v1.4）
+- [x] 服务器 down 时任务进 `waiting` 池（不失败、不立即重排）
+- [x] 健康监控检测到服务器恢复时 `_recover_waiting_tasks` 自动重入队
+- [x] 每任务最多恢复 3 次（防毒瘤），超限标 failed + `[RECOVER_SKIP]`
+- [x] 启动时 `_recover_stale_waiting` 恢复遗留 waiting 任务（防重启丢失）
+- [x] 网页状态新增「等待服务恢复」
+- [x] 单元测试：down→waiting 不失败→up→自动入队→生成完成；重试上限生效
+
 ### 中文提示词转换（v1.2）
 - [x] `manager/prompt_translator.py`：中文→FLUX 英文提示词翻译器（借鉴短剧 FLUX 方法论，LLM 失败返回原文）
 - [x] `flux_queue.py` submit() 入队前检测中文自动转换

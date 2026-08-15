@@ -34,6 +34,12 @@
 - **[08-15] 火山方舟 LLM 端点 404 → 短剧项目 `pipeline.py` 用 `{BASE}/v3/chat/completions`（OpenAI 兼容格式）+ model `deepseek-v4-flash-260425` → 对齐此调用方式；LLM 配置从 `~/.claude/settings.json` 的 env 读（非 shell 环境变量）**
 - **[08-15] Windows curl 发中文 body 按 GBK 编码 → 服务端 `_read_body` UTF-8 解码 UnicodeDecodeError，且 `errors='replace'` 后乱码导致 `has_chinese` 检测不到 → 服务端 `_read_body` 加 UTF-8 兜底；测试用 `--data-binary` + python urllib 发 UTF-8，勿用 curl 中文 body**
 
+## 队列服务器恢复（2026-08-15，v1.4）
+
+- **[08-15] 服务器 down 时任务重试 3 次就标 failed，恢复后无自动恢复机制 → 服务器恢复后任务永远失败，需手动重提 → 对齐转录 `orchestrator._recover_failed_tasks`：服务器 down 时任务进 `waiting` 池（不失败、不立即重排），健康监控检测到恢复时 `_recover_waiting_tasks` 自动重入队，每任务最多恢复 3 次（防毒瘤）**
+- **[08-15] 旧版 `_process` 服务器 down 用 `queue.put` 立即重排 → 几秒内打满 3 次 retry → 改为进 waiting 池由健康监控（30s）统一恢复，避免打满**
+- **[08-15] 曾因服务器 down 而 failed 的历史任务（retry 超限）不会自动恢复 → 需手动重置或重新提交（防毒瘤机制所致，非 bug）**
+
 ## 参考链接
 
 - 小红书侧原始记录：`ObsidW/审查/山西旅游-FLUX部署生成方案.md` 第 8 节
