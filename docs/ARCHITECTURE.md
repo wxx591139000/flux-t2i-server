@@ -1,6 +1,6 @@
 # 项目详细方案 — FLUX 文生图服务（通用）
 
-> 版本：v1.0 · 2026-08-15
+> 版本：v1.1 · 2026-08-15
 
 ## 系统架构图（文字描述）
 
@@ -47,6 +47,39 @@ start_gen.sh → [无卡?]abort → [模型未就绪?]abort → [已在跑?]skip
 watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? → scp上传 → start_gen.sh → 确认fluxgen → scp拉回 output/
 ```
 
+## 对外服务架构（v1.1）
+
+```
+公网用户(浏览器) ── cloudflared 隧道 flux.zhuanlu.xyz → localhost:9620 ──► flux_web_service.py
+                                                                            │ 网页提交提示词 / API / 激活码 / admin
+                                                                            ▼
+                                            flux_queue.py FluxQueueScheduler（优先队列 + 单worker串行）
+                                              │ 去重 → 配额precheck → 队列上限 → 入队
+                                              ▼
+                                         worker: SSH 调 FLUX 服务器(复用 flux_server_manager) → 生成 → 拉图 web_out/ → done
+                                              ▼
+                                    flux_db.py(SQLite) + flux_quota.py + plans.yaml
+```
+
+### 模块划分与职责（v1.1，全部在 `manager/`）
+
+| 模块 | 职责 |
+|---|---|
+| `flux_service.py` | main 入口，wiring DB→quota→queue→web + 健康监控 |
+| `flux_web_service.py` | 对外 HTTP 服务（stdlib http.server），网页 + API + 认证 |
+| `flux_queue.py` | 队列调度器（核心）：PriorityQueue + 单 worker，复用 manager SSH 函数 |
+| `flux_db.py` | SQLite 存储：users/codes/jobs/usage |
+| `flux_quota.py` | 月度图片配额（owner 无限） |
+| `plans.yaml` | 套餐（default/basic/pro，月度图片数） |
+| `feishu_notify.py` | 飞书通知（服务器 down 提醒开机） |
+| `flux_server_manager.py` | 服务器管理器（SSH生成+拉图+插稿+飞书），被 queue 复用 |
+
+### 提交门（v1.1，对标转录 orchestrator）
+```
+submit(user,prompt) → 去重(user:prompt) → 配额precheck → 队列上限 → 入队(priority, seq)
+worker: pop → SSH生成 → 拉图 web_out/<jobid>/ → done；服务器down → [SERVER_DOWN]重排队(3次)
+```
+
 ## 关键设计决策
 
 1. **diffusers 而非 ComfyUI**：服务器 github 被墙，ComfyUI git clone 失败；diffusers 纯 pip 可装
@@ -55,6 +88,8 @@ watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? 
 4. **分片权重而非单文件**：FLUX.1-dev 官方是 sharded，transformer 3 片 + T5 2 片；大小从 HF API 取真实 LFS 字节数
 5. **screen 后台**：可断 SSH，任务不中断
 6. **密钥环境变量化**：HF_TOKEN 从环境变量读，不硬编码（防 GitHub 泄露）
+7. **stdlib http.server + 单 worker 串行**（v1.1）：无框架依赖、GPU 单卡严格串行，队列 worker 单线程
+8. **Windows subprocess 用 bash -lc + UTF-8**（v1.1）：cmd.exe 错解析管道、GBK 崩中文、反斜杠路径当转义，见 PITFALLS
 
 ## 部署架构
 
@@ -64,3 +99,4 @@ watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? 
 - **SSH 别名**：`autodl-flux`（`~/.ssh/config`）
 - **下载镜像**：`HF_ENDPOINT=https://hf-mirror.com`；pip：`mirrors.aliyun.com`
 - **本地**：Windows，看门狗定时跑，结果拉回 `output/`
+- **对外服务**（v1.1）：本地 Windows 跑 `flux_service.py`（端口9620），公网挂本地 `xhs-tunnel`；遵守双隧道约定不抢道

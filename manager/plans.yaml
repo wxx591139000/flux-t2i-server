@@ -1,0 +1,10 @@
+# FLUX 对外文生图服务 — 套餐配置（月度图片配额，自然月口径）
+# monthly_images: 每月可生成图片数上限；-1 表示无限
+# owner 无限量，不受套餐约束
+plans:
+  default:
+    monthly_images: 10
+  basic:
+    monthly_images: 50
+  pro:
+    monthly_images: 200

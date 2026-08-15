@@ -62,4 +62,4 @@ for entry in "${FILES[@]}"; do
   dl_one "$rel" "$size" || { log "!! 失败: $rel"; }
 done
 log "===== 全部完成 ====="
-touch /root/DOWNLOAD_DONE
+touch "$MODEL/DOWNLOAD_DONE"   # 与 start_gen.sh / 看门狗检查位置一致

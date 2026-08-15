@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## [v1.2] - 2026-08-15
+
+**对外文生图服务完善 + 二次归档**：新增网页下载按钮，更新 5 份核心文档与使用指南。
+
+- 新增 `manager/flux_web_service.py`：每个已完成任务网页带「⬇ 下载」按钮；修图片 URL token 写死 `X` 的隐患，改为显式带当前用户 token
+- 新增 `docs/USER_GUIDE.md`：用户使用指南（浏览器操作 + owner/API + 配额规则）
+- 新增 `docs/WEB_SERVICE.md`：对外服务架构文档
+- 更新 `docs/`：SPEC / ARCHITECTURE / TEST_PLAN / PITFALLS / PROGRESS 补 v1.1 对外服务内容
+- 更新 `README.md`：v1.1 对外服务能力 + manager/ 目录结构
+
+**commit**: `归档: flux-t2i-server 2026-08-15`（v1.2） · **tag**: `archive-20260815-v2`
+
+## [v1.1] - 2026-08-15
+
+**对外文生图服务上线**（对标转录bot）：Web 提交 + 排队调度 + 配额计费 + 公网隧道。
+
+- 新增 `manager/`：`flux_service`(入口) / `flux_web_service`(网页+API) / `flux_queue`(队列调度) / `flux_db`(SQLite) / `flux_quota`(配额) / `plans.yaml`(套餐) / `feishu_notify`(飞书通知) / `flux_server_manager`(SSH生成)
+- 公网 `flux.zhuanlu.xyz`（本地 xhs-tunnel 加 ingress → localhost:9620）
+- 修 Windows subprocess 三坑：cmd.exe 管道 / GBK 解码 / 反斜杠路径
+- E2E 全链路实测通过（提交→生成→拉图→公网下载）
+
 ## [v1.0] - 2026-08-15
 
 **通用化落地**：将小红书场景的 FLUX 部署沉淀为通用文生图服务项目，与业务解耦。

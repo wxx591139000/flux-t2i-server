@@ -4,6 +4,12 @@ output/
 __pycache__/
 *.pyc
 
+# FLUX 对外服务运行时数据（不入库）
+data/
+web_out/
+manager/tmp_web_prompts.json
+manager/_owner_openid.txt
+
 # 密钥/配置（绝不入库）
 .env
 *.token

@@ -1,6 +1,6 @@
 # FLUX 文生图服务（通用）
 
-> 版本：v1.0 · 2026-08-15（归档：`archive-20260815`）
+> 版本：v1.2 · 2026-08-15（归档：`archive-20260815-v2`）
 > 自部署 FLUX.1 文生图服务，**与具体业务解耦，可服务所有文生图需求**（小红书配图、公众号配图、海报底图……）。
 > 基于 AutoDL VGPU 32G 服务器 + diffusers。
 
@@ -10,6 +10,7 @@
 - 🔔 **开机看门狗**（本地）：检测服务器开机+带卡 → 自动上传脚本 → 一键启动生成（对标转录 bot 机制）
 - ⏯️ **一键启动**（服务器）：`start_gen.sh` 幂等启动，screen 后台可断 SSH
 - ⏬ **curl 流式下载**：适配无卡 2GB 内存，断点续传（huggingface_hub 在无卡模式会失败，curl 绕开）
+- 🌐 **对外文生图服务**（v1.1 新增）：Web 提交提示词 + 排队调度 + 配额计费 + 公网 `flux.zhuanlu.xyz`。详见 `docs/WEB_SERVICE.md`
 
 ## 目录结构
 
@@ -22,9 +23,19 @@ flux-t2i-server/
 │   └── prompts.json        # (gitignored) 你的业务提示词
 ├── local/
 │   └── flux_gen_watchdog.py # 本地开机看门狗
+├── manager/                 # 对外服务 + 服务器管理（v1.1）
+│   ├── flux_service.py     # main 入口（DB→quota→queue→web）
+│   ├── flux_web_service.py # 对外 HTTP 服务（网页+API）
+│   ├── flux_queue.py       # 队列调度器（单worker串行）
+│   ├── flux_db.py          # SQLite 存储
+│   ├── flux_quota.py       # 月度配额
+│   ├── plans.yaml          # 套餐
+│   ├── flux_server_manager.py # 服务器管理器（SSH生成+拉图+飞书）
+│   └── feishu_notify.py    # 飞书通知
 ├── example/
 │   └── prompts.example.json # 通用提示词模板
 ├── output/                  # (gitignored) 生成结果拉回本地
+├── web_out/                 # (gitignored) 对外服务生成图
 └── docs/                    # 归档文档
 ```
 
