@@ -41,36 +41,48 @@ class QuotaService:
         self.db = db
         self.plans = load_plans()
 
-    def get_plan(self, user_id: str) -> dict:
+    def effective(self, user_id: str) -> dict:
+        """账户聚合口径：绑账户则套餐/owner/用量按账户；否则按 token 自身（自账户）。"""
+        acct = None
+        acct_id = self.db.account_id_of(user_id)
+        if acct_id:
+            acct = self.db.account_get(acct_id)
+        if acct:
+            return {'account_id': acct['account_id'], 'plan': acct['plan'],
+                    'is_owner': acct['is_owner'], 'used': self.db.account_usage(acct_id, current_ym()),
+                    'inflight': self.db.account_inflight(acct_id)}
         u = self.db.get_user(user_id)
-        plan_name = u['plan'] if u else 'default'
-        return self.plans.get(plan_name, self.plans.get('default', {}))
+        return {'account_id': '', 'plan': u['plan'] if u else 'default',
+                'is_owner': bool(u and u['is_owner']),
+                'used': self.db.usage_get(user_id, current_ym()),
+                'inflight': self.db.job_count_queued(user_id)}
+
+    def get_plan(self, user_id: str) -> dict:
+        return self.plans.get(self.effective(user_id)['plan'], self.plans.get('default', {}))
 
     def precheck(self, user_id: str) -> tuple:
-        """检查是否可提交新任务。返回 (ok, reason)"""
-        u = self.db.get_user(user_id)
-        if u and u['is_owner']:
+        """检查是否可提交新任务（账户聚合口径）。返回 (ok, reason)"""
+        eff = self.effective(user_id)
+        if eff['is_owner']:
             return True, ''
-        plan = self.get_plan(user_id)
-        limit = plan.get('monthly_images', -1)
+        limit = self.plans.get(eff['plan'], {}).get('monthly_images', -1)
         if limit is None or limit < 0:
             return True, ''
-        used = self.db.usage_get(user_id, current_ym())
-        inflight = self.db.job_count_queued(user_id)
+        used, inflight = eff['used'], eff['inflight']
         if used + inflight >= limit:
             return False, f'本月配额已用 {used}/{limit} 张，可升级套餐或下月再试'
         return True, ''
 
     def record_enqueued(self, user_id: str):
+        # 仍按 token 落账，聚合时按账户（对齐转录：用量按身份落账，quota 按账户聚合）
         self.db.usage_add(user_id, current_ym(), 1)
 
     def usage_summary(self, user_id: str) -> str:
-        u = self.db.get_user(user_id)
-        if u and u['is_owner']:
+        eff = self.effective(user_id)
+        if eff['is_owner']:
             return 'owner 无限量'
-        plan = self.get_plan(user_id)
-        limit = plan.get('monthly_images', -1)
-        used = self.db.usage_get(user_id, current_ym())
+        limit = self.plans.get(eff['plan'], {}).get('monthly_images', -1)
+        used = eff['used']
         if limit is None or limit < 0:
             return f'本月已用 {used} 张（无限）'
         return f'本月已用 {used}/{limit} 张'

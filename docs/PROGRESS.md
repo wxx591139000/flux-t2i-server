@@ -1,14 +1,26 @@
 # 项目推进进度 — FLUX 文生图服务（通用）
 
-> 版本：v1.1 · 2026-08-15
+> 版本：v1.5 · 2026-08-16
 
 ## 里程碑回顾
 
 - **2026-08-14**：小红书场景下最初部署 FLUX（山西旅游配图），踩坑记录到方案文档
 - **2026-08-15**：沉淀为**通用项目** `flux-t2i-server`，与小红书解耦；完成 curl 流式下载解法；全流程跑通（下载32GB→切带卡→生成36张→拉回→智能插入7篇笔记）
 - **2026-08-15（同日 v1.1）**：新增**对外文生图服务**（对标转录bot）：Web 提交 + 排队调度 + 配额计费 + 公网隧道 `flux.zhuanlu.xyz`；E2E 全链路实测通过
+- **2026-08-16（v1.5）**：新增**商户管理中心 `/admin`**（借鉴转录项目 admin.html，管理套餐/token/激活码）+ **账户化改造**（激活码=账户，多设备绑定共享套餐，用量按账户聚合，商家按客户管理）
 
 ## 已完成功能清单
+
+### 商户管理中心 + 账户化（v1.5）
+- [x] `/admin` 商户管理中心（借鉴转录项目 admin.html）：`X-Admin-Token` 头鉴权 = `WEB_ADMIN_TOKEN`
+- [x] 激活码：8 位去混淆字符集、`status/expires_at/remark`、生成 `count 1-100` 校验、全码统计表、改备注、下钻
+- [x] 激活码=账户：`accounts` 表 + `users.account_id` 迁移 + 已有 active 码回填
+- [x] `code_activate` 建账户 + 新增 `code_bind`（换设备并入账户）
+- [x] 用量账户聚合：`quota.effective()`（绑账户则套餐/用量/owner 按账户，未绑自账户向后兼容）
+- [x] `accounts`/`codes` 迁移 + 账户方法（create/bind/usage/inflight/tokens/list）
+- [x] 新增 `/api/bind`、`/api/my`；客户页「激活/绑定账户」框
+- [x] admin 按「客户/账户」管理：账户/客户名/套餐/用量聚合/设备数/详情（账户下所有 token）
+- [x] E2E 验证：激活建账户→多设备绑定→用量聚合→账户详情→set_plan/set_owner→未绑 token 独立
 
 ### 核心文生图（v1.0）
 - [x] `server/gen_flux.py`：diffusers 批量文生图（bf16 + CPU offload，分组输出，断点跳过）

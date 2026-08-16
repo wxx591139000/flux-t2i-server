@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## [v1.5] - 2026-08-16
+
+**商户管理中心 `\admin` + 账户化改造**（成套借鉴转录项目 admin.html + account 模型）。
+
+### 商户管理中心 `/admin`（借鉴转录项目 admin.html）
+- **鉴权**：`X-Admin-Token` / `Authorization: Bearer` 头 = `WEB_ADMIN_TOKEN`（非 cookie，页面存 localStorage）
+- **激活码**：8 位去混淆字符集（`ABCDEFGHJKMNPQRSTUVWXYZ23456789`）、`status`(unused/active)/`expires_at`/`remark`、生成 `count 1-100` 校验
+- **管理面板**：生成激活码表单 + 全码统计表 + 改备注 + 下钻 + 用户管理（套餐/owner/用量）+ 最近任务
+- `flux_db.py`：codes 表迁移加 `created_at/expires_at/remark/status` 列；`code_generate` 改 secrets 去混淆 8 位；新增 `list_users/list_codes/list_jobs/search_users/code_set_remark`
+- `flux_web_service.py`：新增 `/admin` 面板 + 8 个 admin API（users/codes/jobs/gen_codes/set_remark/set_plan/set_owner/search）
+
+### 账户化改造（借鉴转录项目 account 模型）
+- **激活码=账户**：一客户一账户，客户任意 token「绑定激活码」并入同一账户，多设备**共享一份套餐**
+- **用量按账户聚合**：`users` 加 `account_id` 列；`quota.effective()` 按账户聚合（绑账户则套餐/用量/owner 取账户，否则自账户向后兼容）
+- **商家按客户管理**：admin 主表改为「客户/账户」维度（账户/客户名/套餐/用量/设备数/详情），账户详情列出关联 token
+- `flux_db.py`：`accounts` 表 + 账户方法（create/bind/usage/inflight/list）+ `code_activate` 建账户、新增 `code_bind` + 已有 active 码回填
+- `flux_web_service.py`：激活改账户 + 新增 `/api/bind`、`/api/my` + 客户页「激活/绑定账户」框 + admin 账户维度界面
+- E2E 验证通过：激活建账户→多设备绑定→用量聚合→账户详情→set_plan/set_owner→未绑 token 独立
+
 ## [v1.4] - 2026-08-15
 
 **队列服务器恢复自动重试**（对齐转录 orchestrator 机制）：服务器 down 时任务不再失败，恢复后自动重试。
