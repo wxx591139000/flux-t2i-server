@@ -152,6 +152,13 @@ class FluxDB:
                    (user_id, plan, is_owner, int(time.time())))
         return self.get_user(user_id)
 
+    def user_ensure(self, user_id: str) -> dict:
+        """确保用户存在（不存在则创建），返回用户记录。飞书 bot 等非 web 入口用。"""
+        u = self.get_user(user_id)
+        if u:
+            return u
+        return self.create_user(user_id)
+
     def set_plan(self, user_id: str, plan: str):
         self._exec('UPDATE users SET plan=? WHERE user_id=?', (plan, user_id))
 

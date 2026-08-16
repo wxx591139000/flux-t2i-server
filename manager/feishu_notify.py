@@ -102,6 +102,50 @@ class FeishuNotifier:
             raise RuntimeError('FEISHU_OWNER_OPEN_ID 未配置')
         return self.send_direct(oid, text)
 
+    # ── 图片发送（飞书 API：先上传 /open-apis/im/v1/images → 再发图片消息）──
+    def upload_image(self, image_path: str):
+        """上传本地图片到飞书，返回 image_key；失败返回 None"""
+        path = Path(image_path)
+        if not path.exists():
+            logger.error(f'图片文件不存在: {path}')
+            return None
+        headers = {'Authorization': f'Bearer {self.get_tenant_token()}'}
+        try:
+            with open(str(path), 'rb') as f:
+                resp = requests.post(
+                    f'{API}/open-apis/im/v1/images',
+                    headers=headers,
+                    files={'image': (path.name, f)},
+                    data={'image_type': 'message'},
+                    timeout=120)
+            result = resp.json()
+            if result.get('code') == 0:
+                return result['data']['image_key']
+            logger.error(f'飞书图片上传失败: {result}')
+        except Exception as e:
+            logger.error(f'飞书图片上传异常: {e}')
+        return None
+
+    def send_image(self, user_id: str, image_key: str) -> bool:
+        """发送图片消息给指定用户（私聊）"""
+        if not image_key:
+            return False
+        result = self._post(
+            '/open-apis/im/v1/messages?receive_id_type=open_id',
+            {'receive_id': user_id, 'msg_type': 'image',
+             'content': json.dumps({'image_key': image_key})})
+        if result.get('code') == 0:
+            return True
+        logger.error(f'飞书图片消息发送失败: {result}')
+        return False
+
+    def send_image_direct(self, user_id: str, image_path: str) -> bool:
+        """便捷：上传图片 + 发送一条图片消息"""
+        key = self.upload_image(image_path)
+        if not key:
+            return False
+        return self.send_image(user_id, key)
+
 
 def notify_owner(text: str) -> bool:
     """便捷函数：发飞书私信给 owner"""

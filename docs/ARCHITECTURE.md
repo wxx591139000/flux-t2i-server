@@ -1,6 +1,6 @@
 # 项目详细方案 — FLUX 文生图服务（通用）
 
-> 版本：v1.1 · 2026-08-15
+> 版本：v1.7 · 2026-08-16
 
 ## 系统架构图（文字描述）
 
@@ -65,14 +65,34 @@ watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? 
 
 | 模块 | 职责 |
 |---|---|
-| `flux_service.py` | main 入口，wiring DB→quota→queue→web + 健康监控 |
+| `flux_service.py` | main 入口，wiring DB→quota→queue→web→feishu_bot + 健康监控 |
 | `flux_web_service.py` | 对外 HTTP 服务（stdlib http.server），网页 + API + 认证 |
 | `flux_queue.py` | 队列调度器（核心）：PriorityQueue + 单 worker，复用 manager SSH 函数 |
-| `flux_db.py` | SQLite 存储：users/codes/jobs/usage |
+| `flux_db.py` | SQLite 存储：users/codes/jobs/usage + `user_ensure` |
 | `flux_quota.py` | 月度图片配额（owner 无限） |
 | `plans.yaml` | 套餐（default/basic/pro，月度图片数） |
-| `feishu_notify.py` | 飞书通知（服务器 down 提醒开机） |
+| `feishu_notify.py` | 飞书通知（私信 + 图片上传/回传） |
+| `feishu_bot.py` | 飞书"图图"对话式出图机器人（v1.7）：WS 监听 + 轮询回传 |
 | `flux_server_manager.py` | 服务器管理器（SSH生成+拉图+插稿+飞书），被 queue 复用 |
+
+### 飞书"图图"对话式出图（v1.7）
+
+```
+飞书用户 ── P2P 私聊发提示词 ──► lark_oapi WS 长连接 (feishu_bot._ws_listen)
+                                    │  p2_im_message_receive_v1 事件
+                                    ▼
+                            _handle_prompt(open_id, text)
+                              │ user_ensure(open_id)   # open_id 即 user_id
+                              │ scheduler.submit()      # 复用队列：中文翻译/配额/去重/入队
+                              ▼
+                        确认回执（任务号+用量）
+                              │
+                              ▼
+                        _poll_loop 每5秒轮询 job status
+                              │ done ──► upload_image() → send_image() → 图片回传
+                              │ failed ─► 回错误
+                              │ waiting ─► 通知服务器恢复中
+```
 
 ### 提交门（v1.1，对标转录 orchestrator）
 ```

@@ -21,6 +21,7 @@ from manager.flux_db import FluxDB
 from manager.flux_quota import QuotaService
 from manager.flux_queue import FluxQueueScheduler
 from manager.flux_web_service import FluxWebServer
+from manager.feishu_bot import FeishuBot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,9 +47,12 @@ def main():
 
     scheduler.start()
     web.start()
+    bot = FeishuBot(scheduler, db, quota)
+    bot.start()
 
     log.info(f'   Web: http://localhost:{args.port}')
     log.info(f'   队列调度器: 单 worker 串行')
+    log.info(f'   飞书图图机器人: 对话式出图')
 
     try:
         while True:

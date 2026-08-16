@@ -2,6 +2,12 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 飞书对话式出图（2026-08-16，v1.7）
+
+- **[08-16] 飞书发图必须两步走 → 飞书图片消息不支持直接发二进制 → 先 `POST /open-apis/im/v1/images`（multipart，`image_type=message`）拿 `image_key`，再发 `msg_type=image` + `content={"image_key":...}`（与发文件 `/open-apis/im/v1/files` + `file_key` 结构等价）**
+- **[08-16] lark_oapi WS 事件数据与轮询 REST 字段不同 → WS 用 `message.message_type`（非 `msg_type`）、`content` 在顶层、`message.chat_type` 判私聊 → 按 WS 结构解析，勿照抄 REST 字段名**
+- **[08-16] 飞书 WS 长连接需 `lark-oapi` 依赖 → 未装则机器人静默不监听 → `_ws_listen` 内 try/except 导入并打错误日志，服务不崩**
+
 ## 商户管理中心 / 账户化（2026-08-16，v1.5）
 
 - **[08-16] 管理页点登录没反应 → admin.html 是嵌入 Python `.format()` 模板，JS 花括号要写两遍（`{}`→`{{}}`），`tb.appendChild(tr);}}))}}` 多写一个右括号 → 渲染成 `}))}`（多一个 `)`），整个 `<script>` 语法错误不执行 → 用 `node --check` 校验服务端渲染出的 JS，修正为 `}})` + `}}`（`}})}}`）**

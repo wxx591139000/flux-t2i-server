@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## [v1.7] - 2026-08-16
+
+**飞书"图图"对话式出图机器人**：从单向通知器升级为可对话出图，飞书私聊发提示词 → 生成后图片回传。
+
+- 新增 `manager/feishu_bot.py`：WebSocket 长连接监听 P2P 私聊（借鉴转录bot"小白" feishu_channel 范式），收到文本 → `scheduler.submit(open_id, prompt)` → 确认消息 + 用量 → 轮询线程检测完成 → 上传图片回传
+- `manager/feishu_notify.py`：新增 `upload_image()` / `send_image()` / `send_image_direct()`（飞书图片上传 `/open-apis/im/v1/images` + 图片消息发送）
+- `manager/flux_db.py`：新增 `user_ensure()`（飞书 open_id 即 user_id，首次自动建用户）
+- `manager/flux_service.py`：主入口集成 bot 启动（凭证从 .env 读，未配置则不启动）
+- 设计：同进程内嵌直接调 scheduler（不走 HTTP）；owner（自己）通过 bot 无限量；每用户最多 1 个在途任务；首版仅 P2P 私聊、纯文生图（斜杠命令给提示语）
+
+**验证**：图片回传链路实测通过（飞书收到测试图）；对话逻辑模拟通过（确认/在途拦截/配额/完成后回图）；服务重启 bot 激活，web 不受影响（本地+公网 200）
+
 ## [v1.6] - 2026-08-16
 
 **新增两份使用 SOP 文档**（纯文档变更，无代码改动）。

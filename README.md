@@ -1,6 +1,6 @@
 # FLUX 文生图服务（通用）
 
-> 版本：v1.6 · 2026-08-16（归档：`archive-20260816-v2`）
+> 版本：v1.7 · 2026-08-16（归档：`archive-20260816-v3`）
 > 自部署 FLUX.1 文生图服务，**与具体业务解耦，可服务所有文生图需求**（小红书配图、公众号配图、海报底图……）。
 > 基于 AutoDL VGPU 32G 服务器 + diffusers。
 
@@ -15,6 +15,7 @@
 - 🔄 **队列服务器恢复自动重试**（v1.4 新增）：服务器 down 时任务进等待恢复池（不失败、不反复重试），健康监控检测到恢复后自动重新入队继续生成，全程无需手动介入。重试上限防毒瘤
 - 👤 **商户管理中心 `/admin`**（v1.5 新增）：借鉴转录项目 admin.html，管理用户套餐/token/激活码（生成码、统计、改备注、下钻）。管理员登录 `X-Admin-Token` = `WEB_ADMIN_TOKEN`
 - 🔗 **账户化**（v1.5 新增）：激活码=账户，客户多设备「绑定激活码」共享一份套餐，用量按账户聚合；商家按「客户/账户」管理（客户名/用量/设备数/详情）
+- 💬 **飞书"图图"对话式出图**（v1.7 新增）：在飞书私聊发提示词 → 接入 FLUX 队列生成 → 完成后图片直接回传飞书对话。借鉴转录bot"小白"的 WebSocket 长连接范式，支持中文提示词自动翻译
 
 ## 目录结构
 
@@ -28,14 +29,15 @@ flux-t2i-server/
 ├── local/
 │   └── flux_gen_watchdog.py # 本地开机看门狗
 ├── manager/                 # 对外服务 + 服务器管理（v1.1）
-│   ├── flux_service.py     # main 入口（DB→quota→queue→web）
+│   ├── flux_service.py     # main 入口（DB→quota→queue→web→飞书bot）
 │   ├── flux_web_service.py # 对外 HTTP 服务（网页+API）
 │   ├── flux_queue.py       # 队列调度器（单worker串行）
 │   ├── flux_db.py          # SQLite 存储
 │   ├── flux_quota.py       # 月度配额
 │   ├── plans.yaml          # 套餐
 │   ├── flux_server_manager.py # 服务器管理器（SSH生成+拉图+飞书）
-│   └── feishu_notify.py    # 飞书通知
+│   ├── feishu_notify.py    # 飞书通知（含图片上传/回传）
+│   └── feishu_bot.py       # 飞书"图图"对话式出图机器人（v1.7）
 ├── example/
 │   └── prompts.example.json # 通用提示词模板
 ├── output/                  # (gitignored) 生成结果拉回本地
@@ -49,6 +51,7 @@ flux-t2i-server/
 - 📗 `docs/flux服务-用户使用SOP.md` — 普通用户从零到生成图的完整 SOP（提示词、套餐、激活/绑定账户、换设备、FAQ）
 - `docs/USER_GUIDE.md` — 用户使用指南（浏览器 + owner/API + 配额规则）
 - `docs/WEB_SERVICE.md` — 对外服务架构文档
+- 💬 **飞书出图**：飞书私聊"图图"机器人，直接发提示词（支持中文）即可出图，生成后图片回传对话
 
 ## 快速开始
 
