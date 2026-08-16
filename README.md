@@ -1,6 +1,6 @@
 # FLUX 文生图服务（通用）
 
-> 版本：v1.5 · 2026-08-16（归档：`archive-20260816`）
+> 版本：v1.6 · 2026-08-16（归档：`archive-20260816-v2`）
 > 自部署 FLUX.1 文生图服务，**与具体业务解耦，可服务所有文生图需求**（小红书配图、公众号配图、海报底图……）。
 > 基于 AutoDL VGPU 32G 服务器 + diffusers。
 
@@ -42,6 +42,13 @@ flux-t2i-server/
 ├── web_out/                 # (gitignored) 对外服务生成图
 └── docs/                    # 归档文档
 ```
+
+## 使用文档
+
+- 📘 `docs/flux服务-商家使用SOP.md` — 商户经营套餐/token/激活码的完整 SOP（登录、开账户、改套餐、设owner、下钻、API）
+- 📗 `docs/flux服务-用户使用SOP.md` — 普通用户从零到生成图的完整 SOP（提示词、套餐、激活/绑定账户、换设备、FAQ）
+- `docs/USER_GUIDE.md` — 用户使用指南（浏览器 + owner/API + 配额规则）
+- `docs/WEB_SERVICE.md` — 对外服务架构文档
 
 ## 快速开始
 
