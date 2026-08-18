@@ -637,7 +637,7 @@ async function api(p,o){{o=o||{{}};o.headers=Object.assign({{'Content-Type':'app
 function showGate(){{document.getElementById('gate').style.display='';document.getElementById('panel').style.display='none'}}
 function showPanel(){{document.getElementById('gate').style.display='none';document.getElementById('panel').style.display=''}}
 async function login(){{tk=document.getElementById('ptk').value.trim();
-  const d=await api('/api/admin/users'); if(d.users){{localStorage.setItem(K,tk);showPanel();loadAll()}}
+  const d=await api('/api/admin/users'); if(d.accounts!==undefined){{localStorage.setItem(K,tk);showPanel();loadAll()}}
   else msg('gmsg','Token 错误','err')}}
 function logout(){{localStorage.removeItem(K);tk='';showGate();document.getElementById('ptk').value=''}}
 function escNice(ts){{if(!ts)return '—';const t=new Date(ts*1000);return isNaN(t)?'—':t.toLocaleString('zh-CN',{{hour12:false}})}}
@@ -702,7 +702,7 @@ async function searchUser(){{const kw=document.getElementById('sk').value.trim()
   (d.accounts||[]).forEach(a=>document.querySelectorAll('#atb tr').forEach(r=>{{if(r.dataset.id===a.account_id)r.classList.add('hl')}}))}}
 function drill(t){{loadJobs();if(t)setTimeout(()=>document.querySelectorAll('#jtb tr').forEach(r=>{{if(!r.innerText.includes(t))r.style.display='none'}}),400);}}
 
-(async function(){{if(!tk)return showGate();try{{const d=await api('/api/admin/users');if(d.users){{showPanel();loadAll()}}else showGate()}}catch(e){{showGate()}}}})();
+(async function(){{if(!tk)return showGate();try{{const d=await api('/api/admin/users');if(d.accounts!==undefined){{showPanel();loadAll()}}else showGate()}}catch(e){{showGate()}}}})();
 function loadAll(){{loadUsers();loadCodes();loadJobs()}}
 </script></body></html>"""
 

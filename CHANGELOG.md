@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## [v1.8] - 2026-08-18
+
+**一键启动脚本 + 修复 admin 登录 bug**（运维优化）。
+
+- `start_service.ps1` 重构：支持 `-Target all/flux/xhs/tunnel`，可分别拉起 FLUX 文生图服务(:9620)、小红书发布服务(:8800)、公网隧道
+- **修好 cloudflared 启动 bug**：原传 `--config` 参数导致 "tunnel run accepts only one argument" 起不来（1033 隧道错误根源之一）；改为 `cd .cloudflared` 目录 + `tunnel run xhs-tunnel`（文档 COORDINATION.md 正确方式）
+- ps1 补 UTF-8 BOM（否则含中文的 ps1 被 PowerShell 按 GBK 误读解析报错）
+- 新增 `启动-01-FLUX服务.bat` / `启动-02-小红书服务.bat` / `启动-03-仅隧道.bat` 三入口，重启后可手动分别拉起
+- `start_service.bat` 改为一键拉起全部
+- **修 admin 登录 bug**：`/api/admin/users` 返回 `{"accounts":[]}`，但前端登录门检查 `d.users`（永远 undefined）→ 任何 token 都报"Token 错误"；改为 `d.accounts!==undefined`（2 处，login + 自动刷新）
+
+**验证**：ps1 幂等（重复跑不重复起进程）；三个服务重启后本地+公网全链路 200；admin 用 `flux-admin-2026` 登录恢复正常
+
 ## [v1.7] - 2026-08-16
 
 **飞书"图图"对话式出图机器人**：从单向通知器升级为可对话出图，飞书私聊发提示词 → 生成后图片回传。

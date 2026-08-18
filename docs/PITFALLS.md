@@ -2,6 +2,13 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 运维启动脚本 / admin 登录（2026-08-18，v1.8）
+
+- **[08-18] cloudflared 起不来："tunnel run accepts only one argument" → `start_service.ps1` 传 `-ArgumentList 'tunnel','run',...,'--config',path` 参数拆分坏，`--config` 被当位置参数 → 撤 `--config`，`cd .cloudflared` 目录 + `tunnel run xhs-tunnel`（config.yml 在目录内自动加载，COORDINATION.md 文档方式）**
+- **[08-18] 公网 flux.zhuanlu.xyz 报 1033 / 530 → 本地 Windows 重启后 flux_service 和 cloudflared 隧道全掉 → 一键启动脚本拉起来；因果判断：机器重启后永久进程被回收，非代码 bug**
+- **[08-18] 含中文的 .ps1 一执行就 ParserError（字符串缺终止符）→ 无 UTF-8 BOM，PowerShell 按系统 ANSI(GBK) 读中文乱码截断引号 → python 补 `\xef\xbb\xbf` BOM**
+- **[08-18] admin 输对 token 仍报"Token 错误" → `/api/admin/users` 返回 `{"accounts":[]}`，前端 `login()` 检查 `d.users`（undefined）→ 改 `d.accounts!==undefined`（两处：login + 自动刷新 IIFE）**
+
 ## 飞书对话式出图（2026-08-16，v1.7）
 
 - **[08-16] 飞书发图必须两步走 → 飞书图片消息不支持直接发二进制 → 先 `POST /open-apis/im/v1/images`（multipart，`image_type=message`）拿 `image_key`，再发 `msg_type=image` + `content={"image_key":...}`（与发文件 `/open-apis/im/v1/files` + `file_key` 结构等价）**
