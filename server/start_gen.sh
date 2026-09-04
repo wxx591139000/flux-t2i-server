@@ -50,12 +50,16 @@ fi
 echo "[3/4] 脚本与提示词就绪 ($PROMPTS)"
 
 # ── Step 4: 启动生成（screen 后台，可断SSH）──
+# 关键：先 screen -wipe 清掉【僵尸(Dead)】会话。否则 gen_flux 崩溃/被 kill 后残留的
+# Dead 会话名字仍是 fluxgen，会被下面 grep 误判为"已在跑"→跳过真实启动→任务永远等超时。
+screen -wipe 2>/dev/null
 if [ $FORCE -eq 0 ] && screen -ls 2>/dev/null | grep -q "fluxgen"; then
     echo "✅ 生成任务已在运行，跳过启动（如需重启加 --force）"
     screen -ls | grep fluxgen
     exit 0
 fi
 screen -S fluxgen -X quit 2>/dev/null
+screen -wipe 2>/dev/null
 sleep 1
 
 mkdir -p "$OUT"

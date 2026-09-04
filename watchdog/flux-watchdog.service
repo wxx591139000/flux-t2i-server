@@ -1,0 +1,14 @@
+[Unit]
+Description=FLUX server readiness watchdog (keep AutoDL flux servers ready to accept jobs)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/flux-watchdog
+ExecStart=/opt/flux-watchdog/flux_watchdog.sh
+Restart=always
+RestartSec=10
+# 日志见: journalctl -u flux-watchdog -f
+
+[Install]
+WantedBy=multi-user.target

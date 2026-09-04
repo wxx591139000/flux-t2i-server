@@ -6,6 +6,11 @@ FLUX 服务器管理器（对标转录bot orchestrator 的服务器管理模式�
 - 服务器可达时自动拉起生成服务（start_gen.sh，幂等）
 - 生成完成 → 拉回图片 → 替换 Obsidian 稿子 <!--IMG:N--> 占位符 → 飞书通知
 
+多服务器支持（v2.0）：
+- FLUX_SERVERS 注册表维护多台 flux 服务器（env FLUX_SERVERS_JSON 可覆写，未来加机不动代码）
+- SSH 操作全部接受 server 参数（None = 默认 flux1，向后兼容）
+- find_ready_server() 返回第一台可达+带卡+模型就绪的服务器
+
 用法:
   python flux_server_manager.py                 # 常驻 daemon
   python flux_server_manager.py --once          # 处理一次队列即退（测试用）
@@ -34,10 +39,47 @@ DONE_DIR = JOB_DIR / '_done'
 OBSIDIAN_IMAGES = Path(os.environ.get('FLUX_OBSIDIAN_IMAGES',
     r'E:\ObsidianHouse\ObsidW\02 Projects项目\hongshu\02-稿子\images\flux_out'))
 
-# 服务器配置
-SSH_ALIAS = 'autodl-flux'
-REMOTE_BASE = '/root/autodl-tmp/flux-t2i'
-REMOTE_MODEL = '/root/autodl-tmp/models/FLUX.1-dev'
+# ═══════════════ 多服务器注册表 ═══════════════
+# 每台 = {name, alias(~/.ssh/config), remote_base(工作目录), remote_model(模型路径)}
+# 支持 env FLUX_SERVERS_JSON 覆盖（未来加机不动代码）
+_DEFAULT_SERVERS = [
+    {"name": "flux1", "alias": "autodl-flux",  "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
+    {"name": "flux2", "alias": "autodl-flux2", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
+]
+
+
+def _load_servers() -> list:
+    raw = os.environ.get('FLUX_SERVERS_JSON')
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, list) and loaded:
+                return loaded
+        except Exception:
+            pass
+    return _DEFAULT_SERVERS
+
+
+FLUX_SERVERS = _load_servers()
+SERVER_DEFAULT = FLUX_SERVERS[0]
+
+
+def _get_server(server=None) -> dict:
+    """把 server 参数解析成注册表条目（dict / name / alias / None=默认）。"""
+    if server is None:
+        return SERVER_DEFAULT
+    if isinstance(server, dict):
+        return server
+    for s in FLUX_SERVERS:
+        if s.get('name') == server or s.get('alias') == server:
+            return s
+    return SERVER_DEFAULT
+
+
+# 旧常量 = 默认服务器（flux1），向后兼容（小红书产线 process_job 等仍走 flux1）
+SSH_ALIAS = SERVER_DEFAULT['alias']
+REMOTE_BASE = SERVER_DEFAULT['remote_base']
+REMOTE_MODEL = SERVER_DEFAULT['remote_model']
 LOCAL_GEN = BASE_DIR / 'server' / 'gen_flux.py'
 
 logging.basicConfig(level=logging.INFO,
@@ -61,31 +103,37 @@ def run(cmd, timeout=30):
         return False, str(e)
 
 
-def server_reachable() -> bool:
-    ok, _ = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {SSH_ALIAS} echo ok', 15)
+def server_reachable(server=None) -> bool:
+    s = _get_server(server)
+    ok, _ = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {s["alias"]} echo ok', 15)
     return ok
 
 
-def gpu_ready() -> tuple:
-    ok, out = run(f'ssh -o ConnectTimeout=8 {SSH_ALIAS} '
+def gpu_ready(server=None) -> tuple:
+    s = _get_server(server)
+    ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
                   "'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1'", 15)
     return ok and 'NVIDIA' in out, out
 
 
-def model_ready() -> bool:
-    ok, _ = run(f'ssh -o ConnectTimeout=8 {SSH_ALIAS} '
-                f"'test -f {REMOTE_MODEL}/DOWNLOAD_DONE && echo READY'", 15)
+def model_ready(server=None) -> bool:
+    s = _get_server(server)
+    ok, _ = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+                f"'test -f {s['remote_model']}/DOWNLOAD_DONE && echo READY'", 15)
     return ok
 
 
-def gen_running() -> bool:
-    ok, out = run(f'ssh -o ConnectTimeout=8 {SSH_ALIAS} '
-                  "'screen -ls 2>/dev/null | grep -c fluxgen'", 15)
+def gen_running(server=None) -> bool:
+    s = _get_server(server)
+    # 先 screen -wipe 清僵尸会话，避免 Dead 会话被 grep -c 误判为"运行中"（否则崩溃后残留会挡住重启）
+    ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+                  "'screen -wipe 2>/dev/null; screen -ls 2>/dev/null | grep -c fluxgen'", 15)
     return ok and '1' in out
 
 
-def upload_prompts(job: dict) -> bool:
+def upload_prompts(job: dict, server=None) -> bool:
     """把 job 的提示词写成 prompts.json 并上传服务器"""
+    s = _get_server(server)
     notes = [{
         'note': job['note_title'],
         'images': [{"key": f"P{i+1}", "prompt": img['prompt']}
@@ -95,44 +143,47 @@ def upload_prompts(job: dict) -> bool:
     prompts_path.write_text(json.dumps({'notes': notes}, ensure_ascii=False), encoding='utf-8')
     local_p = str(prompts_path).replace('\\', '/')
     local_g = str(LOCAL_GEN).replace('\\', '/')
-    ok1, _ = run(f'scp {local_p} {SSH_ALIAS}:{REMOTE_BASE}/prompts.json', 30)
-    ok2, _ = run(f'scp {local_g} {SSH_ALIAS}:{REMOTE_BASE}/gen_flux.py', 30)
+    ok1, _ = run(f'scp {local_p} {s["alias"]}:{s["remote_base"]}/prompts.json', 30)
+    ok2, _ = run(f'scp {local_g} {s["alias"]}:{s["remote_base"]}/gen_flux.py', 30)
     return ok1 and ok2
 
 
-def start_generation() -> bool:
-    ok, out = run(f'ssh -o ConnectTimeout=15 {SSH_ALIAS} '
-                  f'bash {REMOTE_BASE}/start_gen.sh', 60)
+def start_generation(server=None) -> bool:
+    s = _get_server(server)
+    ok, out = run(f'ssh -o ConnectTimeout=15 {s["alias"]} '
+                  f'bash {s["remote_base"]}/start_gen.sh', 60)
     log.info(out)
     return ok
 
 
-def wait_generation(n_images: int, timeout_sec=3600) -> bool:
+def wait_generation(n_images: int, server=None, timeout_sec=3600) -> bool:
     """轮询直到生成完成（所有图片出现或 gen.log 标完成）"""
+    s = _get_server(server)
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         time.sleep(20)
-        ok, out = run(f'ssh -o ConnectTimeout=8 {SSH_ALIAS} '
-                      f'find {REMOTE_BASE}/out -name "*.png" | wc -l', 15)
+        ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+                      f'find {s["remote_base"]}/out -name "*.png" | wc -l', 15)
         if ok and out.strip().isdigit() and int(out.strip()) >= n_images:
-            log.info(f'✅ 生成完成: {out.strip()}/{n_images} 张')
+            log.info(f'✅ 生成完成: {out.strip()}/{n_images} 张 ({s["name"]})')
             return True
         # 检查是否报错
-        ok2, err = run(f'ssh -o ConnectTimeout=8 {SSH_ALIAS} '
-                       f'tail -5 {REMOTE_BASE}/gen.log 2>/dev/null | tr "\\r" "\\n" | grep -E "❌|Error|Traceback" | tail -1', 15)
+        ok2, err = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+                       f'tail -5 {s["remote_base"]}/gen.log 2>/dev/null | tr "\\r" "\\n" | grep -E "❌|Error|Traceback" | tail -1', 15)
         if ok2 and err:
             log.warning(f'⚠️  生成疑似报错: {err[:120]}')
     log.warning('⚠️  生成超时')
     return False
 
 
-def pull_images(job: dict) -> str:
+def pull_images(job: dict, server=None) -> str:
     """把生成图拉回本地 02-稿子/images/flux_out/<batch>/，返回目录"""
+    s = _get_server(server)
     batch = job['job_id']
     dest = OBSIDIAN_IMAGES / batch
     dest.mkdir(parents=True, exist_ok=True)
     dest_posix = str(dest).replace('\\', '/')
-    ok, _ = run(f'scp -r {SSH_ALIAS}:{REMOTE_BASE}/out/. "{dest_posix}" 2>/dev/null', 120)
+    ok, _ = run(f'scp -r {s["alias"]}:{s["remote_base"]}/out/. "{dest_posix}" 2>/dev/null', 120)
     # gen_flux 输出在 out/00_<title>/xxx.png，需上移一层到 batch/
     moved = 0
     for sub in dest.iterdir():
@@ -172,10 +223,40 @@ def insert_into_note(job: dict) -> bool:
     return replaced > 0
 
 
+# ═══════════════ 多服务器探活 / 选择 ═══════════════
+
+def probe(server=None) -> dict:
+    """探测单台服务器完整状态：reachable / gpu_ok / gpu模型 / model_ok"""
+    s = _get_server(server)
+    return {
+        'name': s['name'],
+        'alias': s['alias'],
+        'reachable': server_reachable(s),
+        'gpu_ok': gpu_ready(s)[0],
+        'gpu': gpu_ready(s)[1],
+        'model_ok': model_ready(s),
+    }
+
+
+def find_ready_server() -> dict | None:
+    """返回第一台 可达 + 带卡 + 模型就绪 的服务器；都没就绪返回 None。"""
+    for s in FLUX_SERVERS:
+        p = probe(s)
+        if p['reachable'] and p['gpu_ok'] and p['model_ok']:
+            log.info(f'🟢 选中服务器: {p["name"]} ({p["alias"]}) gpu={p["gpu"]}')
+            return s
+    return None
+
+
+def any_ready() -> bool:
+    """是否至少有一台可用服务器（供健康监控判断是否可接单/可恢复）。"""
+    return find_ready_server() is not None
+
+
 # ═══════════════ 任务处理 ═══════════════
 
 def process_job(job: dict) -> bool:
-    """处理单个配图任务：确保服务器→生成→拉回→插入→通知"""
+    """处理单个配图任务：确保服务器→生成→拉回→插入→通知（小红书产线专用，默认走 flux1）"""
     log.info(f'▶ 处理任务: {job["note_title"]} ({len(job["images"])}张)')
     job_id = job['job_id']
 
@@ -246,7 +327,7 @@ def health_check_pending(pending: list) -> bool:
     """有任务时检查服务器，down → 通知（节流），可达 → 通知恢复。返回是否服务器就绪"""
     if not pending:
         return True
-    if server_reachable():
+    if server_reachable():  # 小红书产线 process_job 绑定默认服务器(flux1)
         return True
     log.warning('🔴 FLUX 服务器不可达且有任务，通知开机')
     notify_owner(f'🔴 FLUX 文生图服务器不可达，有 {len(pending)} 个配图任务排队。\n'
@@ -264,6 +345,7 @@ def main():
 
     log.info('🚀 FLUX 服务器管理器启动')
     log.info(f'   任务队列: {JOB_DIR}')
+    log.info(f'   服务器注册: {[s["name"] for s in FLUX_SERVERS]}')
     log.info(f'   检测间隔: {args.interval}s')
 
     while True:

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     priority     INTEGER NOT NULL DEFAULT 0,
     image_path   TEXT,
     error        TEXT,
+    server       TEXT,              -- 任务执行所在 flux 服务器名 (flux1/flux2/...)；多服务器调度
     created_at   INTEGER,
     completed_at INTEGER
 );
@@ -81,6 +82,9 @@ class FluxDB:
             if 'original_prompt' not in jcols:
                 self._conn.execute('ALTER TABLE jobs ADD COLUMN original_prompt TEXT')
                 logger.info('🗄️  jobs 表已加 original_prompt 列')
+            if 'server' not in jcols:
+                self._conn.execute('ALTER TABLE jobs ADD COLUMN server TEXT')
+                logger.info('🗄️  jobs 表已加 server 列')
             ccols = {r[1] for r in self._conn.execute('PRAGMA table_info(codes)')}
             for col, ddl in {
                 'created_at': 'ALTER TABLE codes ADD COLUMN created_at INTEGER',

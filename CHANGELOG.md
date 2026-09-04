@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## [v2.0] - 2026-09-04
+
+**FLUX 多服务器化 + VPS 看门狗**（支持第 2 台 FLUX 服务器，任一台开机能接单）。
+
+### 任务中心多服务器（Part A）
+- `manager/flux_server_manager.py`：新增 `FLUX_SERVERS` 服务器注册表（默认 flux1 + flux2，支持 env `FLUX_SERVERS_JSON` 覆写，未来加机不动代码）；所有 SSH 操作改为服务器感知（接受 `server` 参数，None=默认 flux1 向后兼容）；新增 `probe()` / `find_ready_server()`（返回第一台可达+带卡+模型就绪）/ `any_ready()`
+- `manager/flux_queue.py`：`_generate()` 每单 `find_ready_server()` 挑任一台可用服务器执行（跳过关机/无卡/模型未就绪），`server` 名回写 DB；`_health_loop()` 改 `any_ready()` 判断——任一台起来即恢复 waiting 池任务；移除不再用的 `REMOTE_BASE/REMOTE_OUT` 常量
+- `manager/flux_db.py`：jobs 表新增可空 `server` 列（记录任务跑在哪台，幂等迁移）
+- 并发策略：保持单 worker 串行，每单自动选任意可用服务器（用户已确认）
+
+### VPS 看门狗（Part B，新建 `watchdog/`）
+- `watchdog/flux_server_ready.sh`：服务器端就地脚本。`--check` 只读状态（带卡+模型+脚本）/ 全量校验+清残留+打 `SERVER_READY`
+- `watchdog/flux_watchdog.sh`：VPS 常驻（镜像 qwen `qwen_watchdog.sh` 多机版）。`TARGETS` 逐台巡检，机器在线但未就绪 → 自动就地预热到「可接单」，轮询确认
+- `watchdog/flux-watchdog.service`：VPS systemd unit（`Restart=always`）
+- `watchdog/README.md`：部署到 `vps-aliyun`（/opt/flux-watchdog + systemd enable）完整步骤 + 加/减机的运维
+- 语义按用户确认：看门狗「拉起服务」= 预热就绪+保活（非重写常驻守护），真正生图仍由任务中心按需调度
+
+### Part C（flux2 接入，待克隆完成）
+- `~/.ssh/config` 已加 `autodl-flux2`（connect.weste.seetacloud.com:23192，key id_rsa_musetalk）；免密 + 数据盘克隆校验待 clone 完成后进行
+
+**验证**：三个 manager 文件编译 + import 通过；jobs 表 `server` 列迁移 OK；watchdog 两脚本 `bash -n` 通过。真机 E2E（网页提交→任一台生成→`server` 列有值；拔一台另一台接力；VPS 看门狗开机自动预热）待 flux2 就绪后实测。
+
 ## [v1.8] - 2026-08-18
 
 **一键启动脚本 + 修复 admin 登录 bug**（运维优化）。

@@ -2,6 +2,10 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 多服务器 / 僵尸 screen（2026-09-04，v2.0）
+
+- **[09-04] 服务器就绪但任务一直不生成、最终`生成超时` → 僵尸 screen 会话 `1375.fluxgen (Dead ???)` 残留，`screen -ls | grep fluxgen` 连 Dead 会话也匹配 → `start_gen.sh` 误判"已在运行"→跳过真实启动 → 无 gen 进程 → 等超时** → 所有判"是否在跑"的逻辑都要先 `screen -wipe` 清僵尸（4 处：`server/start_gen.sh`、`flux_server_manager.gen_running()`、`flux_queue._generate` 清理、`watchdog/flux_server_ready.sh`）；实测 wipe 后活会话 `1897.fluxgen (Detached)` 起来、卡住任务 done
+
 ## 运维启动脚本 / admin 登录（2026-08-18，v1.8）
 
 - **[08-18] cloudflared 起不来："tunnel run accepts only one argument" → `start_service.ps1` 传 `-ArgumentList 'tunnel','run',...,'--config',path` 参数拆分坏，`--config` 被当位置参数 → 撤 `--config`，`cd .cloudflared` 目录 + `tunnel run xhs-tunnel`（config.yml 在目录内自动加载，COORDINATION.md 文档方式）**

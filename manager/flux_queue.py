@@ -32,8 +32,6 @@ logger = logging.getLogger('manager.flux_queue')
 WEB_OUT = Path(os.environ.get('FLUX_WEB_OUT', BASE_DIR / 'web_out'))
 QUEUE_MAX = int(os.environ.get('FLUX_QUEUE_MAX', '50'))
 MAX_RETRY = 3
-REMOTE_BASE = '/root/autodl-tmp/flux-t2i'
-REMOTE_OUT = f'{REMOTE_BASE}/out'
 
 
 class FluxQueueScheduler:
@@ -88,6 +86,7 @@ class FluxQueueScheduler:
     # ── worker ──
     def start(self):
         self._recover_stale_waiting()   # 启动时恢复上次遗留的 waiting 任务
+        self._recover_orphaned_jobs()   # 启动时恢复重启丢掉的 queued/generating 任务（防孤儿）
         self._worker_thread = threading.Thread(target=self._run_worker, daemon=True, name='flux-worker')
         self._health_thread = threading.Thread(target=self._health_loop, daemon=True, name='flux-health')
         self._worker_thread.start()
@@ -134,16 +133,16 @@ class FluxQueueScheduler:
         m = re.search(r'\[RETRY:(\d+)\]', err or '')
         return int(m.group(1)) if m else 0
 
-    # ── 生成（复用 flux_server_manager SSH 操作）──
+    # ── 生成（复用 flux_server_manager SSH 操作，任一台可用服务器）──
     def _generate(self, job) -> tuple:
-        """生成单图并拉回 web_out/<jobid>/。返回 (ok, err)"""
+        """生成单图并拉回 web_out/<jobid>/。挑任意一台可达+带卡+模型就绪的 flux 服务器执行。返回 (ok, err)"""
         job_id = job['job_id']
-        if not fsm.server_reachable():
-            return False, '[SERVER_DOWN] FLUX 服务器不可达'
-        if not fsm.gpu_ready()[0]:
-            return False, '[SERVER_DOWN] 服务器无卡模式'
-        if not fsm.model_ready():
-            return False, '模型未就绪'
+        # 多服务器支持：挑第一台就绪的（自动跳过关机/无卡/模型未就绪的）
+        server = fsm.find_ready_server()
+        if not server:
+            return False, '[SERVER_DOWN] 无可用 flux 服务器（均关机 / 无卡 / 模型未就绪）'
+        alias = server['alias']
+        rem_out = f"{server['remote_base']}/out"
 
         # 写单图 prompts.json
         prompts = {
@@ -155,27 +154,27 @@ class FluxQueueScheduler:
         # 上传（prompts + gen_flux.py）——本地 Windows 路径转正斜杠，避免 bash 把反斜杠当转义
         local_prompts = str(prompts_path).replace('\\', '/')
         local_gen = str(fsm.LOCAL_GEN).replace('\\', '/')
-        ok1, _ = fsm.run(f'scp {local_prompts} {fsm.SSH_ALIAS}:{REMOTE_BASE}/prompts.json', 30)
-        ok2, _ = fsm.run(f'scp {local_gen} {fsm.SSH_ALIAS}:{REMOTE_BASE}/gen_flux.py', 30)
+        ok1, _ = fsm.run(f'scp {local_prompts} {alias}:{server["remote_base"]}/prompts.json', 30)
+        ok2, _ = fsm.run(f'scp {local_gen} {alias}:{server["remote_base"]}/gen_flux.py', 30)
         if not (ok1 and ok2):
             return False, '上传 prompts 失败'
 
-        # 干净重启：杀掉残留 fluxgen 会话 + 清空 out/（保证只拉回本次生成图，避免历史图污染）
-        fsm.run(f'ssh {fsm.SSH_ALIAS} "screen -S fluxgen -X quit 2>/dev/null; pkill -f gen_fl[u]x.py 2>/dev/null; rm -rf {REMOTE_OUT}/* 2>/dev/null; true"', 15)
+        # 干净重启：杀掉残留 fluxgen 会话 + wipe 清僵尸 + 清空 out/（僵尸 Dead 会话会被 start_gen 误判为运行中，必须 wipe）
+        fsm.run(f'ssh {alias} "screen -S fluxgen -X quit 2>/dev/null; screen -wipe 2>/dev/null; pkill -f gen_fl[u]x.py 2>/dev/null; rm -rf {rem_out}/* 2>/dev/null; true"', 15)
         time.sleep(2)
 
-        if not fsm.start_generation():
+        if not fsm.start_generation(server):
             return False, '启动生成失败'
 
         # 等待完成（1 张）
-        if not fsm.wait_generation(1, timeout_sec=1800):
+        if not fsm.wait_generation(1, server, timeout_sec=1800):
             return False, '生成超时'
 
         # 拉回 web_out/<jobid>/
         dest = WEB_OUT / job_id
         dest.mkdir(parents=True, exist_ok=True)
         dest_posix = str(dest).replace('\\', '/')
-        ok, _ = fsm.run(f'scp -r {fsm.SSH_ALIAS}:{REMOTE_OUT}/. "{dest_posix}" 2>/dev/null', 120)
+        ok, _ = fsm.run(f'scp -r {alias}:{rem_out}/. "{dest_posix}" 2>/dev/null', 120)
         # gen_flux 输出在 out/00_web/<jobid>.png，上移一层
         import shutil
         for sub in list(dest.iterdir()):
@@ -186,25 +185,26 @@ class FluxQueueScheduler:
         pngs = list(dest.glob('*.png'))
         if not pngs:
             return False, '未拉回图片'
-        self.db.job_update(job_id, image_path=str(pngs[0]))
+        self.db.job_update(job_id, image_path=str(pngs[0]), server=server['name'])
+        logger.info(f'🗄️  任务 {job_id} 由服务器 {server["name"]} 完成')
         return True, ''
 
     # ── 健康监控（对标转录bot _health_monitor_loop + _recover_failed_tasks）──
     def _health_loop(self):
         while not self._stop.is_set():
             try:
-                if not self._pq.empty() and not fsm.server_reachable():
+                if not self._pq.empty() and not fsm.any_ready():
                     now = time.time()
                     if now - self._last_notify > 600:   # 节流 10 分钟
                         self._last_notify = now
-                        logger.warning('🔴 FLUX 服务器不可达且有任务排队，通知开机')
+                        logger.warning('🔴 FLUX 服务器均不可用且有任务排队，通知开机')
                         try:
-                            notify_owner(f'🔴 FLUX 文生图服务器不可达，有 {self._pq.qsize()} 个任务排队。\n'
-                                         f'请到 AutoDL 控制台开机（带卡模式）。')
+                            notify_owner(f'🔴 FLUX 文生图服务器均不可用，有 {self._pq.qsize()} 个任务排队。\n'
+                                         f'请到 AutoDL 控制台给任一台开机（带卡模式）。')
                         except Exception as e:
                             logger.error(f'飞书通知失败: {e}')
-                elif fsm.server_reachable() and self._waiting:
-                    # 服务器恢复 → 自动重入队等待恢复的任务
+                elif fsm.any_ready() and self._waiting:
+                    # 任一台可用服务器恢复 → 才尝试重入队等待恢复的任务（否则全关机会每 30s 打退一次 retry）
                     self._recover_waiting_tasks()
             except Exception as e:
                 logger.error(f'健康监控异常: {e}')
@@ -228,6 +228,20 @@ class FluxQueueScheduler:
             self._pq.put((job['priority'], -self._seq, job_id))
             self._seq += 1
             logger.info(f'🔄 {job_id} 服务器恢复，重新入队 (retry {retry+1})')
+
+    def _recover_orphaned_jobs(self):
+        """重启后把 DB 里残留 queued/generating 的任务重新入队。
+        原缺陷：任务队列 _pq 在内存，重启即清零，DB 的 queued/generating 会成孤儿永远无人处理。
+        现：启动时把这两类重入队（generating 改回 queued 重新生成，最稳）。"""
+        for j in self.db.jobs_queued():
+            jid = j['job_id']
+            key = f"{j['user_id']}:{j['prompt']}"
+            if j['status'] == 'generating':
+                self.db.job_update(jid, status='queued')
+            self._inflight.add(key)
+            self._pq.put((j['priority'], -self._seq, jid))
+            self._seq += 1
+            logger.info(f'🔁 重启恢复孤儿任务重入队: {jid} (原 {j["status"]})')
 
     def _recover_stale_waiting(self):
         """启动时扫描 DB 里残留的 waiting 任务，加入等待恢复池（防重启丢失）。"""

@@ -1,6 +1,6 @@
 # 项目推进进度 — FLUX 文生图服务（通用）
 
-> 版本：v1.8 · 2026-08-18
+> 版本：v2.0 · 2026-09-04
 
 ## 里程碑回顾
 
@@ -11,8 +11,18 @@
 - **2026-08-16（v1.6）**：新增**两份使用 SOP 文档**（纯文档变更）——`docs/flux服务-商家使用SOP.md`（商户经营套餐全流程）+ `docs/flux服务-用户使用SOP.md`（用户从零到生成图）
 - **2026-08-16（v1.7）**：**飞书"图图"对话式出图机器人**——从单向通知器升级为可对话出图（私聊发提示词→生成→图片回传），借鉴转录bot"小白"的 WS 长连接范式
 - **2026-08-18（v1.8）**：**一键启动脚本 + admin 登录 bug 修复**——`start_service.ps1 -Target flux/xhs/tunnel/all` 分别拉起 FLUX / 小红书 / 隧道（修 cloudflared 启动 bug + 补 BOM）；修 admin 登录判定字段错（`d.users`→`d.accounts`）
+- **2026-09-04（v2.0）**：**多服务器化 + VPS 看门狗 + 重启恢复修复**——任务中心 `FLUX_SERVERS` 注册表支持多台（flux1+flux2），`find_ready_server()` 每单挑任一台可用；`watchdog/` 新建 VPS 看门狗（镜像 qwen）；`flux_queue` 加 `_recover_orphaned_jobs` 重启不丢单；根治**僵尸 screen 会话被误判"运行中"→跳过启动→任务超时**的缺陷（4 处 `screen -wipe`）；重启验证 `server` 列落库 + 死机自愈链路全通
 
 ## 已完成功能清单
+
+### 多服务器 + VPS 看门狗（v2.0）
+- [x] `manager/flux_server_manager.py`：`FLUX_SERVERS` 多服务器注册表（env `FLUX_SERVERS_JSON` 可覆写）+ SSH 操作全部服务器感知（`server` 参数，None=默认 flux1）+ `probe/find_ready_server/any_ready`
+- [x] `manager/flux_queue.py`：`_generate` 每单 `find_ready_server()` 挑任一台 + `server` 名回写 DB；`_health_loop` 用 `any_ready()`——任一台起来即恢复 waiting 池
+- [x] `manager/flux_queue.py` `_recover_orphaned_jobs()`：重启后把 DB 残留 queued/generating 任务重入队（原先内存队列重启即丢成孤儿）
+- [x] `manager/flux_db.py`：jobs 表加可空 `server` 列（幂等迁移）
+- [x] `watchdog/`：`flux_server_ready.sh`（服务器端就绪，`--check`只读/全量）+ `flux_watchdog.sh`（VPS 巡检）+ `flux-watchdog.service`（systemd）+ `README.md`（部署）；镜像 qwen `watchdog-vps`
+- [x] 根治僵尸 screen：`server/start_gen.sh`、`gen_running()`、`flux_queue._generate`、`watchdog/flux_server_ready.sh` 均加 `screen -wipe`
+- [x] 实测：重启加载 v2.0 + 孤儿恢复 + 死机自愈（22:40 recovery） + `server=flux1` 落库全通
 
 ### 飞书"图图"对话式出图（v1.7）
 - [x] `manager/feishu_bot.py`：WebSocket 长连接监听 P2P 私聊（lark_oapi.ws.Client，对齐转录bot feishu_channel）
@@ -74,13 +84,12 @@
 
 ## 进行中工作
 
-- [ ] `flux-t2i-server` 二次归档（v1.2，tag archive-20260815-v2）
+- [x] v2.0 多服务器 + VPS 看门狗 + 重启恢复修复（2026-09-04，待 git 归档）
 
 ## 待办事项 / Roadmap
 
-- [ ] **git 提交 + 打 tag** 本次 v1.1→v1.2 归档
-- [ ] **小红书产线回归**：`flux_server_manager` 文件队列（run() 修复后）未再实测，需在服务器可用时跑通
-- [ ] **长期守护**：服务进程 + cloudflared 隧道目前是手动/后台进程，会话结束会被回收；建议做开机自启守护脚本
-- [ ] **owner 无限配额**：当前 owner 用预留 token，未配置 is_owner 无限逻辑（quota 里 owner 跳过）
-- [ ] 清理测试失败记录（早期服务器未起时的 failed 任务）
-- [ ] （可选）接入监控/告警（任务进度、下载完成通知）
+- [ ] **flux2 接入**（等 clone 完成、端口 23192 可达）：免密 + 校验数据盘克隆 + 出现在 `find_ready_server` 备选；后续加机只需在 `FLUX_SERVERS`/`watchdog/TARGETS` 各加一条
+- [ ] **VPS 看门狗部署**：`watchdog/` 代码已就绪，部署到 vps-aliyun（`/opt/flux-watchdog` + `systemctl enable --now` + 配 key），见 `watchdog/README.md`
+- [ ] **遗留 failed 任务重提**：早期僵尸 screen 导致的 `生成超时` 历史失败（如 1786886515483）不会自愈，需要时手动重提（重提走新的多服务器+server 落库链路）
+- [ ] **小红书产线回归**：重启脚本已升 v2.0，本地 `flux_gen_watchdog.py` 仍绑定 flux1 单机（默认），确认多服务器后小红书产线是否也要吃到（计划保持 flux1 不动）
+- [ ] **长期守护**：服务进程 + cloudflared 隧道目前手动/后台进程，会话结束会被回收；建议开机自启守护脚本

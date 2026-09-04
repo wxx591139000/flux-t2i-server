@@ -1,6 +1,13 @@
 # 项目详细方案 — FLUX 文生图服务（通用）
 
-> 版本：v1.8 · 2026-08-18
+> 版本：v2.0 · 2026-09-04
+
+## 多服务器 + VPS 看门狗（v2.0 新增）
+
+- **多服务器注册表**：`manager/flux_server_manager.py` 的 `FLUX_SERVERS` 维护多台 FLUX 机（默认 flux1 `autodl-flux` + flux2 `autodl-flux2`；env `FLUX_SERVERS_JSON` 可覆写，未来加机不动代码）。所有 SSH 操作接受 `server` 参数（None=默认 flux1 向后兼容）。
+- **调度**：`flux_queue._generate` 每单 `fsm.find_ready_server()` 挑第一台 **可达 + 带卡(nvidia-smi) + 模型就绪(DOWNLOAD_DONE)** 的服务器执行 → `server` 名回写 jobs 表。任一台上线即接单；`_health_loop` 用 `any_ready()`——任一台起来即恢复 waiting 池。保持单 worker 串行。
+- **VPS 看门狗**（`watchdog/`，镜像 qwen `watchdog-vps`）：VPS(`vps-aliyun`) systemd 长驻 `flux_watchdog.sh`，`TARGETS` 逐台巡检。机器在线但「未就绪」→ 自动推送并跑就地 `flux_server_ready.sh` 预热成可接单（带卡+模型+脚本校验 + 清残留 + 打 `SERVER_READY`），轮询确认。语义=预热就绪+保活，真正生图仍由任务中心按需调度。
+- **加机**：任务中心在 `FLUX_SERVERS` 加一条 + `~/.ssh/config` 加别名 + 免密；看门狗在 `TARGETS` 加一行 + 配 key → `systemctl restart flux-watchdog`。
 
 ## 系统架构图（文字描述）
 
