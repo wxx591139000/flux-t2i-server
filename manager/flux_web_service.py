@@ -278,15 +278,25 @@ class _Handler(BaseHTTPRequestHandler):
 
         def _pint(name):
             v = data.get(name)
-            try:
-                return int(v) if v not in (None, '') else None
-            except (TypeError, ValueError):
+            if v in (None, ''):
                 return None
+            if isinstance(v, bool):  # bool 是 int 子类，int(True)=1，需显式拒绝
+                raise ValueError(f'{name} 参数非法（应为整数）：{v!r}')
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                # 诚信：参数给了却没法用，明确报 400，而不是静默退回默认值
+                raise ValueError(f'{name} 参数非法（应为整数）：{v!r}')
 
-        width = _pint('width')
-        height = _pint('height')
-        seed = _pint('seed')
-        steps = _pint('steps')
+        try:
+            width = _pint('width')
+            height = _pint('height')
+            seed = _pint('seed')
+            steps = _pint('steps')
+        except ValueError as e:
+            self._json({'error': str(e)}, 400)
+            return
+
         negative_prompt = data.get('negative_prompt') or None
 
         self._resolve_user(token)
