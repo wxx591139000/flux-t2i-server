@@ -8,6 +8,7 @@ FLUX 对外文生图服务 — Web 服务（对标转录bot web_upload/server.py
 import os
 import sys
 import json
+import time
 import uuid
 import html
 import logging
@@ -30,6 +31,7 @@ logger = logging.getLogger('manager.flux_web_service')
 WEB_ADMIN_TOKEN = os.environ.get('WEB_ADMIN_TOKEN', '')
 SERVICE_NAME = 'FLUX 文生图'
 OWNER_UNLIMITED_HINT = 'owner'
+WEB_STARTED_AT = time.time()   # web 进程启动时刻，供 /health 报 uptime
 
 
 class FluxWebServer:
@@ -125,6 +127,81 @@ class _Handler(BaseHTTPRequestHandler):
              body_token)
         return t == WEB_ADMIN_TOKEN
 
+    # ── 健康探针 ──
+    def _health(self):
+        """浅探针：GET /health。
+
+        **刻意不做任何 SSH / 上游 HTTP 外呼。** 探针必须恒定快：若在这里去探 GPU 机器，
+        一台机器关机就会让本服务 /health 变慢甚至超时，监控会把「后端不可用」误判成
+        「网站死了」——这两件事必须能分开看。GPU 侧可用性请直接问常驻服务：
+            curl http://127.0.0.1:$FLUX_RESIDENT_PORT/health
+        （那是另一台机器上的另一个服务，字段见 server/flux_resident_server.py:_health）
+
+        为什么要有这个探针：worker 线程若异常退出，web 仍会照常 200 —— 用户提交
+        得到 queued 却永远不出图，从外部完全看不出来。`worker_alive` 是唯一能区分
+        「活着」与「僵尸」的信号，且不需要碰网络。
+
+        字段：
+          status        ok / degraded；degraded 只表示**本进程**有问题（DB 或 worker）
+          db_ok         SQLite 可读
+          worker_alive  worker 线程活着？null = 未挂调度器（web-only 模式，见本文件 main()）
+          health_alive  健康监控线程活着？（它负责把 waiting 任务捞回来）
+          gen_mode      本进程生效的生成路径 resident / legacy
+          queue_depth   待处理任务数（内存优先队列）
+          inflight      去重集合大小（排队中 + 生成中）
+          waiting       等 GPU 侧恢复的任务数；>0 说明后端当前不可用
+          backend_hint  由 waiting/queue 推导的后端状态提示（**推导值，非实测**）
+          web_uptime_sec / uptime_sec   web 进程 / 调度器 运行秒数
+          errors        探针过程中捕获到的异常（空数组 = 正常）
+        """
+        st, sched_err = {}, ''
+        has_sched = self.scheduler is not None
+        if has_sched:
+            try:
+                st = self.scheduler.stats() or {}
+            except Exception as e:      # 探针自身绝不能抛，否则 200 变 500
+                sched_err = f'{type(e).__name__}: {e}'
+                logger.warning(f'/health 读取调度器状态失败: {sched_err}')
+        # 读不出状态时报 None（未知），而不是 False —— 别把「未知」冒充「已死」，
+        # 也别把它和「没挂调度器」混为一谈（下面判定要区分）。
+        worker = (st.get('worker_alive') if not sched_err else None) if has_sched else None
+
+        db_ok, db_err = False, ''
+        try:
+            db_ok = bool(self.db.ping())
+        except Exception as e:
+            db_err = f'{type(e).__name__}: {e}'
+            logger.warning(f'/health 数据库探活失败: {db_err}')
+
+        # 健康判定：DB 必须可用；挂了调度器则必须能读出它、且其 worker 活着。
+        # 未挂调度器（web-only 模式，见本文件 main()）算健康 —— 那是合法运行模式，
+        # 只是本进程不产出图（生成在别的进程里跑）。
+        healthy = bool(db_ok) and not (has_sched and (bool(sched_err) or not worker))
+
+        depth = st.get('queue_depth') or 0
+        if st.get('waiting'):
+            hint = 'server_down'        # waiting 池只装 [SERVER_DOWN] 任务
+        elif depth or st.get('inflight'):
+            hint = 'busy'
+        else:
+            hint = 'idle'
+
+        self._json({
+            'status': 'ok' if healthy else 'degraded',
+            'service': SERVICE_NAME,
+            'db_ok': db_ok,
+            'worker_alive': worker,
+            'health_alive': st.get('health_alive') if has_sched else None,
+            'gen_mode': st.get('gen_mode') if has_sched else None,
+            'queue_depth': depth if has_sched else None,
+            'inflight': st.get('inflight') if has_sched else None,
+            'waiting': st.get('waiting') if has_sched else None,
+            'backend_hint': hint,
+            'web_uptime_sec': round(time.time() - WEB_STARTED_AT, 1),
+            'uptime_sec': st.get('uptime_sec'),
+            'errors': [x for x in (db_err, sched_err) if x],
+        }, 200 if healthy else 503)
+
     # ── 路由 ──
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -141,7 +218,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == '/admin':
                 self._page_admin()
             elif path == '/health':
-                self._json({'status': 'ok'})
+                self._health()
             elif path == '/api/status':
                 self._api_status(q)
             elif path == '/api/my':

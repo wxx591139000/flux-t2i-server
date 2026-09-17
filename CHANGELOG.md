@@ -1,5 +1,230 @@
 # CHANGELOG
 
+## [v2.6] - 2026-09-16
+
+**FLUX 生图质量保障：五层方法论 + 翻译层修复 + 双链真机端到端。**
+
+### 背景
+GPU 窗口内完成一批真机实验（bench / steps 扫描 / 中文翻译链 / 白底措辞），核实并修正了
+「FLUX 需英文」「负向词不生效」「steps 最优档」等关键认知，把能固化的结论落地成代码与文档。
+
+### 改动（代码）
+- `prompt_translator.py`：翻译规则加「禁止负向表达（no X）」「禁止擅自添加用户没提的实体」；
+  LLM 失败**不再静默兜底返回中文原文**（中文直发 FLUX 连主体都会错），改为抛 `TranslationError`，
+  `flux_queue.py` 捕获后**拒绝入队**而非降级出图。
+- `flux_resident_client.py`：`generate_via_resident` 的 `dest` 改为可选（None 跳过拉图），
+  修复 `bench` 子命令从未跑通的 `TypeError`。
+- `docs/PITFALLS.md`：补「`flux_web_service.py` 是 web-only 装配（scheduler=None），
+  该入口下 `POST /api/submit` 必然 500 —— 端到端/生产必须走 `flux_service.py`」。
+
+### 实测（真机 flux3 · RTX 4080 32G）
+- **bench 5 张连打**：单张推理 40.7s，极差 1.04s → 常驻无冷启动开销坐实。
+- **steps 六档扫描**（15/20/25/30/35/40，同 seed）：≈0.7s/step + 23s 固定开销，
+  **20 步即画质饱和** —— 外源「30–50 最佳」对本模型不成立。
+- **中文是分界线**：同句直连出动漫少女（主体错），过翻译层出干净商品图。
+- **A 链真机端到端**（submit→选机 flux3→status→download）：同 token 200 / 错 token 403。
+- **B 链真机端到端**（Next.js `/api/health` + `/api/generate` → A 链 → flux3）：全通，端到端 55.3s。
+- **offload**：32G 卡 `none` 档实测 OOM（权重 31.22 GiB 占满），`model` 档可用（显存 4 MiB）。
+
+### 关键认知（写入报告）
+中文必须过翻译层；负向词在 FLUX.1-dev 上被静默忽略（无 `true_cfg_scale`）；
+`steps=20` 饱和；提画质靠分辨率不靠 steps。
+
+### 未做
+legacy 链路对照（唯一能算出「常驻快几倍」）；`offload=sequential` 对比；1024²/3:4 构图一致性。
+
+## [v2.5] - 2026-09-16
+
+**接入 flux3（AutoDL 克隆实例）：把「换机器」从"要改代码"变成"改一个别名"。**
+
+### 背景
+flux1 / flux2 当日无卡可用，用户在 AutoDL 平台把实例**克隆**出一台新的。目标是让它直接接上，
+不改代码、不改调用方。
+
+### 改动
+- **显式登记 flux3**（`manager/flux_server_manager.py` 的 `_DEFAULT_SERVERS`）：name=`flux3`、
+  alias=`autodl-flux3`。克隆实例与原机同布局，`remote_base` / `remote_model` 沿用同一组默认路径。
+  （即使不登记，只要别名匹配 `FLUX_SERVER_ALIAS_GLOB` 也会被自动发现 —— 显式登记是为了让日志与
+  `jobs.server` 里出现稳定的名字 `flux3`，而不是一串别名。）
+- **新增 env `FLUX_DEFAULT_SERVER`**：`_resolve_default()` 让「默认机」可指定；不设则保持候选机第一台
+  （flux1，**行为完全向后兼容**）。解决的现实问题：默认机被小红书产线（`process_job`）与不带 `--server`
+  的 CLI 使用，而 flux1/flux2 已无卡 —— 设 `FLUX_DEFAULT_SERVER=flux3` 即可把默认机指过去。
+  填了不存在或未纳入的名字 → warning + 回退第一台，不抛。
+- `.env.example` 的「多机」章节补上 `FLUX_DEFAULT_SERVER` 说明。
+
+### 实测（真机，非 stub）
+```
+$ python manager/flux_resident_client.py servers
+     NAME       ALIAS              可达   带卡   模型   常驻   已加载    备注
+     flux1      autodl-flux        ✗    ✗    ✗    ✗    ✗       SSH 不通
+     flux2      autodl-flux2       ✗    ✗    ✗    ✗    ✗       SSH 不通
+  ▶  flux3      autodl-flux3       ✓    ✓    ✓    ✗    ✗      NVIDIA GeForce RTX 4080
+▶ = 会被选用的机器: autodl-flux3
+```
+A 链口径 `fsm.find_ready_server()` 同样选中 `flux3`。flux3 实地核对：工作目录
+`/root/autodl-tmp/flux-t2i` 在、`models/FLUX.1-dev/DOWNLOAD_DONE` 在、
+GPU `NVIDIA GeForce RTX 4080 / 32760 MiB`（已用 1 MiB）、数据盘 50G 用 32G。
+
+### 免密（一个容易踩空的点）
+克隆实例**继承了克隆源的 `/root/.ssh/authorized_keys`**，`id_rsa_musetalk` 直接可登 ——
+无需密码、无需 sshpass、`BatchMode=yes` 可用。这点关键：选机探测固定带 `BatchMode=yes`，
+纯密码认证会让全部探测直接失败（报「SSH 不通」而非「密码错」）。
+
+### 验证（离线，无需 GPU）
+`verify_autoselect.py` 20/20、`verify_resident_stub.py` 26/26、`verify_quota_patch.py` 2/2、
+`verify_refund_quota.py` 19/19 —— 全部通过，登记 flux3 未破坏既有选机语义。
+
+### 未做
+常驻服务拉起（`up`）与真机出图 / `bench` **未跑** —— 需用户确认（会占 32GB 显存并产生 GPU 计费时间）。
+`FLUX_OFFLOAD` 默认 `none`（全程显存），而该卡 32760 MiB 对 ~33GB fp16 权重余量很小，
+拉起若 OOM 需退 `model` 档。
+
+## [v2.4] - 2026-09-16
+
+**健康探针：把「HTTP 端口开着」升级为「能证明服务真的能干活」。**
+
+### 修复
+- **对外 `GET /health` 是硬编码 `{"status":"ok"}`**（`manager/flux_web_service.py:144`），
+  只能证明端口在监听。最难受的一类真实故障是 **worker 线程异常退出**：web 照常 200、用户提交照常拿到
+  `queued`，但队列永不再被消费 —— 从外部完全看不出来，只能等用户来问。
+
+### 新增
+- **web 浅探针 `_Handler._health()`**（`manager/flux_web_service.py`）：返回
+  `status / db_ok / worker_alive / health_alive / gen_mode / queue_depth / inflight / waiting /
+  backend_hint / web_uptime_sec / uptime_sec / errors[]`，HTTP 码 `200`（ok）/ `503`（degraded）。
+  **刻意零外呼**（不 SSH、不 HTTP 探 GPU 机）：否则一台 GPU 机关机就会让探针变慢/超时，
+  监控会把「后端不可用」误判成「本服务死了」。后端线索用零成本的 `waiting` 池大小推导（`backend_hint`）。
+- **`FluxQueueScheduler.stats()`**（`manager/flux_queue.py`）：进程内状态快照，best-effort 不加锁
+  （qsize/len 在 GIL 下足够原子；加锁反而可能与持锁的 `submit` 互相排队，把快探针变慢请求）。
+- **`FluxDB.ping()`**（`manager/flux_db.py`）：`SELECT 1` 探活，不查业务表（避免大表慢拖累探针）。
+
+### 判定的三种情况（别合并）
+```
+未挂调度器（has_sched=False，web-only 模式）→ 健康，worker_alive 报 null
+挂了且 worker 活着                          → 健康
+挂了但 worker 死 / stats() 读不出 / DB 坏    → degraded(503)，异常原文进 errors[]
+```
+探针自身**绝不抛**（否则 200 变 500，监控看到"崩了"而非"DB 坏了"）。
+
+### 下游站点侧（工作区 `ecom-image-studio`，非本仓文件）
+- `app/api/health/route.ts` 新增：一条 curl 同时给出站点层与上游层；上游不可达 → 503 + `degraded` +
+  `upstream.httpStatus=null`。
+- `lib/providers/flux.ts`：`fluxHealth()` 重构出 `fluxHealthReport()`（带 `httpStatus`/`latencyMs`/`detail`），
+  **`fluxHealth(): boolean` 保留为薄包装**不破坏既有契约。`httpStatus=null`（连不上）与 `503`
+  （连上了但上游自报不健康）是两种故障，不再被压成一个 boolean。
+
+### 验证（全部离线，无需 GPU）
+`chain-verify/verify_health_probe.py`（26 项，新增）：web-only 模式、worker 死→degraded、DB 坏→degraded、
+探针不抛、**AST 剥 docstring 后源码级证明零外呼**（禁用词 `ssh/curl/subprocess/fsm./fr./urllib/probe/Popen`）。
+`run_both_chains.sh` 现覆盖：A 链 27 + 浅探针 26 + B 链正向 24 + B 链反向 7 = **84 项全绿**。
+
+## [v2.3] - 2026-09-16
+
+**双链端到端验收 + 克隆机路径透传修复**。起因：确认「本项目的生图网页任务中心」与「面向客户的生图网站」
+是**两个独立项目**，各自要有完整可用的链路；两者唯一关联是网站通过 HTTP 调用本服务。
+
+### 修复
+- **`ensure_resident` 未透传 `FLUX_WORKDIR` / `FLUX_MODEL`**（`manager/flux_resident_client.py`）：
+  原先只传 `FLUX_RESIDENT_PORT/SCREEN/PY/TOKEN`，而 `start_resident.sh` 里 `WORKDIR`/`MODEL` 是硬编码默认值
+  → **克隆实例换了工作目录/模型路径时，脚本会去查错路径的模型，误报「模型未就绪」**，且上传的
+  `flux_resident_server.py` 与脚本查找路径错位。现按这台机器注册的 `remote_base` / `remote_model` 透传
+  （`shlex.quote` 包裹）。这正是「自动选在线机」要支持的克隆场景，属上一版遗漏。
+
+### 新增（仓库外，工作区 `chain-verify/`）
+- **`chainA_server.py`**：把真 `FluxWebServer` + 真 `FluxQueueScheduler` + 真 `FluxDB` 装配成常驻服务，
+  GPU 侧用 `--stub` 合成 PNG、传输走直连模式 —— **离线可跑完整任务中心链路**，装配方式与 `flux_service.py` 一致。
+- **`verify_chainA.py`**：任务中心端到端断言（20 项）。
+- **`verify_chainA_legacy_wiring.py`**：legacy 逃生口的接线体检（15 项）—— 用替身接管 `fsm.run`，
+  逼真模拟「远端成功出一张图」，验命令构造与产物搬运。**不证明**真实 SSH/GPU 可用。
+- **`verify_chainB.mjs` + `run_both_chains.sh`**：客户网站链路断言（正向 15 项 + 后端不可用反向 4 项），
+  一条命令起两条链验证完再收摊。
+
+### 文档
+- `README.md`：新增「两条链路及其边界（v2.3）」—— 画出任务中心完整链路图、明确下游网站是独立项目、
+  给出离线端到端自检命令；服务器部署章节补克隆机路径透传说明。
+- `docs/PITFALLS.md`：新增「双链验收 / 路径透传」「离线端到端自检的环境坑」两节。
+
+### 验收记录（2026-09-16，离线，无需 GPU/SSH）
+| 链路 | 断言 | 结果 |
+|---|---|---|
+| A 链：自带任务中心（resident 默认路径） | `/health` `/` `/center` `submit` `status` `download` 归属校验 配额 | **20/20** |
+| A 链：legacy 逃生口接线 | 依赖存在性 / 命令构造 / 产物搬运 / 不误杀常驻服务 | **15/15** |
+| B 链：客户网站正向 | 页面 / 入参校验 / 单图 / 多图 / 真实 PNG 尺寸 | **15/15** |
+| B 链：客户网站反向（后端不可用） | 500 + 结构化错误 + 可行动提示 | **4/4** |
+| 上一批回归 | 26 + 2 + 19 + 20 项 | **67/67** |
+
+## [v2.2] - 2026-09-16
+
+**多机自动选择 + 计费正确性修复**。第 1 项：应用 `flux-optimize/patches` 的两个补丁（配额双重计数、job_id 碰撞）。
+第 2 项：失败退配额。第 3 项：自动选在线机（换机 / 克隆实例到新服务器后免配置接入）。
+
+### 新增
+- **自动发现候选机**（`manager/flux_server_manager.py`）：`ssh_config_aliases()` 解析 `~/.ssh/config`，`discover_servers()` 把匹配 `FLUX_SERVER_ALIAS_GLOB`（默认 `autodl-flux*`）的别名自动登记为候选机。克隆实例到新服务器后**不用改代码**，只要有一条 Host 别名即可。探测时自动跳过无 GPU 的机器。
+- **`probe_full()`：一次 SSH 往返拿齐四态**（可达 / 带卡 / 模型文件 / 常驻服务）。旧选机路径每台要 3~4 次往返（`echo` + `nvidia-smi` + `test -f` + `curl`），候选机一多就按台数线性放大。现在每台固定 1 次。
+- **`probe_all()`：并行探测**。N 台全关机时，串行要 N × ConnectTimeout(8s)，并行后总耗时 ≈ 1 个 timeout。
+- **探测结果 TTL 缓存**（`FLUX_PROBE_TTL`，默认 20s，0=关闭）。选机逻辑每张图都会调用，不缓存则每张图 N 次 SSH。
+- **`FluxDB.usage_sub()`**：扣减月度用量，SQL `MAX(count-?, 0)` 保证下限 0，永不产生负数。
+- **`FluxDB.refund_job_once()`**：幂等退配额，靠新增列 `jobs.refunded_at` 防重复退。
+- **`fr.find_available_server()` 分级选机**：常驻已加载 > 可达+有卡+模型就绪 > 可达+有卡 > 可达（含无卡）。
+- **`fr.any_usable()`**：waiting 任务恢复门，判据是「可达+有卡+模型就绪」，**刻意不要求常驻服务已在跑**。
+- CLI 新增 `servers` 子命令：列出候选机四态 + 标出会被选哪台 + 列出未纳入的 `~/.ssh/config` 别名（`probe` 保留为旧名）。
+
+### 改动
+- `manager/flux_db.py`：**修复 `_lock` 初始化顺序** —— `self._lock` 原先在 `_migrate()` **之后**才赋值，而 `_migrate → _backfill_accounts → _one/_all/_exec` 都会 `with self._lock`，于是每次构造 `FluxDB` 都抛 `AttributeError`，被 `_backfill_accounts` 的宽 `except` 吞成一行「账户回填跳过」——**该迁移从未真正执行过**。现已把锁的创建提到 `_migrate()` 之前（实跑验证：迁移日志正常打出）。
+- `manager/flux_db.py`：`jobs` 表新增 `refunded_at` 列（SCHEMA + 幂等 `_migrate` 补列）。
+- `manager/flux_quota.py`：`precheck()` 改为**只用 `used` 判定**，不再叠加 `inflight`。`usage` 在入队时已 +1，`used` 天然包含在途任务；叠加后同一张在途图被算两次，突发提交时用户实际可用额度只有套餐一半。删除死代码 `record_enqueued()`（全仓零调用，留着会诱发真的双重计费）。
+- `manager/flux_queue.py`：`_process()` 与 `_recover_waiting_tasks()` 的**终态失败**落点接上 `_refund_quota()`（幂等）；`job_id` 由毫秒时间戳改为 `uuid.uuid4().hex[:16]`（毫秒时间戳同毫秒并发提交会撞主键）；`_any_ready()` 改用 `fr.any_usable()`。
+- `manager/flux_server_manager.py`：`probe()` 不再重复调两次 `gpu_ready()`（原来 `[0]`/`[1]` 各调一次，等于每台多跑一次 `nvidia-smi` 往返）；`find_ready_server()` 改走并行 `probe_all()`（语义与优先级顺序不变）。
+- `manager/flux_resident_client.py`：`probe()` 分流（`FLUX_RESIDENT_BASE` 有值走直连 HTTP，否则委托 `fsm.probe_full`）；`ensure_resident()` 复用探测结果里的 `gpu_ok`/`model_ok`，省掉每张图 2 次 SSH 往返；等待循环改用 `force=True` 绕过 TTL 缓存。
+
+### 计费语义（需要知道的行为变化）
+- 任务进入**终态失败**（业务失败 / 重试超限 `[RECOVER_SKIP]`）→ 自动退还 1 张配额，日志打 `↩️`。
+- `waiting`（服务器 down，进等待恢复池）→ **不退**。它不是终态，任务恢复后会继续跑；若在 waiting 就退，等于同一张图免费出。
+- 退款额度按 token 落账（与 `usage_add` 同口径），账户聚合仍由 `account_usage` 负责。
+
+### 验证（全部离线，无需 GPU / 网络）
+- `verify_resident_stub.py` **26/26 PASS**（回归，确认本批改动没打破常驻链路）
+- `verify_quota_patch.py` **2/2 PASS**：patch 前突发只放出 25 张（`used=25 + inflight=25` 命中上限 50），patch 后放满 50 张
+- `verify_refund_quota.py` **19/19 PASS**：退配额幂等、`usage_sub` 下限 0、业务失败退 / `waiting` 不退 / 重试超限退、以及 O-13 正例（账户回填迁移真的执行）
+- `verify_autoselect.py` **20/20 PASS**：`probe_full` 输出解析 5 种形态、分级选择 6 条规则、端到端接线 4 项、**每台恰好 1 次 SSH 往返**（4 台=4 次，无重复）、**并行实测 0.30s**（串行需 ~1.2s）、TTL 缓存命中后二次调用 0 次 SSH
+- 改动范围（md5 逐文件比对）：**5 改动 / 0 新增 / 0 删除 / 62 未动**
+
+### 未验证
+真机 GPU 出图、真实 SSH 连通性、多机同时在线时的实际选机结果、`bench --count 5` 的吞吐提升倍数。
+这些都需要 FLUX 机开机后才能定论 —— 未开机，不下结论。
+
+## [v2.1] - 2026-09-16
+
+**模型常驻生成路径**（消除「每张图冷启动重载 ~31GB 权重」的结构性瓶颈）。
+
+### 新增
+- `server/flux_resident_server.py`：GPU 端常驻生成服务。模型加载一次常驻显存，之后每个请求只做推理。HTTP + JSON 协议（`/health` `/generate` `/status` `/image` `/jobs` `/cancel`），只绑 `127.0.0.1`；单线程串行 worker + 优先级队列；任务状态落盘便于 SSH 排查；`--stub` 模式（纯标准库合成 PNG，无需 GPU）供离线自证。可选 `X-Auth-Token` 鉴权
+- `server/start_resident.sh`：常驻服务幂等启动/探活。`--check`（只读探活，就绪 exit 0）/ `--force` / `--stop`。只操作 `fluxd` 会话与 `flux_resident_serve[r].py`，**不删 `out/`、不动 `fluxgen`**，与旧链路互不干扰
+- `manager/flux_resident_client.py`：调用侧客户端与传输层。`DirectTransport`（本机可达时走 urllib）与 `SshCurlTransport`（远端 GPU 机走 `ssh <alias> curl`，无需端口转发）自动选择；`probe / find_available_server / any_ready / ensure_resident / wait_model_loaded / generate_via_resident` + 一个 CLI（`probe/health/up/gen/bench`）
+- `manager/.env.example`：配置样例（`FLUX_GEN_MODE` / `FLUX_RESIDENT_*` / `FLUX_OFFLOAD` …）
+
+### 改动
+- `manager/flux_queue.py`：`_generate()` 改为按 `FLUX_GEN_MODE` **分发**（resident 默认 / legacy 逃生口），原实现整段保留为 `_generate_legacy()` 未删改；新增 `_generate_resident()`，按 `TransportError.kind` 分流成 `[SERVER_DOWN]`（进等待恢复池）与普通失败；`_health_loop` 改用 `_any_ready()`（resident 模式一次 `/health` 覆盖可达/带卡/模型三态，旧路线每台 3 次 SSH 往返）；模块级显式 `_load_env()`
+- `manager/flux_server_manager.py`：`process_job()` 改为按同一开关分发，新增 `process_job_resident()`（逐张提交，产物布局与 `pull_images` 一致，`insert_into_note` 无需改动），原实现保留为 `process_job_legacy()`；模块级显式 `_load_env()`；新增 `GEN_MODE`
+- `manager/flux_service.py`：启动日志打印当前生成路径
+- `README.md` / `docs/ARCHITECTURE.md` / `docs/PITFALLS.md`：补常驻路径说明、架构图、8 条新踩坑
+
+### 能力增量
+- `width / height / steps / seed / negative_prompt` 可透传到服务端（旧 web 层只能传 prompt，服务端固定 768×1024 / steps 25 / seed 42）
+- 服务端加输入硬边界：尺寸归一到 16 的倍数并夹在 256~2048，steps 限 1~100，越界返回 400（不再静默截断）
+- 随机 seed 会随状态落账并回带，支持「拿到好图 → 用该 seed 复现」
+
+### 验证
+**已实测**（`flux-resident-verify/verify_resident_stub.py` 离线自证，**26/26 PASS**，无需 GPU）：
+服务生命周期、生成全链路、尺寸/seed/负向词透传（读 PNG IHDR 实测输出尺寸）、同 seed 字节级可复现、
+只传 prompt 时沿用旧默认、越界 400、未知 job 404、5 任务并发排队后全部终结、取消排队任务、
+错误分流（不可达→`server_down` / 业务错误→`failed`）、SSH 传输层的命令构造与中文 base64 编解码无损、
+启动脚本不误杀旧链路。另：4 个改动文件 py_compile 通过、`start_resident.sh` 通过 `bash -n`、
+resident/legacy 两种模式 import 均通过、非法 `FLUX_GEN_MODE` 回退并告警、`.env` 加载时序已验证。
+
+**未实测**：真机 GPU 出图、真实 SSH 连通性（不涉网络/密钥/认证）、`FLUX_OFFLOAD` 三档的显存与耗时差异、
+吞吐提升倍数。这些需要 FLUX 机开机后才能定论 —— 未开机，不下结论。
+
 ## [v2.0] - 2026-09-04
 
 **FLUX 多服务器化 + VPS 看门狗**（支持第 2 台 FLUX 服务器，任一台开机能接单）。

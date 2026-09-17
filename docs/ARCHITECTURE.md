@@ -1,11 +1,97 @@
 # 项目详细方案 — FLUX 文生图服务（通用）
 
-> 版本：v2.0 · 2026-09-04
+> 版本：v2.4 · 2026-09-16
+
+## 边界：本项目自带任务中心，下游站点是独立项目（v2.3 明确）
+
+本项目**自带完整可用的生图网页任务中心**（`flux_web_service.py` 的页面 + `/api/submit` → `/api/status`
+→ `/api/download` 三端点 + `flux_queue` 单 worker），不依赖任何其它项目。
+
+面向客户的生图网站（如 `ecom-image-studio`）是**独立项目**，唯一关联是**通过 HTTP 消费上面三个端点**。
+两边各自独立部署、独立健康；本项目侧的自检**不需要**下游站点存在，下游站点也只需保证
+`submit` 与 `download` 用同一个 token（归属校验按 `job.user_id == token`）。
+离线端到端自检见 README「两条链路及其边界（v2.3）」。
+
+## 健康探针（v2.4 新增）
+
+**问题**：原 `GET /health` 返回硬编码 `{"status":"ok"}`，只能证明"HTTP 端口开着"。真实故障里最难受的一种是
+**worker 线程异常退出**：web 照常 200、用户提交照常拿到 `queued`，但队列再也不会被消费，永远不出图 ——
+从外部完全看不出来，只能等用户来问。
+
+**分层**（两个 `/health` 是两个不同东西）：
+
+| 探针 | 位置 | 回答 | 外呼 |
+|---|---|---|---|
+| 常驻服务 `/health`（默认 :9630） | GPU 机 | 模型加载了吗 / GPU / 队列深度 / 当前任务 | 不适用 |
+| 对外 web `/health`（:9620） | 本机 | **本进程**健康吗 / 队列积压 / 后端疑似不可用 | **零外呼** |
+
+**web 浅探针数据源**（全部进程内）：
+```
+FluxQueueScheduler.stats()  → gen_mode / queue_depth / inflight / waiting
+                              / worker_alive / health_alive / stopped / uptime_sec
+FluxDB.ping()               → SELECT 1（只证明连接可用，不查业务表）
+web_uptime_sec              → 模块级 WEB_STARTED_AT
+```
+
+**判定规则**（`_Handler._health()`，`flux_web_service.py`）：
+```
+healthy = db_ok and not (has_sched and (sched_err or not worker_alive))
+  未挂调度器（has_sched=False，web-only 模式）→ 算健康，worker_alive 报 null
+  挂了但 worker 死 / stats() 读不出       → degraded(503)，异常原文进 errors[]
+HTTP 码同步：200 / 503
+```
+
+**刻意不做**：不在探针里 SSH 或 HTTP 探 GPU 机。否则一台 GPU 机关机就会让本服务探针变慢/超时，
+监控会把「后端不可用」误判成「本服务死了」。`waiting` 池大小是**零成本推导**出的后端线索
+（waiting 池只装 `[SERVER_DOWN]` 任务）：`waiting>0 → backend_hint=server_down`，仅供参考。
+
+**下游站点侧**（如 `ecom-image-studio`）：把上游 `/health` 包成自己的 `GET /api/health`，
+一次响应里同时给出站点层与上游层，上游不可达返回 503 + `status=degraded` + `upstream.httpStatus=null`。
+区分「连不上」（`httpStatus=null`）与「连上了但上游自报不健康」（`httpStatus=503`）—— 两者故障定位完全不同。
+
+
+## 模型常驻生成路径（v2.1 新增）
+
+**动机**：旧链路每张图都要走「pkill 旧进程 → screen 起 `gen_flux.py` → `from_pretrained` 重载
+~31GB 权重 → 生成 1 张 → 进程退出」。N 张图 = N 次模型加载，吞吐被结构性地卡在 I/O 上。
+
+**做法**：GPU 机上跑一个常驻进程，模型加载一次常驻显存，之后每个请求只做推理。
+
+```
+本地 (Windows)                                        服务器 (AutoDL)
+┌─────────────────────────────────────────┐          ┌────────────────────────────────────┐
+│ flux_queue._generate                    │          │ flux_resident_server.py            │
+│   └─ [GEN_MODE=resident] ──────────────►│          │  ├─ JobStore  (内存任务表+落盘)     │
+│       flux_resident_client              │          │  ├─ FluxWorker(单线程串行, 优先级队列)│
+│         ├─ DirectTransport (urllib)     │◄────────►│  ├─ FluxPipeline  ← 常驻显存         │
+│         │   本机可达时用（本地部署/隧道）│  HTTP    │  │   (FLUX_OFFLOAD=none|model|seq) │
+│         └─ SshCurlTransport (ssh+curl)  │          │  └─ resident_out/<job_id>.png      │
+│            远端 GPU 机时用（无需隧道）   │  ──ssh──►│                                    │
+│         fetch_png: scp 拉回             │          │                                    │
+└─────────────────────────────────────────┘          └────────────────────────────────────┘
+```
+
+- **协议**：`GET /health`（状态/GPU/队列深度）· `POST /generate` · `GET /status?job_id` ·
+  `GET /image?job_id`（PNG）· `GET /jobs` · `POST /cancel`。只绑 `127.0.0.1`，不新增公网暴露面。
+- **两种传输自动选择**：`FLUX_RESIDENT_BASE` 有值 → 直连；否则 → SSH 执行远端 curl。
+  SSH 方式不建隧道、不用管隧道生命周期，与项目原有 `fsm.run` 走 ssh 的风格一致。
+- **鉴权**：设 `FLUX_RESIDENT_TOKEN` 后所有请求需带 `X-Auth-Token`；不设则不校验（仅本机可绑定）。
+- **错误分流**：`TransportError.kind` 分 `server_down`（进等待恢复池，等机器回来重试）与
+  `failed`（业务失败，直接标记失败）。这个区分决定任务是否会被无限重试，必须精确。
+- **能力增量**：`width/height/steps/seed/negative_prompt` 全部可透传（旧 web 层只能传 prompt；
+  服务端固定 768×1024 / steps 25 / seed 42）。同时服务端加硬边界：尺寸归一 16 的倍数并夹在
+  256~2048，steps 限 1~100，越界返回 400。
+- **两条链路互斥**：常驻服务占住显存后，旧链路再上一份模型会 OOM。故 `flux_queue`（web 队列）
+  与 `flux_server_manager.process_job`（小红书配图）**共用同一个 `FLUX_GEN_MODE` 一起切**。
+- **回退**：`FLUX_GEN_MODE=legacy` 一键回到旧链路；旧的文件与函数**全部保留**，未删除。
 
 ## 多服务器 + VPS 看门狗（v2.0 新增）
 
-- **多服务器注册表**：`manager/flux_server_manager.py` 的 `FLUX_SERVERS` 维护多台 FLUX 机（默认 flux1 `autodl-flux` + flux2 `autodl-flux2`；env `FLUX_SERVERS_JSON` 可覆写，未来加机不动代码）。所有 SSH 操作接受 `server` 参数（None=默认 flux1 向后兼容）。
-- **调度**：`flux_queue._generate` 每单 `fsm.find_ready_server()` 挑第一台 **可达 + 带卡(nvidia-smi) + 模型就绪(DOWNLOAD_DONE)** 的服务器执行 → `server` 名回写 jobs 表。任一台上线即接单；`_health_loop` 用 `any_ready()`——任一台起来即恢复 waiting 池。保持单 worker 串行。
+- **多服务器注册表**：`manager/flux_server_manager.py` 的 `FLUX_SERVERS` 维护多台 FLUX 机（默认 flux1 `autodl-flux` + flux2 `autodl-flux2` + flux3 `autodl-flux3`；env `FLUX_SERVERS_JSON` 可覆写）。**v2.2 起支持自动发现**：`ssh_config_aliases()` 解析 `~/.ssh/config`，`discover_servers()` 把匹配 `FLUX_SERVER_ALIAS_GLOB`（默认 `autodl-flux*`）的别名自动登记为候选机 —— 克隆实例到新服务器后免配置接入。所有 SSH 操作接受 `server` 参数（None=默认机）。**v2.5 起默认机可配**：`_resolve_default()` 读 env `FLUX_DEFAULT_SERVER`，不设则候选机第一台（flux1，向后兼容）—— 用于第一台「开机但没卡」时把产线 / 不带 `--server` 的 CLI 的默认机临时指到别的机器；A 链不受影响（走 `find_ready_server()` 每单自选）。
+- **探测（v2.2 重写）**：`fsm.probe_full()` 把「可达 / 带卡 / 模型文件 / 常驻服务」合成**一条远程命令**（`echo REACH; nvidia-smi …; test -f DOWNLOAD_DONE …; curl /health`），用标记行切分解析 —— 每台固定 **1 次 SSH 往返**（旧路径 3~4 次）。`fsm.probe_all()` **并行**探测（`ThreadPoolExecutor`），结果按 `FLUX_PROBE_TTL`（默认 20s）缓存。
+- **选机分级（v2.2）**：`fr._pick_from()` 按 ①常驻在跑+模型已加载 ②可达+有卡+模型就绪 ③可达+有卡 ④可达（含无卡）逐级挑选，满足即停。第 ④ 级**故意保留**无卡机器，以便 `ensure_resident` 报出「需切带卡模式」的准确原因。CLI `servers` 与生产路径共用这一套判断（`_pick_from` 抽出来就是为了避免"命令说选 A、实际跑 B"）。
+- **调度**：`flux_queue._generate` 按 `FLUX_GEN_MODE` 分发（v2.1）。**resident**（默认）走 `flux_resident_client.find_available_server()` → `ensure_resident()`（幂等拉起）→ `generate_via_resident()`；`ensure_resident` 复用探测结果里的 `gpu_ok`/`model_ok`，不再各补一次 SSH，并按**这台机器**的 `remote_base`/`remote_model` 透传 `FLUX_WORKDIR`/`FLUX_MODEL`（v2.3 修）。**legacy** 走 `fsm.find_ready_server()`（v2.2 起也走并行 `probe_all()`，语义不变）→ `start_generation()` → `wait_generation()`。两条路线都把 `server` 名回写 jobs 表。任一台上线即接单；`_health_loop` 用 `_any_ready()` 分流 —— resident 模式用 `fr.any_usable()`（可达+有卡+模型就绪，**不要求常驻已在跑**，否则换机后 waiting 任务会一直卡住）。保持单 worker 串行。
+- **计费（v2.2）**：入队时 `usage_add(1)` 是**唯一**计费入口（`flux_quota.record_enqueued` 已删）；`precheck` 只用 `used` 判定（不再叠加 `inflight`，否则在途图算两次、额度只剩一半）；终态失败（业务失败 / 重试超限）经 `_refund_quota()` → `FluxDB.refund_job_once()` 幂等退还，`waiting` **不退**。
 - **VPS 看门狗**（`watchdog/`，镜像 qwen `watchdog-vps`）：VPS(`vps-aliyun`) systemd 长驻 `flux_watchdog.sh`，`TARGETS` 逐台巡检。机器在线但「未就绪」→ 自动推送并跑就地 `flux_server_ready.sh` 预热成可接单（带卡+模型+脚本校验 + 清残留 + 打 `SERVER_READY`），轮询确认。语义=预热就绪+保活，真正生图仍由任务中心按需调度。
 - **加机**：任务中心在 `FLUX_SERVERS` 加一条 + `~/.ssh/config` 加别名 + 免密；看门狗在 `TARGETS` 加一行 + 配 key → `systemctl restart flux-watchdog`。
 
@@ -32,17 +118,40 @@
 
 | 模块 | 职责 |
 |---|---|
-| `server/gen_flux.py` | 加载 FluxPipeline（bf16 + CPU offload），读 prompts.json 逐张生成，同名输出跳过 |
-| `server/start_gen.sh` | 带卡检查→模型检查→脚本检查→screen 后台启动 gen_flux.py；幂等 |
+| `server/flux_resident_server.py` | **(v2.1)** 常驻生成服务：HTTP 协议 + 单线程串行 worker + 模型常驻显存。自带 stub 模式（`--stub`，无需 GPU）便于离线自证 |
+| `server/start_resident.sh` | **(v2.1)** 常驻服务幂等启动/探活：`--check`（只读，就绪 exit 0）/ `--force` / `--stop`。只操作 `fluxd` 会话，不碰旧链路的 `fluxgen` |
+| `manager/flux_resident_client.py` | **(v2.1)** 常驻服务客户端与传输层：`probe / probe_all / find_available_server / _pick_from / any_ready / any_usable / ensure_resident / wait_model_loaded / generate_via_resident`，CLI 含 `servers`（候选机四态 + 会选哪台 + 未纳入别名）|
+| `server/gen_flux.py` | (legacy) 加载 FluxPipeline（bf16 + CPU offload），读 prompts.json 逐张生成，同名输出跳过 |
+| `server/start_gen.sh` | (legacy) 带卡检查→模型检查→脚本检查→screen 后台启动 gen_flux.py；幂等 |
 | `server/dl_curl.sh` | curl 流式断点续传下载全部分片，停滞检测，完成打 DOWNLOAD_DONE |
-| `local/flux_gen_watchdog.py` | 本地循环：可达性→带卡→模型→启动→确认→(可选)拉回 |
+| `local/flux_gen_watchdog.py` | 本地循环：可达性→带卡→模型→启动→确认→(可选)拉回（走旧链路） |
 
 ## 数据流 / 调用链路
 
-**生成链路**：
+**生成链路（v2.1 默认 · 常驻）**：
+```
+prompt → 常驻服务 /generate → FluxWorker(单线程) → FluxPipeline(常驻显存) → resident_out/<job_id>.png
+       → scp 拉回 web_out/<job_id>/<job_id>.png（或 CLI 指定路径）
+```
+
+**生成链路（legacy）**：
 ```
 prompts.json → gen_flux.py → FluxPipeline(FLUX.1-dev) → out/<NN>_<组名>/<key>.png
 ```
+
+**常驻服务启动链路**（幂等）：
+```
+ensure_resident()                                   ← 管理器侧（manager/flux_resident_client.py）
+  → upload_scripts()  scp flux_resident_server.py + start_resident.sh → {remote_base}/
+  → ssh '<env> bash start_resident.sh'              ← 环境变量必须带 FLUX_WORKDIR / FLUX_MODEL（v2.3 修）
+start_resident.sh → [无卡?]abort → [模型未就绪?]abort → [已在跑且非--force?]skip
+                 → screen -dmS fluxd python flux_resident_server.py
+                 → 轮询 /health（≤30s）确认 HTTP 起来（模型加载在后台继续）
+```
+
+⚠️ **路径必须按机器透传**：`start_resident.sh` 的 `WORKDIR` / `MODEL` 是默认值（`${FLUX_*:-默认}`），
+而 `SERVER_PY="$WORKDIR/flux_resident_server.py"` 必须与 `upload_scripts` 的目标目录（`{remote_base}/`）一致。
+克隆实例换了路径时若不带这两个变量，脚本会查错路径 → 误报「模型未就绪」（v2.3 已修，见 `docs/PITFALLS.md`）。
 
 **一键启动链路**（幂等）：
 ```
@@ -73,9 +182,9 @@ watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? 
 | 模块 | 职责 |
 |---|---|
 | `flux_service.py` | main 入口，wiring DB→quota→queue→web→feishu_bot + 健康监控 |
-| `flux_web_service.py` | 对外 HTTP 服务（stdlib http.server），网页 + API + 认证 |
-| `flux_queue.py` | 队列调度器（核心）：PriorityQueue + 单 worker，复用 manager SSH 函数 |
-| `flux_db.py` | SQLite 存储：users/codes/jobs/usage + `user_ensure` |
+| `flux_web_service.py` | 对外 HTTP 服务（stdlib http.server），网页 + API + 认证。**(v2.4)** `GET /health` 为浅探针（`_health()`，只读进程内状态、零外呼）；注意 `main()` 单独跑时 `scheduler=None`（web-only 模式）探针须容忍 |
+| `flux_queue.py` | 队列调度器（核心）：PriorityQueue + 单 worker，复用 manager SSH 函数。**(v2.4)** 加 `stats()` 供探针读进程内状态（best-effort 快照，不加锁） |
+| `flux_db.py` | SQLite 存储：users/codes/jobs/usage + `user_ensure`。**(v2.4)** 加 `ping()`（`SELECT 1`）供探针探活 |
 | `flux_quota.py` | 月度图片配额（owner 无限） |
 | `plans.yaml` | 套餐（default/basic/pro，月度图片数） |
 | `feishu_notify.py` | 飞书通知（私信 + 图片上传/回传） |

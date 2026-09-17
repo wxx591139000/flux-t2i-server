@@ -6,10 +6,19 @@ FLUX 服务器管理器（对标转录bot orchestrator 的服务器管理模式�
 - 服务器可达时自动拉起生成服务（start_gen.sh，幂等）
 - 生成完成 → 拉回图片 → 替换 Obsidian 稿子 <!--IMG:N--> 占位符 → 飞书通知
 
-多服务器支持（v2.0）：
-- FLUX_SERVERS 注册表维护多台 flux 服务器（env FLUX_SERVERS_JSON 可覆写，未来加机不动代码）
-- SSH 操作全部接受 server 参数（None = 默认 flux1，向后兼容）
+多服务器支持（v2.0，2026-09-16 起支持自动发现）：
+- FLUX_SERVERS 注册表维护多台 flux 服务器
+- 自动发现：扫 ~/.ssh/config，把匹配 FLUX_SERVER_ALIAS_GLOB 的别名自动登记为候选机
+  —— 克隆实例到新机后，只要有一条 Host 别名就自动带上，不用改代码
+- probe_full() 一次 SSH 往返拿齐「可达 / 带卡 / 模型文件 / 常驻服务」四态（选机用）
+- SSH 操作全部接受 server 参数（None = 默认机；默认机 = 候选机第一台 flux1，
+  可用 FLUX_DEFAULT_SERVER 覆盖，向后兼容）
 - find_ready_server() 返回第一台可达+带卡+模型就绪的服务器
+
+生成路径（FLUX_GEN_MODE，2026-09-16 起）：
+- resident（默认）  走 manager/flux_resident_client.py + server/flux_resident_server.py，
+                    模型加载一次常驻显存，每张图只做推理；process_job 逐张提交
+- legacy            走 start_gen.sh + gen_flux.py 的冷启动链路（保留作逃生口/回退）
 
 用法:
   python flux_server_manager.py                 # 常驻 daemon
@@ -20,8 +29,11 @@ import os
 import sys
 import json
 import time
+import shlex
 import shutil
+import fnmatch
 import logging
+import threading
 import subprocess
 import argparse
 from pathlib import Path
@@ -32,20 +44,84 @@ BASE_DIR = Path(__file__).parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from manager.feishu_notify import notify_owner
+from manager.feishu_notify import notify_owner, _load_env
+_load_env()   # 同 flux_queue：先把 manager/.env 灌进环境，模块级配置才读得到
 JOB_DIR = Path(os.environ.get('FLUX_JOB_DIR',
     r'E:\ObsidianHouse\xiaohongshu-workspace\data\flux_jobs'))
 DONE_DIR = JOB_DIR / '_done'
 OBSIDIAN_IMAGES = Path(os.environ.get('FLUX_OBSIDIAN_IMAGES',
     r'E:\ObsidianHouse\ObsidW\02 Projects项目\hongshu\02-稿子\images\flux_out'))
 
-# ═══════════════ 多服务器注册表 ═══════════════
+# ═══════════════ 多服务器注册表（含自动发现） ═══════════════
 # 每台 = {name, alias(~/.ssh/config), remote_base(工作目录), remote_model(模型路径)}
-# 支持 env FLUX_SERVERS_JSON 覆盖（未来加机不动代码）
+# 优先级：env FLUX_SERVERS_JSON（显式，完全接管） > 显式默认机 + 自动发现
+#
+# 自动发现解决的实际问题：用户有时换到有卡的机器，或把整个实例克隆到新服务器。
+# 克隆实例与原机是同布局（同 remote_base / remote_model），只差一个 SSH 别名，
+# 所以只要别名能匹配 FLUX_SERVER_ALIAS_GLOB，就自动成为候选机 —— 不用改代码。
 _DEFAULT_SERVERS = [
     {"name": "flux1", "alias": "autodl-flux",  "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
     {"name": "flux2", "alias": "autodl-flux2", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
+    # flux3 = 2026-09-16 从 AutoDL 平台克隆出的实例（当日 flux1/flux2 无卡）。
+    # 克隆实例与原机同布局，故 remote_base / remote_model 沿用同一组默认路径。
+    # alias 必须与 ~/.ssh/config 里的 Host 名逐字一致；换了命名就改这一行，
+    # 或走 FLUX_SERVER_ALIAS_GLOB 自动发现（见下方 discover_servers）。
+    {"name": "flux3", "alias": "autodl-flux3", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
 ]
+
+FLUX_SERVER_DISCOVER = (os.environ.get('FLUX_SERVER_DISCOVER', '1').strip() != '0')
+# 支持逗号分隔多模式，例如 "autodl-flux*,autodl-clone-gpu"
+FLUX_SERVER_ALIAS_GLOB = os.environ.get('FLUX_SERVER_ALIAS_GLOB', 'autodl-flux*')
+# 克隆实例沿用同布局，路径用这两个兜底
+FLUX_REMOTE_BASE = os.environ.get('FLUX_REMOTE_BASE', '/root/autodl-tmp/flux-t2i')
+FLUX_REMOTE_MODEL = os.environ.get('FLUX_REMOTE_MODEL', '/root/autodl-tmp/models/FLUX.1-dev')
+
+
+def ssh_config_aliases() -> list:
+    """从 ~/.ssh/config 读出所有 Host 别名（跳过含通配符的模板项）。"""
+    cfg = Path(os.path.expanduser('~')) / '.ssh' / 'config'
+    if not cfg.exists():
+        return []
+    out = []
+    try:
+        for line in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line[:4].lower() == 'host' and (len(line) == 4 or line[4] in ' \t'):
+                for a in line.split()[1:]:
+                    if any(c in a for c in '*?!'):
+                        continue            # Host * / 模板项，不是真实主机
+                    out.append(a)
+    except Exception as e:
+        # 用局部取 logger：本函数在模块级（FLUX_SERVERS = _load_servers()）就会被调用，
+        # 那时模块的 log 还没定义，直接引用会 NameError
+        logging.getLogger('flux_manager').warning(f'解析 ~/.ssh/config 失败: {e}')
+    return out
+
+
+def discover_servers() -> list:
+    """候选机 = 显式默认机 + ~/.ssh/config 中匹配 FLUX_SERVER_ALIAS_GLOB 的别名。
+
+    显式注册的别名优先（保留 flux1/flux2 的稳定顺序与名字），
+    自动发现的机器 name 直接取别名，并打 discovered=True 便于排查。
+    """
+    servers = [dict(s) for s in _DEFAULT_SERVERS]
+    seen = {s.get('alias') for s in servers}
+    if not FLUX_SERVER_DISCOVER:
+        return servers
+    pats = [p.strip() for p in FLUX_SERVER_ALIAS_GLOB.split(',') if p.strip()]
+    for alias in ssh_config_aliases():
+        if alias in seen:
+            continue
+        if pats and not any(fnmatch.fnmatchcase(alias, p) for p in pats):
+            continue
+        servers.append({'name': alias, 'alias': alias,
+                        'remote_base': FLUX_REMOTE_BASE,
+                        'remote_model': FLUX_REMOTE_MODEL,
+                        'discovered': True})
+        seen.add(alias)
+    return servers
 
 
 def _load_servers() -> list:
@@ -57,11 +133,41 @@ def _load_servers() -> list:
                 return loaded
         except Exception:
             pass
-    return _DEFAULT_SERVERS
+    return discover_servers()
 
 
 FLUX_SERVERS = _load_servers()
-SERVER_DEFAULT = FLUX_SERVERS[0]
+
+
+def _resolve_default(servers: list) -> dict:
+    """默认机 = FLUX_DEFAULT_SERVER 指定的那台；未指定则候选机第一台（向后兼容）。
+
+    为什么需要这个开关：默认机被两条路径使用 ——
+      ① 小红书产线（本模块 process_job / health_check_pending）
+      ② 不带 --server 的 CLI 调用（flux_resident_client._server_by_name(None)）
+    当候选机第一台「开机但没卡」（GPU 被占 / AutoDL 切成无卡模式）时，
+    希望不改代码就能把默认机临时指到当前有卡的机器：FLUX_DEFAULT_SERVER=flux3。
+    注意它只改「默认值」，不改变候选机集合，也不影响分级自动选机
+    （A 链走的是 find_ready_server，本来就每单自己挑）。
+    """
+    want = (os.environ.get('FLUX_DEFAULT_SERVER') or '').strip()
+    if want:
+        for s in servers:
+            if want in (s.get('name'), s.get('alias')):
+                return s
+        logging.getLogger('flux_manager').warning(
+            f'FLUX_DEFAULT_SERVER={want!r} 不在候选机 '
+            f'{[s["name"] for s in servers]} 中，回退第一台')
+    return servers[0]
+
+
+SERVER_DEFAULT = _resolve_default(FLUX_SERVERS)
+
+# 探测结果缓存：SSH 往返是这个模块最贵的操作，而选机逻辑每张图都会调用。
+# FLUX_PROBE_TTL=0 可关闭（调试/测试时用）。
+_PROBE_TTL = float(os.environ.get('FLUX_PROBE_TTL', '20'))
+_probe_cache = {}                      # alias -> (ts, probe_dict)
+_probe_cache_lock = threading.Lock()
 
 
 def _get_server(server=None) -> dict:
@@ -76,7 +182,8 @@ def _get_server(server=None) -> dict:
     return SERVER_DEFAULT
 
 
-# 旧常量 = 默认服务器（flux1），向后兼容（小红书产线 process_job 等仍走 flux1）
+# 旧常量 = 默认服务器（候选机第一台；FLUX_DEFAULT_SERVER 可覆盖）。
+# 向后兼容：小红书产线 process_job 等仍走默认机。
 SSH_ALIAS = SERVER_DEFAULT['alias']
 REMOTE_BASE = SERVER_DEFAULT['remote_base']
 REMOTE_MODEL = SERVER_DEFAULT['remote_model']
@@ -87,6 +194,12 @@ logging.basicConfig(level=logging.INFO,
     handlers=[logging.FileHandler(BASE_DIR / 'manager' / 'flux_manager.log', encoding='utf-8'),
               logging.StreamHandler(sys.stdout)])
 log = logging.getLogger('flux_manager')
+
+# 生成路径：resident（常驻服务，默认）/ legacy（每张冷启动）
+GEN_MODE = (os.environ.get('FLUX_GEN_MODE') or 'resident').strip().lower()
+if GEN_MODE not in ('resident', 'legacy'):
+    log.warning(f'未知 FLUX_GEN_MODE={GEN_MODE!r}，回退为 resident')
+    GEN_MODE = 'resident'
 
 
 # ═══════════════ SSH / 服务器操作 ═══════════════
@@ -226,22 +339,122 @@ def insert_into_note(job: dict) -> bool:
 # ═══════════════ 多服务器探活 / 选择 ═══════════════
 
 def probe(server=None) -> dict:
-    """探测单台服务器完整状态：reachable / gpu_ok / gpu模型 / model_ok"""
+    """探测单台服务器完整状态：reachable / gpu_ok / gpu / model_ok。
+
+    注意 gpu_ready() 只调一次 —— 原实现用 [0]/[1] 各调一次，
+    等于每台服务器多跑一次 nvidia-smi 的 SSH 往返。
+    """
     s = _get_server(server)
+    gpu_ok, gpu = gpu_ready(s)
     return {
         'name': s['name'],
         'alias': s['alias'],
         'reachable': server_reachable(s),
-        'gpu_ok': gpu_ready(s)[0],
-        'gpu': gpu_ready(s)[1],
+        'gpu_ok': gpu_ok,
+        'gpu': gpu,
         'model_ok': model_ready(s),
     }
 
 
+def probe_full(server=None, force: bool = False) -> dict:
+    """一次 SSH 往返拿齐四态：可达 / 带卡 / 模型文件 / 常驻服务。**选机专用**。
+
+    为什么合成一条命令：原选机路径每台要 3~4 次 SSH 往返
+    （echo + nvidia-smi + test -f + curl），候选机一多就按台数线性放大，
+    且全关机时每台还要各等一个 ConnectTimeout。合成后每台固定 1 次往返。
+
+    结果按 FLUX_PROBE_TTL 秒缓存（默认 20，设 0 关闭）。选机逻辑每张图都会调用，
+    不缓存的话候选机一多就是每张图 N 次 SSH。代价：机器刚开机最多晚 TTL 秒被认出来，
+    需要立刻刷新就传 force=True。
+
+    输出用标记行切分：REACH / <GPU 名> / MODEL_OK|MODEL_MISSING / <health JSON>|HEALTH_FAIL
+    """
+    s = _get_server(server)
+    alias = s['alias']
+    if not force and _PROBE_TTL > 0:
+        with _probe_cache_lock:
+            hit = _probe_cache.get(alias)
+        if hit and (time.time() - hit[0]) < _PROBE_TTL:
+            return hit[1]
+
+    port = int(os.environ.get('FLUX_RESIDENT_PORT', '9630'))
+    remote = (f"echo REACH; "
+              f"nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; "
+              f"test -f {s['remote_model']}/DOWNLOAD_DONE && echo MODEL_OK || echo MODEL_MISSING; "
+              f"curl -s -m 5 http://127.0.0.1:{port}/health || echo HEALTH_FAIL")
+    d = {'name': s.get('name'), 'alias': alias, 'reachable': False,
+         'gpu_ok': False, 'gpu': '', 'model_ok': False,
+         'resident': False, 'model_loaded': False, 'status': '',
+         'health': None, 'error': ''}
+    ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {alias} '
+                  f'{shlex.quote(remote)}', 20)
+    if not ok:
+        d['error'] = 'SSH 不通（可能关机 / 别名未在 ~/.ssh/config 中）'
+    else:
+        lines = [ln.strip() for ln in (out or '').splitlines()]
+        if 'REACH' not in lines:
+            d['error'] = (out or '')[:160] or 'SSH 无输出'
+        else:
+            d['reachable'] = True
+            marks = {'REACH', 'MODEL_OK', 'MODEL_MISSING', 'HEALTH_FAIL'}
+            for ln in lines[1:]:                  # 跳过 REACH 行；GPU 名是第 2 行
+                if ln in marks or ln.startswith('{'):
+                    continue
+                d['gpu'] = ln[:80]
+                break
+            d['gpu_ok'] = bool(d['gpu']) and 'NVIDIA' in d['gpu']
+            d['model_ok'] = 'MODEL_OK' in lines
+            for ln in reversed(lines):            # /health 的 JSON 落在最后一段
+                if not (ln.startswith('{') and ln.endswith('}')):
+                    continue
+                try:
+                    h = json.loads(ln)
+                except Exception:
+                    break
+                d['health'] = h
+                d['resident'] = True
+                d['status'] = h.get('status', '')
+                d['model_loaded'] = bool(h.get('model_loaded'))
+                if h.get('model_error'):
+                    d['error'] = h['model_error']
+                break
+    if _PROBE_TTL > 0:
+        with _probe_cache_lock:
+            _probe_cache[alias] = (time.time(), d)
+    return d
+
+
+def probe_all(servers=None, force: bool = False) -> list:
+    """并行探测所有候选机，返回 [(server, probe), ...]，保持注册顺序。
+
+    并行是关键：N 台全关机时，串行要 N × ConnectTimeout(8s)；
+    并行后总耗时 ≈ 1 个 timeout。
+    """
+    servers = list(servers if servers is not None else FLUX_SERVERS)
+    if not servers:
+        return []
+    if len(servers) == 1:
+        return [(servers[0], probe_full(servers[0], force=force))]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(servers), 8)) as ex:
+        probes = list(ex.map(lambda s: probe_full(s, force=force), servers))
+    return list(zip(servers, probes))
+
+
+def clear_probe_cache():
+    """清掉探测缓存（测试/强制刷新用）。"""
+    with _probe_cache_lock:
+        _probe_cache.clear()
+
+
+
 def find_ready_server() -> dict | None:
-    """返回第一台 可达 + 带卡 + 模型就绪 的服务器；都没就绪返回 None。"""
-    for s in FLUX_SERVERS:
-        p = probe(s)
+    """返回第一台 可达 + 带卡 + 模型就绪 的服务器；都没就绪返回 None。
+
+    语义与旧版完全一致（同样的优先级顺序），但探测改为并行 probe_full：
+    每台 1 次 SSH 往返 + TTL 缓存。旧版是串行 3~4 次往返/台。
+    """
+    for s, p in probe_all():
         if p['reachable'] and p['gpu_ok'] and p['model_ok']:
             log.info(f'🟢 选中服务器: {p["name"]} ({p["alias"]}) gpu={p["gpu"]}')
             return s
@@ -256,7 +469,64 @@ def any_ready() -> bool:
 # ═══════════════ 任务处理 ═══════════════
 
 def process_job(job: dict) -> bool:
-    """处理单个配图任务：确保服务器→生成→拉回→插入→通知（小红书产线专用，默认走 flux1）"""
+    """处理单个配图任务：确保服务器→生成→拉回→插入→通知（小红书产线专用）"""
+    if GEN_MODE == 'resident':
+        return process_job_resident(job)
+    return process_job_legacy(job)
+
+
+def process_job_resident(job: dict) -> bool:
+    """常驻服务版：逐张提交给 GPU 机上的常驻服务。
+
+    与原链路的差别：
+      · 模型不再每张重载 —— N 张图只加载一次模型（原链路是 N 次）
+      · 逐张落盘，中途失败时前面的成品保留（重跑会覆盖重生成，但不影响已插入的稿子）
+      · 产物布局与 pull_images 一致（images/flux_out/<batch>/P<n>.png），
+        所以 insert_into_note 完全不用改
+    """
+    # 延迟导入：flux_resident_client 反向依赖本模块，模块级导入会成环
+    import manager.flux_resident_client as fr
+
+    n = len(job['images'])
+    job_id = job['job_id']
+    log.info(f'▶ 处理任务(常驻): {job["note_title"]} ({n}张)')
+
+    server, p = fr.find_available_server()
+    if not server:
+        log.warning('🔴 FLUX 服务器不可达，通知 user 开机')
+        notify_owner(f'🔴 FLUX 文生图服务器不可达\n'
+                     f'有配图任务待处理: {job["note_title"]} ({n}张)\n'
+                     f'请到 AutoDL 控制台开机（带卡模式）。')
+        return False                             # 任务保留队列，恢复后重试
+
+    r = fr.ensure_resident(server, p)
+    if not r['ok']:
+        log.error(f'❌ 常驻服务不可用: {r["msg"][:200]}')
+        if r['kind'] == 'server_down':
+            notify_owner(f'⚠️ FLUX 常驻服务不可用（{server["name"]}）\n'
+                         f'任务: {job["note_title"]}\n{r["msg"][:300]}')
+        return False
+
+    dest_dir = OBSIDIAN_IMAGES / job_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for i, img in enumerate(job['images'], start=1):
+        out = dest_dir / f'P{i}.png'
+        try:
+            st = fr.generate_via_resident(server, img['prompt'], out)
+        except fr.TransportError as e:
+            log.error(f'❌ 第 {i}/{n} 张失败 [{e.kind}]: {e}')
+            return False                         # 保留队列；恢复后整批重跑（已存在的 P*.png 会被覆盖）
+        log.info(f'  [{i}/{n}] ✅ {out.name} 推理 {st.get("runtime")}s seed={st.get("seed")}')
+
+    insert_into_note(job)
+    notify_owner(f'✅ FLUX 配图完成: {job["note_title"]} ({n}张)\n'
+                 f'已插入稿子，可在 Obsidian 查看。')
+    log.info(f'✅ 任务完成(常驻): {job_id}')
+    return True
+
+
+def process_job_legacy(job: dict) -> bool:
+    """旧链路：确保服务器→冷启动生成→拉回→插入→通知（保留作逃生口）"""
     log.info(f'▶ 处理任务: {job["note_title"]} ({len(job["images"])}张)')
     job_id = job['job_id']
 

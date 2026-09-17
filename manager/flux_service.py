@@ -50,8 +50,11 @@ def main():
     bot = FeishuBot(scheduler, db, quota)
     bot.start()
 
+    from manager.flux_queue import GEN_MODE
     log.info(f'   Web: http://localhost:{args.port}')
-    log.info(f'   队列调度器: 单 worker 串行')
+    log.info(f'   队列调度器: 单 worker 串行 · 生成路径={GEN_MODE}'
+             + ('（模型常驻显存，每张图只做推理）' if GEN_MODE == 'resident'
+                else '（每张图冷启动 gen_flux.py）'))
     log.info(f'   飞书图图机器人: 对话式出图')
 
     try:

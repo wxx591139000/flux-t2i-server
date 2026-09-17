@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error        TEXT,
     server       TEXT,              -- 任务执行所在 flux 服务器名 (flux1/flux2/...)；多服务器调度
     created_at   INTEGER,
-    completed_at INTEGER
+    completed_at INTEGER,
+    refunded_at  INTEGER            -- 终态失败已退还配额的时刻（非空=已退，防重复退）
 );
 CREATE TABLE IF NOT EXISTS usage (
     user_id TEXT,
@@ -71,8 +72,12 @@ class FluxDB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
-        self._migrate()
+        # ⚠️ 锁必须在 _migrate() 之前创建：_migrate → _backfill_accounts → _one/_all/_exec
+        #    都会 `with self._lock`。原先 _lock 在 _migrate() 之后才赋值，导致每次构造
+        #    FluxDB 都抛 AttributeError，被 _backfill_accounts 的宽 except 吞掉并只打一行
+        #    「账户回填跳过」——即账户回填迁移**从未真正执行过**。（2026-09-16 实跑发现）
         self._lock = threading_lock()
+        self._migrate()
         logger.info(f'🗄️  数据库就绪: {self.path}')
 
     def _migrate(self):
@@ -85,6 +90,9 @@ class FluxDB:
             if 'server' not in jcols:
                 self._conn.execute('ALTER TABLE jobs ADD COLUMN server TEXT')
                 logger.info('🗄️  jobs 表已加 server 列')
+            if 'refunded_at' not in jcols:
+                self._conn.execute('ALTER TABLE jobs ADD COLUMN refunded_at INTEGER')
+                logger.info('🗄️  jobs 表已加 refunded_at 列（失败退配额幂等标记）')
             ccols = {r[1] for r in self._conn.execute('PRAGMA table_info(codes)')}
             for col, ddl in {
                 'created_at': 'ALTER TABLE codes ADD COLUMN created_at INTEGER',
@@ -146,6 +154,14 @@ class FluxDB:
     def _all(self, sql, params=()):
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    def ping(self) -> bool:
+        """轻量探活：证明连接可用且事务没被卡死。供 /health 浅探针调用。
+
+        刻意不做任何 DDL/查询业务表 —— 探针要恒定快，且不该因为某张大表慢而误判服务死了。
+        """
+        with self._lock:
+            return self._conn.execute('SELECT 1').fetchone() is not None
 
     # ── users ──
     def get_user(self, user_id: str):
@@ -343,6 +359,39 @@ class FluxDB:
         self._exec('INSERT INTO usage(user_id, ym, count) VALUES(?,?,?) '
                    'ON CONFLICT(user_id, ym) DO UPDATE SET count=count+?',
                    (user_id, ym, n, n))
+
+    def usage_sub(self, user_id: str, ym: str, n: int = 1) -> int:
+        """扣减月度用量（下限 0，永不产生负数）。返回扣减后的计数。
+
+        与 usage_add 同为「按 token 落账」——聚合口径仍由 account_usage 负责，
+        所以退还也必须按 user_id 落，才能和计费对齐。
+        """
+        self._exec('INSERT INTO usage(user_id, ym, count) VALUES(?,?,0) '
+                   'ON CONFLICT(user_id, ym) DO UPDATE SET count=MAX(count-?, 0)',
+                   (user_id, ym, n))
+        return self.usage_get(user_id, ym)
+
+    def refund_job_once(self, job_id: str, user_id: str, ym: str, n: int = 1) -> bool:
+        """幂等退还某任务的配额：仅当「该任务尚未退过」才真正扣减。
+
+        为什么必须幂等：终态失败有多条落点（业务失败 / 重试超限），将来还可能加重试路径；
+        没有这层标记就会重复退，等于白送额度。标记落在 jobs.refunded_at。
+
+        返回 True=本次确实退了；False=之前已退过（或任务不存在）。
+        """
+        with self._lock:            # ⚠️ Lock 不可重入：块内只能用 _conn 裸执行，不能再调 _exec
+            row = self._conn.execute(
+                'SELECT refunded_at FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if row is None or row['refunded_at']:
+                return False
+            self._conn.execute('UPDATE jobs SET refunded_at=? WHERE job_id=?',
+                               (int(time.time()), job_id))
+            self._conn.execute(
+                'INSERT INTO usage(user_id, ym, count) VALUES(?,?,0) '
+                'ON CONFLICT(user_id, ym) DO UPDATE SET count=MAX(count-?, 0)',
+                (user_id, ym, n))
+            self._conn.commit()
+            return True
 
 
 def threading_lock():

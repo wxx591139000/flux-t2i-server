@@ -65,6 +65,17 @@ Rules:
 4. 30-80 words is optimal for FLUX
 5. Do NOT describe motion — Flux generates a static image
 6. Add technical quality markers like "cinematic lighting", "photorealistic", "professional"
+7. TRANSLATE FAITHFULLY — never invent entities the user did not mention.
+   If the user asks for a mug, do not add coffee, a wooden table or a cafe interior.
+   You may add only visual qualifiers (lighting, camera angle, material, composition),
+   never new objects or settings.
+   (实测：旧版把「马克杯」自行译出 filled with fresh coffee / rustic wooden table / upscale cafe)
+8. Use POSITIVE PHRASING ONLY. FLUX.1-dev is guidance-distilled and ignores negative
+   prompts, so "no shadows" / "without text" have no effect whatever and can push the
+   result the wrong way. Restate the intent as what you DO want — write
+   "evenly lit seamless white backdrop, clean uncluttered surface" instead of
+   "no shadows, no clutter, no reflections".
+   (实测：negative_prompt 与不加它在同一 seed 下出的图完全一致)
 
 Make explicit everything the user wants in the image (all people, animals, objects, actions).
 If the user describes a dynamic action (e.g. fighting, running), capture the frozen pose of that action.
@@ -108,10 +119,25 @@ def call_llm(system_prompt: str, user_message: str, temperature: float = 0.7) ->
         return ''
 
 
-def translate_to_flux_prompt(zh_prompt: str) -> str:
+class TranslationError(RuntimeError):
+    """中文提示词翻译失败（LLM 重试后仍不可用）。
+
+    刻意做成异常而不是静默降级：FLUX 吃中文会**完全跑偏**（见下），
+    让调用方拿到一个能上报的错误，好过让客户拿到一张莫名其妙的图。
     """
-    中文提示词 → FLUX 英文提示词。
-    LLM 成功返回英文；失败返回原文（兜底，保证链路不断）。
+
+
+def translate_to_flux_prompt(zh_prompt: str, retries: int = 3) -> str:
+    """
+    中文提示词 → FLUX 英文提示词。失败重试 retries 次，仍失败抛 TranslationError。
+
+    ⚠️ 为什么不能像旧版那样「LLM 失败就返回中文原文」：
+    FLUX.1-dev 是双**英文**编码器（CLIP-L + T5-XXL），中文进去等于让它猜。
+    实测同一句「一只白色陶瓷马克杯，置于无缝纯白影棚背景…」（同 seed 12345）：
+      - 直发中文   → 出的是**动漫少女插画**，主体根本不是杯子；PNG 从 300KB 涨到 1.04MB
+      - 过翻译层   → 干净的白色马克杯电商图
+    旧兜底把这种灾难静默化了，客户只会觉得「这 AI 出图不行」。
+    且实测 LLM 会偶发空返回（同一句连打 5 次里出现过 1 次），所以必须重试。
     """
     zh_prompt = (zh_prompt or '').strip()
     if not zh_prompt:
@@ -121,12 +147,15 @@ def translate_to_flux_prompt(zh_prompt: str) -> str:
 
     logger.info(f'🌐 中文提示词 → FLUX 英文提示词: {zh_prompt[:40]}...')
     user_msg = f"Translate this Chinese description into a FLUX image prompt:\n{zh_prompt}"
-    result = call_llm(FLUX_SYSTEM_PROMPT, user_msg, temperature=0.8)
-    if result:
-        logger.info(f'✅ 翻译完成: {result[:60]}...')
-        return result
-    logger.warning('LLM 翻译失败，返回原文（FLUX 可能理解不佳但链路不断）')
-    return zh_prompt
+    for attempt in range(1, max(1, retries) + 1):
+        result = call_llm(FLUX_SYSTEM_PROMPT, user_msg, temperature=0.8)
+        # 仍含中文 = 这次没翻干净，同样不算成功
+        if result and not has_chinese(result):
+            tag = f'（第 {attempt} 次）' if attempt > 1 else ''
+            logger.info(f'✅ 翻译完成{tag}: {result[:60]}...')
+            return result
+        logger.warning(f'⚠️ 第 {attempt}/{retries} 次翻译失败（LLM 无返回或仍含中文）')
+    raise TranslationError(f'中文提示词翻译失败（已重试 {retries} 次）: {zh_prompt[:60]}')
 
 
 if __name__ == '__main__':

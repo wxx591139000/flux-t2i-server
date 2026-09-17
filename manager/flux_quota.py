@@ -68,14 +68,20 @@ class QuotaService:
         limit = self.plans.get(eff['plan'], {}).get('monthly_images', -1)
         if limit is None or limit < 0:
             return True, ''
-        used, inflight = eff['used'], eff['inflight']
-        if used + inflight >= limit:
+        # 只用 used 判定：usage 在「入队时」已 +1（见 flux_queue.py submit 里的 usage_add），
+        # 因此 used 天然包含排队中/生成中的任务。若再叠加 inflight（DB 里
+        # status in ('queued','generating') 的计数），同一张在途图会被算两次，
+        # 用户实际可用额度约为套餐的一半（basic=50 实际只能出 ~25 张）。
+        used = eff['used']
+        if used >= limit:
             return False, f'本月配额已用 {used}/{limit} 张，可升级套餐或下月再试'
         return True, ''
 
-    def record_enqueued(self, user_id: str):
-        # 仍按 token 落账，聚合时按账户（对齐转录：用量按身份落账，quota 按账户聚合）
-        self.db.usage_add(user_id, current_ym(), 1)
+    # 2026-09-16 删除 record_enqueued()。它做的是 db.usage_add(user_id, current_ym(), 1)，
+    # 而实际计费已经发生在 flux_queue.submit() 里（入队即 usage_add），全仓零调用。
+    # 保留它 = 留一个「看起来更分层」的诱饵：谁把它接回 submit，就会变成真的双重计费。
+    # 因此计费入口唯一化为 flux_queue.submit() 的 usage_add；退还入口为
+    # FluxDB.refund_job_once()（幂等，见 flux_queue._refund_quota）。
 
     def usage_summary(self, user_id: str) -> str:
         eff = self.effective(user_id)
