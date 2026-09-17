@@ -52,6 +52,28 @@ if GEN_MODE not in ('resident', 'legacy'):
     GEN_MODE = 'resident'
 
 
+def _dedup_key(user_id, prompt, seed=None, width=None, height=None,
+               original_prompt=None) -> str:
+    """去重键的**唯一**构造入口（2026-09-17 修，两个 bug 一起治）。
+
+    bug A —— 键格式漂移：入队处拼 `{user}:{prompt}:{seed}:{w}x{h}`，而 worker
+    收尾的 `discard()` 只拼 `{user}:{prompt}` —— 两者永远不相等，`_inflight`
+    只增不减。三条后果：集合无限增长；`/health` 的 `backend_hint` 恒为 busy
+    （队列空也报忙，监控误判）；同用户用固定 seed 重复提交同样内容会被永久拒绝。
+    现在 add / discard / 孤儿恢复三处全部走这个函数，格式不可能再漂移。
+
+    bug B —— 用错了文本：中文任务原先拿**翻译后**的英文 prompt 做键。但翻译是
+    LLM 调用，同一句中文两次翻译的结果会漂移 —— 实测「一条牛仔材质…瘦腿的男士
+    牛仔裤」两次分别译成 "A pair of men's slim-leg jeans…" 与
+    "Photorealistic product photography…"，键不同 → 去重直接失效 →
+    用户连点两次就出两张重复图，还各计一次费。
+    现在中文一律用**用户原始输入** `original_prompt` 做键：语义相同必定命中去重；
+    换 seed / 换尺寸仍算不同任务（B 链一次出多张候选靠这条放行）。
+    """
+    base = original_prompt or prompt
+    return f'{user_id}:{base}:{seed}:{width}x{height}'
+
+
 class FluxQueueScheduler:
     def __init__(self, db: FluxDB, quota, interval=120):
         self.db = db
@@ -59,8 +81,12 @@ class FluxQueueScheduler:
         self.interval = interval
         self._pq = queue.PriorityQueue()
         self._seq = 0
-        self._inflight = set()          # 去重 user:prompt
+        self._inflight = set()          # 去重键集合（构造见 _dedup_key）
         self._waiting = set()           # 服务器 down 等待恢复池
+        # web 层是 ThreadingHTTPServer：连点 / 并发提交会落在**不同线程**上，
+        # 「检查去重 → 入队 → 登记 inflight」若不原子，两个线程会同时通过检查、
+        # 各入一个队 → 出两张重复图，还各计一次费。
+        self._submit_lock = threading.Lock()
         self._stop = threading.Event()
         self._worker_thread = None
         self._health_thread = None
@@ -92,28 +118,36 @@ class FluxQueueScheduler:
             if prompt != original_prompt:
                 logger.info(f'🌐 中文已转换: {original_prompt[:30]} → {prompt[:50]}...')
 
-        # 1. 去重（同用户同提示词同参数在排队/生成中）
-        #    key 纳入 seed/size：同一提示词换 seed 或换尺寸 = 不同任务（B 链多张候选靠这绕过去重）。
-        key = f'{user_id}:{prompt}:{seed}:{width}x{height}'
-        if key in self._inflight:
-            return {'error': '相同提示词与参数正在排队/生成中，请勿重复提交'}
-        # 2. 配额
-        ok, reason = self.quota.precheck(user_id)
-        if not ok:
-            return {'error': reason}
-        # 3. 队列上限
-        if self._pq.qsize() >= QUEUE_MAX:
-            return {'error': f'队列已满（{QUEUE_MAX}），请稍后再试'}
+        # 1~3 全部收进同一把锁：去重检查、配额、队列上限、入队、计费、登记
+        #    必须是一个原子动作。web 层是多线程的，拆开会留出竞态窗口 ——
+        #    连点两次就能各过一次检查，出两张重复图还各计一次费。
+        #    （锁内只调 self.db 的原子方法，不嵌套别的锁，无死锁风险）
+        with self._submit_lock:
+            # 1. 去重（同用户同提示词同参数在排队/生成中）
+            #    key 纳入 seed/size：同一提示词换 seed 或换尺寸 = 不同任务
+            #    （B 链一次出多张候选靠这条放行）。
+            #    中文必须传 original_prompt —— 翻译结果会漂移，见 _dedup_key。
+            key = _dedup_key(user_id, prompt, seed, width, height,
+                             original_prompt=original_prompt)
+            if key in self._inflight:
+                return {'error': '相同提示词与参数正在排队/生成中，请勿重复提交'}
+            # 2. 配额
+            ok, reason = self.quota.precheck(user_id)
+            if not ok:
+                return {'error': reason}
+            # 3. 队列上限
+            if self._pq.qsize() >= QUEUE_MAX:
+                return {'error': f'队列已满（{QUEUE_MAX}），请稍后再试'}
 
-        # 原先用毫秒时间戳当主键：同毫秒两次并发提交会 INSERT 冲突/互相覆盖。
-        # 改 uuid4 前 16 位（32bit 十六进制 ≈ 64bit 熵），冲突概率可忽略。
-        job_id = uuid.uuid4().hex[:16]
-        self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
-                           width, height, seed, steps, negative_prompt)
-        self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
-        self._inflight.add(key)
-        self._seq += 1
-        self._pq.put((priority, -self._seq, job_id))
+            # 原先用毫秒时间戳当主键：同毫秒两次并发提交会 INSERT 冲突/互相覆盖。
+            # 改 uuid4 前 16 位（32bit 十六进制 ≈ 64bit 熵），冲突概率可忽略。
+            job_id = uuid.uuid4().hex[:16]
+            self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
+                               width, height, seed, steps, negative_prompt)
+            self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
+            self._inflight.add(key)
+            self._seq += 1
+            self._pq.put((priority, -self._seq, job_id))
         logger.info(f'📥 {user_id} 入队 {job_id}: {prompt[:40]}')
         return {'job_id': job_id, 'status': 'queued'}
 
@@ -167,26 +201,36 @@ class FluxQueueScheduler:
         job = self.db.job_get(job_id)
         if not job:
             return
+        # job_get() 返回的是 sqlite3.Row —— 它支持 [] 索引但**没有 .get()**。
+        # 统一转成 dict 再用 .get()：既兼容 Row，缺列时也不会抛 IndexError。
+        job = dict(job)
         user_id = job['user_id']
-        key = f'{user_id}:{job["prompt"]}'
-        self.db.job_update(job_id, status='generating')
-        ok, err = self._generate(job)
-        if ok:
-            self.db.job_update(job_id, status='done', completed_at=int(time.time()))
-            logger.info(f'✅ {job_id} 完成')
-        else:
-            # 服务器 down → 进等待恢复池（不失败、不立即重排，等健康监控检测到恢复后统一入队）
-            if '[SERVER_DOWN]' in err:
-                retry = self._count_retry(job['error'] or '')
-                new_err = f'{err} [RETRY:{retry+1}]'
-                self.db.job_update(job_id, status='waiting', error=new_err)
-                self._waiting.add(job_id)
-                logger.warning(f'⏸ {job_id} 服务器down，进入等待恢复池 (retry {retry+1})')
+        # 必须与入队时同一把钥匙，否则 discard() 永远清不掉（详见 _dedup_key 的 bug 说明）
+        key = _dedup_key(user_id, job.get('prompt'), job.get('seed'),
+                         job.get('width'), job.get('height'),
+                         original_prompt=job.get('original_prompt'))
+        try:
+            self.db.job_update(job_id, status='generating')
+            ok, err = self._generate(job)
+            if ok:
+                self.db.job_update(job_id, status='done', completed_at=int(time.time()))
+                logger.info(f'✅ {job_id} 完成')
             else:
-                self.db.job_update(job_id, status='failed', error=err, completed_at=int(time.time()))
-                logger.error(f'❌ {job_id} 失败: {err[:120]}')
-                self._refund_quota(job, '业务失败')
-        self._inflight.discard(key)
+                # 服务器 down → 进等待恢复池（不失败、不立即重排，等健康监控检测到恢复后统一入队）
+                if '[SERVER_DOWN]' in err:
+                    retry = self._count_retry(job['error'] or '')
+                    new_err = f'{err} [RETRY:{retry+1}]'
+                    self.db.job_update(job_id, status='waiting', error=new_err)
+                    self._waiting.add(job_id)
+                    logger.warning(f'⏸ {job_id} 服务器down，进入等待恢复池 (retry {retry+1})')
+                else:
+                    self.db.job_update(job_id, status='failed', error=err, completed_at=int(time.time()))
+                    logger.error(f'❌ {job_id} 失败: {err[:120]}')
+                    self._refund_quota(job, '业务失败')
+        finally:
+            # finally 而非写在末尾：_generate 抛异常时也必须释放去重键，
+            # 否则这组参数会被永久占用 —— 同用户再也提交不了同样内容。
+            self._inflight.discard(key)
 
     def _refund_quota(self, job, reason: str):
         """终态失败时退还配额（幂等，靠 jobs.refunded_at 防重复退）。
@@ -369,8 +413,11 @@ class FluxQueueScheduler:
         原缺陷：任务队列 _pq 在内存，重启即清零，DB 的 queued/generating 会成孤儿永远无人处理。
         现：启动时把这两类重入队（generating 改回 queued 重新生成，最稳）。"""
         for j in self.db.jobs_queued():
+            j = dict(j)          # 同上：jobs_queued() 返回 sqlite3.Row，没有 .get()
             jid = j['job_id']
-            key = f"{j['user_id']}:{j['prompt']}"
+            key = _dedup_key(j['user_id'], j.get('prompt'), j.get('seed'),
+                             j.get('width'), j.get('height'),
+                             original_prompt=j.get('original_prompt'))
             if j['status'] == 'generating':
                 self.db.job_update(jid, status='queued')
             self._inflight.add(key)

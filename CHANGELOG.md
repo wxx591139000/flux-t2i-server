@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## [v2.8.1] - 2026-09-17
+
+**去重键根治：连点不再出重复图，`_inflight` 不再只增不减。**
+
+当天中午真机跑通 5 张图后，盯数据发现去重机制形同虚设 —— 用户连点两次会出两张重复图、
+还各计一次费。查下来是三个独立缺陷（顺带暴露出离线测试的替身不够真）：
+
+1. **键格式漂移（bug A）**：三处去重键是三种写法 —— 入队
+   `{u}:{p}:{seed}:{w}x{h}`、worker 收尾 `{u}:{p}`、孤儿恢复 `{u}:{p}`。
+   add 与 discard 的键永远不相等 → `_inflight` 只增不减。后果：
+   集合无限增长；`/health` 的 `backend_hint` 恒为 busy（队列空也报忙）；
+   同用户固定 seed 重复提交会被永久拒绝。
+   → 统一走 `_dedup_key()` 单一构造入口，三处不可能再漂移；
+   `discard` 移进 `finally`，`_generate` 抛异常时也一定释放。
+
+2. **用错了文本（bug B，连点出重复图的真凶）**：中文任务原先拿**翻译后**的英文
+   prompt 做键。翻译是 LLM 调用，同一句中文两次翻译结果会漂移 —— 实测同一句
+   分别译成 "A pair of men's slim-leg jeans…" 与 "Photorealistic product
+   photography…"，键不同 → 去重直接失效。
+   → 中文一律用**用户原始输入** `original_prompt` 做键；换 seed / 换尺寸仍算不同
+   任务（B 链一次出多张候选靠这条放行）。
+
+3. **并发竞态（bug C）**：web 层是 `ThreadingHTTPServer`，「检查去重 → 入队 →
+   登记」不是原子操作，连点落在不同线程上时都能通过检查。
+   → 整段收进 `self._submit_lock`。
+
+**回归门** `tests/test_dedup_key.py`（11 项）+ `tests/mutate_dedup_key.py`（4 个变异）。
+变异测试证明门有效：回退成旧写法时 bug A/B/C 各自被抓住，且 bug D（不把
+`sqlite3.Row` 转 dict）也被 C4b 抓住 —— 那条正是我修复过程中引入、真机上打死
+worker 线程的错误，替身换成真实 `Row` 后才暴露。
+
 ## [v2.8] - 2026-09-17
 
 **传输层根治 + 常驻档位安全默认 —— 修掉两个"任务永远卡住"的事故级缺陷。**

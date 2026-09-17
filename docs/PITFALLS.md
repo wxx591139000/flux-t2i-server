@@ -2,6 +2,34 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 去重键与连点（2026-09-17，v2.8.1）
+
+**去重键必须只有一个构造入口。** 三处（入队 / worker 收尾 / 孤儿恢复）曾经各写各的：
+入队带 `{seed}:{w}x{h}`、收尾不带。add 与 discard 的键永远不相等 → `_inflight` 只增不减。
+统一到 `_dedup_key()` 后不可能再漂移；`discard` 必须放 `finally`，否则 `_generate` 抛异常时
+这组参数被永久占用。
+
+**中文去重要用用户原始输入，不能用翻译结果。** 翻译是 LLM 调用，同一句中文两次翻译会漂移
+（实测同一句译成 "A pair of men's slim-leg jeans…" 与 "Photorealistic product photography…"），
+拿翻译后文本做键等于去重失效 → 用户连点两次出两张图、各计一次费。
+
+**`submit()` 必须加锁。** web 层是 `ThreadingHTTPServer`，「检查去重 → 入队 → 登记」不原子时，
+连点落在不同线程上都能通过检查。整段收进 `self._submit_lock`。
+
+**⚠️ `sqlite3.Row` 没有 `.get()`。** `job_get()` / `jobs_queued()` 返回的是 `Row`，它支持
+`[]` 索引但**没有 dict 的 `.get()`**。在 `_process` 里写 `job.get('prompt')` 会
+`AttributeError`，而 `_run_worker` 没有 try/except → **worker 线程直接死掉**，
+`/health` 变 `degraded`、`worker_alive=false`，队列里的任务永远没人处理。
+先 `job = dict(job)` 再用 `.get()`（缺列时也不会抛 `IndexError`）。
+
+**⚠️ 测试替身必须复刻真实对象的类型行为。** 这一条是上面那个 bug 没被离线测试抓住的根因：
+替身的 `job_get()` 返回 `dict`，`.get()` 全绿；真机返回 `Row`，直接崩。
+给 DB 写替身时用**真实的 sqlite 内存库**（`row_factory = sqlite3.Row`），别手搓 dict。
+顺带：多线程用例要 `sqlite3.connect(':memory:', check_same_thread=False)` 并自己配锁。
+
+**⚠️ 变异脚本改生产代码必须二进制读写。** 用文本模式 `open(...,'w')` 的话，Windows 会把
+`\n` 写成 `\r\n`，"恢复"后整个文件 md5 对不上（实测 455 行被 CRLF 化）。用二进制读写保真。
+
 ## 传输层 / 常驻档位（2026-09-17，v2.8）
 
 > 这两个坑同一天爆，症状都是「任务卡住、图出不来」，但根因完全无关，
