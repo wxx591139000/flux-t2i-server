@@ -5,7 +5,7 @@
 **生图选项层 1：接通「尺寸 / seed / 负向词」透传，让前端选项真正生效。**
 
 ### 背景
-下游网站（ecom-image-studio）的 UI 一直有比例 / 负向词 / seed 控件，但适配器源码自己写着
+下游网站（`image-gen-site`，当时名为 `ecom-image-studio`，2026-09-17 改名）的 UI 一直有比例 / 负向词 / seed 控件，但适配器源码自己写着
 「上游不支持，会忽略」—— 因为 web 层的 `_api_submit` 只读 `prompt/priority`，尺寸固定在
 768×1024、seed 恒 0、负向词丢弃。本版把这条断链接通。
 
@@ -27,7 +27,7 @@
 
 ### 验证（离线，无需 GPU）
 `submit` 存参 → `job_get` 读回、`gen_kwargs` 构造、去重（同 prompt+seed 拒 / 换 seed 放行）全部
-通过；三文件 `py_compile` 通过。下游 ecom-image-studio `tsc --noEmit` 通过。
+通过；三文件 `py_compile` 通过。下游 image-gen-site `tsc --noEmit` 通过。
 真机出图待 GPU 开机后补跑（flux3 已于 2026-09-16 23:20 关机）。
 
 ## [v2.6] - 2026-09-16
@@ -136,7 +136,7 @@ GPU `NVIDIA GeForce RTX 4080 / 32760 MiB`（已用 1 MiB）、数据盘 50G 用 
 ```
 探针自身**绝不抛**（否则 200 变 500，监控看到"崩了"而非"DB 坏了"）。
 
-### 下游站点侧（工作区 `ecom-image-studio`，非本仓文件）
+### 下游站点侧（工作区 `image-gen-site`，非本仓文件）
 - `app/api/health/route.ts` 新增：一条 curl 同时给出站点层与上游层；上游不可达 → 503 + `degraded` +
   `upstream.httpStatus=null`。
 - `lib/providers/flux.ts`：`fluxHealth()` 重构出 `fluxHealthReport()`（带 `httpStatus`/`latencyMs`/`detail`），

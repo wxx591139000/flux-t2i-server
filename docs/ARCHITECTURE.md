@@ -7,7 +7,8 @@
 本项目**自带完整可用的生图网页任务中心**（`flux_web_service.py` 的页面 + `/api/submit` → `/api/status`
 → `/api/download` 三端点 + `flux_queue` 单 worker），不依赖任何其它项目。
 
-面向客户的生图网站（如 `ecom-image-studio`）是**独立项目**，唯一关联是**通过 HTTP 消费上面三个端点**。
+面向客户的生图网站 `image-gen-site`（旧名 `ecom-image-studio`，2026-09-17 改名）是**独立项目**，
+唯一关联是**通过 HTTP 消费上面三个端点**。
 两边各自独立部署、独立健康；本项目侧的自检**不需要**下游站点存在，下游站点也只需保证
 `submit` 与 `download` 用同一个 token（归属校验按 `job.user_id == token`）。
 离线端到端自检见 README「两条链路及其边界（v2.3）」。
@@ -45,7 +46,7 @@ HTTP 码同步：200 / 503
 监控会把「后端不可用」误判成「本服务死了」。`waiting` 池大小是**零成本推导**出的后端线索
 （waiting 池只装 `[SERVER_DOWN]` 任务）：`waiting>0 → backend_hint=server_down`，仅供参考。
 
-**下游站点侧**（如 `ecom-image-studio`）：把上游 `/health` 包成自己的 `GET /api/health`，
+**下游站点侧**（`image-gen-site`）：把上游 `/health` 包成自己的 `GET /api/health`，
 一次响应里同时给出站点层与上游层，上游不可达返回 503 + `status=degraded` + `upstream.httpStatus=null`。
 区分「连不上」（`httpStatus=null`）与「连上了但上游自报不健康」（`httpStatus=503`）—— 两者故障定位完全不同。
 

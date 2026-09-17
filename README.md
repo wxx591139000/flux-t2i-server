@@ -1,8 +1,9 @@
 # FLUX 文生图服务（通用）
 
-> 版本：v2.4 · 2026-09-16
+> 版本：v2.7 · 2026-09-17
 > 自部署 FLUX.1 文生图服务，**与具体业务解耦，可服务所有文生图需求**（小红书配图、公众号配图、海报底图……）。
 > 基于 AutoDL VGPU 32G 服务器 + diffusers。
+> 伞项目：本仓与下游站点仓 `image-gen-site` 并列存放于 `image-platform/`（两仓各自独立，唯一关联是 HTTP）。
 
 ## 核心能力
 
@@ -220,7 +221,8 @@ python manager/flux_resident_client.py servers
                    web_out/<job_id>/*.png
 ```
 
-**面向客户的生图网站（如 `ecom-image-studio`）是独立项目**，与本项目**唯一的关联是它通过 HTTP 消费本服务**：
+**面向客户的生图网站是独立项目**（`image-gen-site`，旧名 `ecom-image-studio`，2026-09-17 改名），
+与本项目**唯一的关联是它通过 HTTP 消费本服务**：
 `POST /api/submit` → 轮询 `GET /api/status` → `GET /api/download/<job_id>?token=`。
 两边各自独立部署、各自独立健康，接口就是 `flux_web_service.py` 的这三个端点（契约见
 `docs/WEB_SERVICE.md`）。改本项目时**不要假设**存在某个下游站点；改下游站点时也只需要这三个端点。
