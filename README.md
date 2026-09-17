@@ -1,6 +1,6 @@
 # FLUX 文生图服务（通用）
 
-> 版本：v2.7 · 2026-09-17
+> 版本：v2.8 · 2026-09-17
 > 自部署 FLUX.1 文生图服务，**与具体业务解耦，可服务所有文生图需求**（小红书配图、公众号配图、海报底图……）。
 > 基于 AutoDL VGPU 32G 服务器 + diffusers。
 > 伞项目：本仓与下游站点仓 `image-gen-site` 并列存放于 `image-platform/`（两仓各自独立，唯一关联是 HTTP）。
@@ -248,6 +248,24 @@ cd <workspace>/chain-verify && bash run_both_chains.sh
 其中 `/health` 浅探针有专项脚本 `verify_health_probe.py`（26 项）：覆盖 web-only 模式、
 worker 死→degraded、DB 坏→degraded、探针自身不抛，并用 **AST 源码级断言**证明探针体内零外呼
 （不是靠"感觉很快"）。
+
+### ⚠️ 传输层 & 常驻档位闸门（改 `flux_server_manager.py` / `flux_resident_client.py` 后必跑）
+
+```bash
+python tests/test_transport_env.py        # 8 项，几秒钟，exit 0 = 全过
+```
+
+盯的是两类**不会自己暴露、只会表现为「任务卡住」**的缺陷（2026-09-17 事故，详见
+`docs/PITFALLS.md` 的「传输层 / 常驻档位」）：
+
+1. **ssh/scp 依赖 `bash -lc` 执行**。Git for Windows 默认只把 `<Git>\cmd` 放进 PATH
+   （内有 `git.exe`，**没有 `bash.exe`**），于是「从 Git Bash 起的服务一切正常、双击 `.bat`
+   起的服务三台机全判不可达」——同一天两条路径结果相反。测试 A1 模拟双击场景的受限 PATH，
+   断言 `find_bash()` 仍能定位；A2/A3/A4 断言失败时能说清真因（`NO_BASH` / 带 stderr），
+   不再一律伪装成「服务器关机」。
+2. **常驻服务档位默认值必须是「一定能跑」而不是「最快」**。32G 卡装 31.2 GiB fp16 权重，
+   `offload=none`（全程显存）必然 OOM。测试 B1~B3 锁死默认值与每台机器的声明，
+   B4 确保模型加载报错时立刻失败而不是干等到超时。
 
 ## 健康探针（v2.4）
 

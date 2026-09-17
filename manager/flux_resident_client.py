@@ -444,8 +444,15 @@ def ensure_resident(server: dict, p: dict = None, wait_ready: bool = True) -> di
     #    脚本侧写法是 ${FLUX_WORKDIR:-默认}，所以只要传了就以本机的值为准。
     remote_base = server['remote_base']
     remote_model = server.get('remote_model') or ''
+    # ⚠️ FLUX_OFFLOAD：默认**必须安全**，不能是「最快」。
+    #    offload=none 把 31.2 GiB fp16 权重全塞进显存，32G 卡（36864/32760 MiB）
+    #    + 推理激活值必然 OOM —— 2026-09-17 生产实测：自动拉起常驻服务后
+    #    第一张图就 "CUDA out of memory, total capacity 31.48 GiB"，任务连续失败。
+    #    优先级：环境变量 FLUX_OFFLOAD > 该机器条目的 offload 字段 > 安全默认 model。
+    #    想追速度的机器（80G 卡等）在自己条目上写 "none" 即可，不必改这段逻辑。
+    offload = (os.environ.get('FLUX_OFFLOAD') or server.get('offload') or 'model').strip()
     env_parts = [
-        f'FLUX_OFFLOAD={os.environ.get("FLUX_OFFLOAD", "none")}',
+        f'FLUX_OFFLOAD={offload}',
         f'FLUX_RESIDENT_PORT={REMOTE_PORT}',
         f'FLUX_RESIDENT_SCREEN={RESIDENT_SCREEN}',
         f'FLUX_RESIDENT_PY={shlex.quote(RESIDENT_PY)}',

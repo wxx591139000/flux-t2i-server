@@ -2,11 +2,57 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 传输层 / 常驻档位（2026-09-17，v2.8）
+
+> 这两个坑同一天爆，症状都是「任务卡住、图出不来」，但根因完全无关，
+> 共同点是 **默认值 / 失败路径选错了方向**。闸门：`tests/test_transport_env.py`（8 项，离线）。
+
+- **[09-17] 「本机找不到 bash」被静默伪装成「远程服务器关机」** —— 排查成本最高的一次。
+  - **症状**：客户网站下单后任务永远卡在 waiting；任务中心显示三台机全「SSH 不通（可能关机 / 别名未在 ~/.ssh/config 中）」，而**同一天同一时刻**在 Git Bash 里跑 `flux_resident_client.py servers` 却能看到 `flux3 可达·有卡·模型就绪`。
+  - **根因**：`flux_server_manager.run()` 写死 `subprocess.run(['bash', '-lc', cmd])`。而 **Git for Windows 默认只把 `<Git>\cmd` 写进 PATH，那个目录里只有 `git.exe`；`bash.exe` 在 `<Git>\bin`，不在 PATH**。于是：
+    - 从 Git Bash 起的服务 → PATH 含 MSYS 的 `/usr/bin` → 找得到 bash → 一切正常
+    - 从资源管理器双击 `.bat` 起的服务 → PowerShell 环境 → `FileNotFoundError` → 被 `except Exception` 吞成 `(False, str(e))` → 每台机 ~0.07s 就"不可达"（**三台加起来 0.2 秒**，这个耗时就是破案线索：真 SSH 失败不可能这么快）
+  - **为什么难查**：`run()` 只返回 `r.stdout`，**ssh 的报错全在 stderr，被丢掉了**；`probe_full()` 又把**所有**失败统一写成「SSH 不通（可能关机 / 别名未在 ~/.ssh/config 中）」→ 真因完全不可见，运维被引向"去检查 AutoDL 关机了没"。
+  - **修法**（三处一起）：① 新增 `find_bash()` 主动定位 —— PATH → 从 `which git` 反推 `<Git>` 根 → 常见安装路径，结果缓存；② `run()` 失败时**带回 stderr**，找不到 bash 时返回醒目的 `NO_BASH: ...`；③ `flux_service.py` 启动时做一次自检，缺 bash 直接在日志里吼。
+  - **闸门**：A1（模拟双击 .bat 的受限 PATH，断言仍能定位）A2（无 bash 时报 NO_BASH）A3（失败带 stderr）A4（probe 保留真因）。
+  - **教训**：**「本机缺工具」绝不能退化成「远程机器不可达」** —— 前者是配置问题（1 分钟能修），后者会让人去查云控制台（40 分钟查不出）。
+
+- **[09-17] `FLUX_OFFLOAD` 默认 `none` 在 32G 卡上**必然** OOM**（即上面 09-16 那条"待验证"的实测结论）。
+  - **症状**：常驻服务拉起成功、`/health` 返回 200，但每张图都失败：`模型加载失败: OutOfMemoryError: CUDA out of memory. Tried to allocate 18.00 MiB. GPU 0 has a total capacity of 31.48 GiB of which 13.69 MiB is free. ... this process has 31.45 GiB memory in use`。
+  - **根因**：`ensure_resident()` 透传 `FLUX_OFFLOAD={os.environ.get("FLUX_OFFLOAD","none")}` —— **默认值取的是「最快」（none=全程显存），但 32G 卡装 31.2 GiB fp16 权重 + 推理激活值根本放不下**。
+  - **⚠️ 更正 09-16 的记录**：当时那条写的是「`none` **可能** OOM …… **本批未实跑，属待验证**」。09-17 实跑结论是：**在 RTX 4080 SUPER（32760 MiB）上是必然 OOM，不是"可能"**；`model` 档实测可用（显存占用极小，单张 1280×720 推理 54s / 端到端 71.5s）。
+  - **修法**：优先级改为 `env FLUX_OFFLOAD` > 该机器条目的 `offload` 字段 > **安全默认 `model`**；`_DEFAULT_SERVERS` 每台显式声明 `"offload": "model"`。想跑 `none` 的大显存机器（80G）在自己条目上写明即可，不必改逻辑。
+  - **闸门**：B1（无声明时默认安全值）B2（env 可覆盖）B3（每台默认机都声明了，防新增机器漏写）B4（模型加载报错要立刻抛，别干等到超时）。
+  - **教训**：**默认值要选「一定能跑」，不是「最快」**；性能偏好应该由机器/环境显式声明，而不是当默认值。
+  - **同源教训**：这与 v2.3 的 `FLUX_WORKDIR`/`FLUX_MODEL` 是同一个病 —— **「探测」和「真正拉起」是两条独立代码路径，改一条别忘另一条**。
+
+- **[09-17] 「激活 / 绑定」按钮点了必报「缺少激活码或 token」** —— identity 被当成业务参数。
+  - **症状**：客户页（`/`）的「激活 / 绑定账户」卡片，粘贴激活码点按钮，永远报「缺少激活码或 token」。
+  - **根因**：前端 `activate()` 只发 `{code:c}`；而 `_api_activate()` 第一行就是
+    `if not code or not token: return {'error': '缺少激活码或 token'}` —— **每一次点击都必然失败**。
+    本质是把 identity 当成了业务参数：token 早就在 HTTP 层由 `_get_token()`
+    （cookie `flux_token=` 或 `?token=`）解析好了，handler 却又向 body 要一次。
+  - **修法**：`_api_activate(body, token)` / `_api_bind(body, token)` 接收 `do_POST` 已解析的 token；
+    优先级 **body.token > HTTP 身份**（前者兼容脚本调用，后者让「页面点一下就能用」）。
+  - **顺带补缺口**：admin 页原本**只有「改套餐 / 改备注 / 设 owner / 详情」，没有任何绑定入口**
+    （所以用户想「对每个用户做用户码绑定」时无处可点）。新增：
+    ① 「用户码绑定」卡片（输入 用户 token + 激活码 → `/api/bind`）；
+    ② 账户行内「绑设备」按钮（对该账户直接并一台设备进去）。
+  - **验证**（真机 HTTP，非推算）：只传 code + `?token=` → `激活成功`；第二台设备 → `已绑定账户`；
+    body 带 token 的旧调用 → 仍成功；给了 token 但缺 code → 正确报「缺少激活码或 token」；
+    `set_plan` 改 default→pro 后 DB 里 `accounts.plan='pro'`，4 个设备 token 全部挂在同一账户下。
+  - **注意**：`_get_token()` 在**既无 cookie 也无 `?token=`** 时会**自动生成随机 token**
+    （设计如此：匿名用户各有独立配额）。所以「什么都不传」不会报缺参，而是以一个新身份激活 ——
+    写测试时别把它当成「参数校验仍生效」的证据。
+
 ## flux3 接入（2026-09-16，v2.5）
 
 - **[09-16] 选机探测对「纯密码登录」的机器会全灭，而且报错是「SSH 不通」而非「密码错」** → `probe_full()` 固定带 `-o BatchMode=yes`（故意的：非交互环境不能弹密码提示，否则每台机器都卡在交互等待上）→ 密码认证被直接拒绝，症状与「关机」无法区分 → **克隆实例若继承了克隆源的 `authorized_keys` 就没问题**（本次 flux3 正是如此，`id_rsa_musetalk` 直接可登，无需 sshpass）；否则必须先 `ssh-copy-id` 配免密，**别指望密码能跑选机**
 - **[09-16] 「默认机」与「自动选机」是两个概念，混起来会误判成「部分坏了」** → A 链任务中心走 `find_ready_server()`，每单现挑，换机后**自动就对了**；而小红书产线（`process_job`）与不带 `--server` 的 CLI 走**默认机**（= 候选机第一台 flux1）→ flux1 无卡时表现为「A 链正常、产线全失败」 → 新增 `FLUX_DEFAULT_SERVER` 把默认机指到当前能用的机器
-- **[09-16] 32GB 卡（RTX 4080 / 32760 MiB）对 FLUX.1-dev fp16（~33GB 权重）余量极小**，而 `FLUX_OFFLOAD` 默认 `none`（全程显存）→ 拉起常驻前先想清楚档位：`none` 可能 OOM，退 `model`（比 `sequential` 快 2~3 倍）是这类卡的现实选择。**⚠️ 本批未实跑，属待验证**，勿当结论引用
+- **[09-16] 32GB 卡（RTX 4080 / 32760 MiB）对 FLUX.1-dev fp16（~33GB 权重）余量极小**，而 `FLUX_OFFLOAD` 默认 `none`（全程显存）→ 拉起常驻前先想清楚档位：`none` 可能 OOM，退 `model`（比 `sequential` 快 2~3 倍）是这类卡的现实选择。~~**⚠️ 本批未实跑，属待验证**，勿当结论引用~~
+  → **【09-17 已实测，结论更正】**：在 flux3（RTX 4080 SUPER 32760 MiB）上 `none` **必然 OOM**（不是"可能"），
+  `model` 档可用（1280×720 单张推理 54s / 端到端 71.5s）。默认值已改为安全的 `model`，
+  详见上方「传输层 / 常驻档位（2026-09-17，v2.8）」条目。
 
 ## 健康探针（2026-09-16，v2.4）
 

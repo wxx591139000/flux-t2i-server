@@ -1,5 +1,68 @@
 # CHANGELOG
 
+## [v2.8] - 2026-09-17
+
+**传输层根治 + 常驻档位安全默认 —— 修掉两个"任务永远卡住"的事故级缺陷。**
+
+### 背景
+当天上午，从资源管理器双击 `启动-生图平台.bat` 起的服务，客户网站下单后任务永远停在
+`waiting`，任务中心显示三台机全「SSH 不通（可能关机）」。而在 Git Bash 里跑 CLI 探测，
+同一时刻同一台机却是「flux3 可达·有卡·模型就绪」。两条独立根因：
+
+1. **`run()` 假定 bash 在 PATH 里**。Git for Windows 默认只把 `<Git>\cmd` 写进 PATH
+   （里面只有 `git.exe`），`bash.exe` 在 `<Git>\bin`。Git Bash 起的服务有 `/usr/bin` 所以正常，
+   双击 `.bat` 起的服务 `FileNotFoundError` → 被 `except` 吞成 `(False,'...')` →
+   每台 ~0.07s 判「不可达」。**真因还被两层遮蔽**：`run()` 丢掉 stderr，`probe_full()`
+   把所有失败统一写成「可能关机」。
+2. **拉起常驻服务时 `FLUX_OFFLOAD` 默认 `none`**（全程显存）。32G 卡（RTX 4080 SUPER
+   32760 MiB）装 31.2 GiB fp16 权重必然 OOM → 每张图 `CUDA out of memory`。
+   默认值取的是「最快」而不是「一定能跑」。
+
+### 改动
+- `manager/flux_server_manager.py`
+  - 新增 `find_bash()`：按 PATH →（从 `which git` 反推 `<Git>` 根）→ 常见安装路径依次定位，
+    结果缓存；找不到时打 `log.error` 明说。`run()` 改用它，不再假定 PATH 可用。
+  - `run()` 失败时**带回 stderr**（旧版只取 stdout，ssh 的报错全丢）；无 bash 时返回
+    `NO_BASH: ...` 而不是笼统失败。
+  - `probe_full()` 错误信息分级：`NO_BASH` / `TIMEOUT` / 真实 ssh stderr / 兜底文案。
+  - `_DEFAULT_SERVERS` 每台加 `offload` 字段，显式声明 `"model"`。
+- `manager/flux_resident_client.py` `ensure_resident()`：`FLUX_OFFLOAD` 优先级改为
+  **env > 该机器条目的 `offload` > 安全默认 `model`**。想跑 `none` 的大显存机器在
+  自己条目上声明即可，不必改逻辑。
+- `manager/flux_service.py`：启动时自检 bash，缺了直接在日志里告警 ——
+  这类故障的表现是「所有服务器都不可达」，宁可启动就吼一声。
+- `tests/test_transport_env.py`（**新增**）：8 项离线回归闸门，覆盖上述两类问题的
+  默认值、失败路径与可观测性。改 `flux_server_manager.py` / `flux_resident_client.py`
+  后跑一遍，几秒钟出结果。
+- `manager/flux_web_service.py`（同日第二批：激活/绑定链路）
+  - **修**：「激活 / 绑定」按钮点了必报「缺少激活码或 token」。前端只发 `{code}`，
+    而 `_api_activate` 第一行就要求 `token` —— 每次都必然失败。改为
+    `_api_activate(body, token)` / `_api_bind(body, token)`，用 `do_POST` 已从
+    cookie / `?token=` 解析好的身份兜底（body.token 优先，兼容脚本调用）。
+  - **补**：admin 页原本没有任何绑定入口（只有改套餐 / 备注 / owner / 详情）。
+    新增「用户码绑定」卡片（用户 token + 激活码 → `/api/bind`）与账户行内「绑设备」按钮。
+
+### 验证（2026-09-17 实跑）
+- 闸门 `python tests/test_transport_env.py` → **8/8 通过，exit 0**。
+- **闸门有效性用变异测试证明**（不是"全绿"就算数）：把安全默认改回 `none` → `B1` 变红、exit 1；
+  把 `find_bash` 退回 `shutil.which('bash')` → `A1` 变红、exit 1。两处均已还原。
+- 既有离线套件无回归：`verify_resident_stub` 26/26、`verify_quota_patch` 2/2、
+  `verify_refund_quota` 19/19、`verify_autoselect` 20/20。
+- **真机对照**（PowerShell 环境，即双击 .bat 的同款环境，同一份探测代码）：
+  修复前 `probe_all` 0.2s 三台全 `reachable=False`；修复后 10.2s，
+  `flux3 → reachable=True / gpu_ok=True / model_ok=True（RTX 4080 SUPER）`，`any_usable()=True`。
+- **真机出图**：`model` 档，2 张 1280×720 成功落盘
+  （`web_out/5ec6dd99c49f4933/` 992 KB、`web_out/424e3d1be25846a8/` 449 KB，
+  推理 54.04s / 端到端 71.5s）。
+- **恢复能力**：重启服务后，启动时自动恢复 4 个遗留 `waiting` 任务并全部重新入队、
+  选中 flux3 依次完成。
+
+### 未验证（如实）
+- `find_bash()` 的三级兜底里，"完全没装 Git for Windows" 那条分支只在单元层
+  用打桩验过（A2），**没有在真无 Git 的机器上实跑**；该分支现在的行为是明确报
+  `NO_BASH` 而不是继续伪装成服务器不可达（这是有意的取舍）。
+- 本机服务**没有热加载**：改完这两个文件必须重启 `flux_service.py` 才生效。
+
 ## [v2.7] - 2026-09-17
 
 **生图选项层 1：接通「尺寸 / seed / 负向词」透传，让前端选项真正生效。**

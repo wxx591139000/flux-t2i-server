@@ -13,6 +13,46 @@
 `submit` 与 `download` 用同一个 token（归属校验按 `job.user_id == token`）。
 离线端到端自检见 README「两条链路及其边界（v2.3）」。
 
+## 传输层与常驻档位（v2.8）
+
+**一句话**：本机对 GPU 机的所有操作（探测 / 上传脚本 / 拉起常驻 / 拉图）都走
+`flux_server_manager.run()` → `bash -lc "<ssh|scp 命令>"`。这条链路有两个必须守住的契约。
+
+### 契约 1：bash 必须主动定位，不能假定在 PATH 里
+
+`run()` 用 `bash -lc` 而不是 `cmd /c`，是为了避免 Windows cmd 对管道/引号/单引号的解析差异
+（远端命令里大量 `| head -1`、`&&`、`2>/dev/null`）。代价是**依赖本机有 bash**，而
+Git for Windows 默认只把 `<Git>\cmd` 写进 PATH —— 那个目录只有 `git.exe`，
+`bash.exe` 在 `<Git>\bin`。于是同一份代码在不同启动方式下行为相反：
+
+| 服务是怎么起来的 | PATH 里有 bash 吗 | 结果 |
+|---|---|---|
+| Git Bash 里跑 `python manager/flux_service.py` | 有（MSYS `/usr/bin`） | 正常 |
+| 双击 `启动-*.bat`（explorer → cmd → powershell） | **没有** | 三台机全判「SSH 不通」 |
+
+所以 `find_bash()` 按三级定位：PATH →（从 `which git` 反推 `<Git>` 根再拼 `bin/bash.exe`）
+→ 常见安装路径；结果缓存。**找不到时返回 `NO_BASH: ...`，绝不退化成"服务器不可达"** ——
+后者会把人引去查云控制台（实测浪费 40 分钟）。
+
+### 契约 2：失败必须携带真因
+
+- `run()` 失败时返回 **stderr**（ssh 的报错全在 stderr；旧版只取 stdout，等于把真因扔掉）。
+- `probe_full()` 的错误分级：`NO_BASH` / `SSH 超时` / `SSH 不通（<ssh 原话>）` / 兜底文案。
+- `flux_service.py` 启动时自检 bash —— 这类故障的表现是「所有服务器都不可达」，
+  必须在启动那一刻就吼出来。
+
+### 契约 3：常驻服务的 `FLUX_OFFLOAD` 默认值必须安全
+
+`ensure_resident()` 把 `FLUX_OFFLOAD` 透传给远端 `start_resident.sh`。优先级：
+**env `FLUX_OFFLOAD` > 该机器条目的 `offload` 字段 > 默认 `model`**。
+
+`none`（全程显存）最快，但 32G 卡（RTX 4080 SUPER 32760 MiB）装 31.2 GiB fp16 权重
++ 推理激活值**必然 OOM**。所以每台默认机显式声明 `"offload": "model"`；
+想追速度的大显存机器在自己条目上写 `none` 即可，逻辑不用动。
+
+> 这三个契约由 `tests/test_transport_env.py`（8 项，离线）守住。改 `flux_server_manager.py`
+> 或 `flux_resident_client.py` 后跑一遍；闸门有效性已用变异测试证明（改回旧写法会变红）。
+
 ## 健康探针（v2.4 新增）
 
 **问题**：原 `GET /health` 返回硬编码 `{"status":"ok"}`，只能证明"HTTP 端口开着"。真实故障里最难受的一种是

@@ -249,9 +249,9 @@ class _Handler(BaseHTTPRequestHandler):
             if path == '/api/submit':
                 self._api_submit(token, body)
             elif path == '/api/activate':
-                self._api_activate(body)
+                self._api_activate(body, token)
             elif path == '/api/bind':
-                self._api_bind(body)
+                self._api_bind(body, token)
             elif path == '/api/admin/gen_codes':
                 self._api_gen_codes(body)
             elif path == '/api/admin/set_remark':
@@ -339,10 +339,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _api_activate(self, body):
+    def _api_activate(self, body, token: str = ''):
+        """激活激活码（新建账户 / 并入已有账户）。
+
+        `token` 由 do_POST 从 cookie 或 `?token=` 解析后传入 —— **identity 属于 HTTP 层，
+        不该要求前端在 body 里重复一遍**。旧版只认 body.token，而页面上的"激活 / 绑定"
+        按钮只发了 `{code}`，于是**每一次点击都必然报「缺少激活码或 token」**（2026-09-17 实测）。
+        现在 body.token 优先（兼容脚本调用），缺了就用 HTTP 身份兜底。
+        """
         data = json.loads(body or '{}')
         code = (data.get('code') or '').strip().upper()
-        token = data.get('token', '')
+        token = (data.get('token') or token or '').strip()
         if not code or not token:
             self._json({'error': '缺少激活码或 token'})
             return
@@ -357,11 +364,14 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json({'error': '激活码无效、已过期或不可用'})
 
-    def _api_bind(self, body):
-        """换设备：新 token 并入已激活码的账户（共享套餐/用量）。"""
+    def _api_bind(self, body, token: str = ''):
+        """换设备：新 token 并入已激活码的账户（共享套餐/用量）。
+
+        token 解析规则同 `_api_activate`（body 优先，HTTP 身份兜底）。
+        """
         data = json.loads(body or '{}')
         code = (data.get('code') or '').strip().upper()
-        token = data.get('token', '')
+        token = (data.get('token') or token or '').strip()
         if not code or not token:
             self._json({'error': '缺少激活码或 token'})
             return
@@ -719,6 +729,17 @@ table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:7px;b
   <div id="adetail" style="margin-top:10px"></div>
   </div>
 
+  <div class="card"><h2>用户码绑定 <span class="small">（把一个用户 / 设备并入某个账户，共享套餐与用量）</span></h2>
+  <input id="btk" placeholder="用户 token" style="width:260px">
+  <input id="bcode" placeholder="账户 = 激活码" style="width:180px">
+  <button onclick="bindUser()">绑定</button> <span id="bmsg" class="msg"></span>
+  <div class="small" style="margin-top:6px">
+    token 从哪来：客户页（<a href="/" target="_blank">/</a>）与「我的任务」页（<a href="/center" target="_blank">/center</a>）顶部都会显示「你的Token」；
+    也可以在上面账户表格里搜到客户后点「详情」，看到该账户下所有设备 token。
+    绑定要求目标激活码**已被激活过**（账户已存在）。
+  </div>
+  </div>
+
   <div class="card"><h2>激活码</h2>
   <table><thead><tr><th>激活码</th><th>套餐</th><th>状态</th><th>备注</th><th>到期</th><th>使用人</th><th>操作</th></tr></thead><tbody id="ctb"></tbody></table>
   </div>
@@ -757,11 +778,31 @@ async function loadUsers(){{const d=await api('/api/admin/users');const tb=docum
     '<td><select onchange="setPlan(\\''+esc(a.account_id)+'\\',this.value)">'+
       Object.keys(PLANS).map(p=>'<option value="'+p+'"'+(p===a.plan&&!a.is_owner?' selected':'')+'>'+PLANS[p]+'</option>').join('')+'</select>'+
     ' <button class="mini" onclick="setOwner(\\''+esc(a.account_id)+'\\','+(a.is_owner?1:0)+')">'+(a.is_owner?'取消owner':'设owner')+'</button>'+
+    ' <button class="mini" onclick="bindTo(\\''+esc(a.account_id)+'\\')">绑设备</button>'+
     ' <button class="mini" onclick="accountDetail(\\''+esc(a.account_id)+'\\')">详情</button></td>';
     tb.appendChild(tr);}})}}
 
 async function setPlan(t,p){{const d=await api('/api/admin/set_plan',{{method:'POST',body:JSON.stringify({{account_id:t,plan:p}})}});
   if(d.ok)loadUsers(); else alert(d.error||'失败')}}
+
+// 用户码绑定：把一个用户/设备(token)并入某个账户(激活码)，共享套餐与用量。
+// 服务端 /api/bind 的 token 走 HTTP 身份兜底，但这里是管理员代客户操作，
+// 目标 token 必须显式传 body.token。
+async function bindUser(){{
+  const t=document.getElementById('btk').value.trim();
+  const c=document.getElementById('bcode').value.trim().toUpperCase();
+  const el=document.getElementById('bmsg');
+  if(!t||!c){{el.innerHTML='<span class="err">请填 token 与激活码</span>';return}}
+  const d=await api('/api/bind',{{method:'POST',body:JSON.stringify({{code:c,token:t}})}});
+  if(d.ok){{el.innerHTML='<span class="ok">'+esc(d.msg||'已绑定')+'</span>';document.getElementById('btk').value='';loadUsers();loadCodes()}}
+  else el.innerHTML='<span class="err">'+esc(d.error||'失败')+'</span>';
+}}
+async function bindTo(acct){{
+  const t=prompt('要并入账户 '+acct+' 的用户 token（客户页/我的任务页顶部的「你的Token」）：','');
+  if(!t||!t.trim())return;
+  const d=await api('/api/bind',{{method:'POST',body:JSON.stringify({{code:acct,token:t.trim()}})}});
+  if(d.ok){{alert('已绑定：'+(d.msg||''));loadUsers();loadCodes()}}else alert(d.error||'失败');
+}}
 async function setOwner(t,cur){{const d=await api('/api/admin/set_owner',{{method:'POST',body:JSON.stringify({{account_id:t,is_owner:cur?0:1}})}});
   if(d.ok)loadUsers(); else alert(d.error||'失败')}}
 

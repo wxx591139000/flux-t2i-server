@@ -40,6 +40,14 @@ def main():
     args = ap.parse_args()
 
     log.info('🚀 FLUX 对外文生图服务启动')
+
+    # 启动自检：ssh/scp 靠 bash -lc 执行（见 flux_server_manager.run）。
+    # 缺 bash 时故障表现是「所有服务器都不可达」，极易误判成 GPU 机关机 —— 宁可启动就吼一声。
+    from manager.flux_server_manager import find_bash
+    if find_bash() is None:
+        log.error('⚠️  启动自检未通过：本机无 bash，ssh/scp 无法执行，'
+                  '所有服务器都会被判「不可达」。装 Git for Windows 或把 <Git>\\bin 加入 PATH 后重启。')
+
     db = FluxDB()
     quota = QuotaService(db)
     scheduler = FluxQueueScheduler(db, quota)

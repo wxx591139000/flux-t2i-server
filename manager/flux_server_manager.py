@@ -60,13 +60,20 @@ OBSIDIAN_IMAGES = Path(os.environ.get('FLUX_OBSIDIAN_IMAGES',
 # 克隆实例与原机是同布局（同 remote_base / remote_model），只差一个 SSH 别名，
 # 所以只要别名能匹配 FLUX_SERVER_ALIAS_GLOB，就自动成为候选机 —— 不用改代码。
 _DEFAULT_SERVERS = [
-    {"name": "flux1", "alias": "autodl-flux",  "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
-    {"name": "flux2", "alias": "autodl-flux2", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
+    {"name": "flux1", "alias": "autodl-flux",  "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev", "offload": "model"},
+    {"name": "flux2", "alias": "autodl-flux2", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev", "offload": "model"},
     # flux3 = 2026-09-16 从 AutoDL 平台克隆出的实例（当日 flux1/flux2 无卡）。
     # 克隆实例与原机同布局，故 remote_base / remote_model 沿用同一组默认路径。
     # alias 必须与 ~/.ssh/config 里的 Host 名逐字一致；换了命名就改这一行，
     # 或走 FLUX_SERVER_ALIAS_GLOB 自动发现（见下方 discover_servers）。
-    {"name": "flux3", "alias": "autodl-flux3", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev"},
+    #
+    # offload：拉起常驻服务时透传给服务端的显存档位（none|model|sequential）。
+    #   ⚠️ 这几台都是 32G 卡（RTX 4080 SUPER 32760 MiB），fp16 权重约 31.2 GiB，
+    #   offload=none（全程显存）**必然 OOM** —— 2026-09-17 实测：自动拉起后
+    #   "CUDA out of memory, total capacity 31.48 GiB" 每张图都失败。
+    #   所以这里显式声明 model。有更大显存的机器（如 80G）想追速度，在它的
+    #   条目上改回 "none" 即可，不用动代码逻辑。
+    {"name": "flux3", "alias": "autodl-flux3", "remote_base": "/root/autodl-tmp/flux-t2i", "remote_model": "/root/autodl-tmp/models/FLUX.1-dev", "offload": "model"},
 ]
 
 FLUX_SERVER_DISCOVER = (os.environ.get('FLUX_SERVER_DISCOVER', '1').strip() != '0')
@@ -204,16 +211,77 @@ if GEN_MODE not in ('resident', 'legacy'):
 
 # ═══════════════ SSH / 服务器操作 ═══════════════
 
+# ── bash 定位 ──────────────────────────────────────────────────────────
+# 为什么需要它（2026-09-17 踩坑，事故级）：
+#   Git for Windows 安装时默认只把 <Git>\cmd 写进 PATH，**那个目录里只有 git.exe**；
+#   bash.exe 在 <Git>\bin（和 <Git>\usr\bin），不在 PATH。
+#   run() 原先直接写死 subprocess.run(['bash', '-lc', cmd])，于是：
+#     · 从 Git Bash 里跑服务 → PATH 有 /usr/bin → bash 找得到 → 一切正常
+#     · 从资源管理器双击 .bat 跑服务 → PowerShell 环境 PATH 无 bash → FileNotFoundError
+#       → 被 run() 的 except 吞成 (False, '...') → 每次探测 ~0.07s 就"不可达"
+#       → 三台机器全被判「SSH 不通（可能关机）」→ waiting 池永久卡住、健康监控误报。
+#   教训：**「找不到本机工具」绝不能退化成「远程服务器不可达」** —— 会把运维引向错误方向。
+_BASH_EXE = None      # None=尚未探测；'' = 已确认没有；其它 = 可用路径
+
+
+def find_bash():
+    """定位可用的 bash（结果缓存）。找不到返回 None。"""
+    global _BASH_EXE
+    if _BASH_EXE is not None:
+        return _BASH_EXE or None
+    cands = []
+    w = shutil.which('bash')
+    if w:
+        cands.append(w)
+    if os.name == 'nt':
+        g = shutil.which('git')                      # 从 <Git>\cmd\git.exe 反推 Git 根
+        if g:
+            root = Path(g).resolve().parent.parent
+            cands += [root / 'bin' / 'bash.exe', root / 'usr' / 'bin' / 'bash.exe']
+        for p in (r'C:\Program Files\Git\bin\bash.exe',
+                  r'C:\Program Files\Git\usr\bin\bash.exe',
+                  r'C:\Program Files (x86)\Git\bin\bash.exe',
+                  r'C:\Program Files (x86)\Git\usr\bin\bash.exe'):
+            cands.append(Path(p))
+    for c in cands:
+        try:
+            if Path(c).is_file():
+                _BASH_EXE = str(c)
+                if not w or str(c) != str(w):
+                    log.info(f'🔧 bash 不在 PATH，改按 Git 安装位置定位: {c}')
+                return _BASH_EXE
+        except Exception:
+            pass
+    _BASH_EXE = ''
+    log.error('❌ 本机未找到 bash —— ssh/scp 全部无法执行，'
+              '所有服务器都会被判「不可达」。请安装 Git for Windows，'
+              '或把 <Git>\\bin 加入 PATH。')
+    return None
+
+
 def run(cmd, timeout=30):
-    """执行命令。用 bash -lc（避免 Windows cmd 解析管道/引号）+ UTF-8 解码（避免 GBK 解码中文失败）。"""
+    """执行命令。用 bash -lc（避免 Windows cmd 解析管道/引号）+ UTF-8 解码（避免 GBK 解码中文失败）。
+
+    与旧版的差别：
+      1. bash 走 find_bash() 定位，不再假定它在 PATH 里；
+      2. 失败时把 **stderr** 带回来（旧版只取 stdout，ssh 的报错全在 stderr，
+         于是所有失败都退化成一句'SSH 不通'，真因不可见）。
+    """
+    bash = find_bash()
+    if not bash:
+        return False, ('NO_BASH: 本机未找到 bash，无法执行 ssh/scp'
+                       '（装 Git for Windows 或把 <Git>\\bin 加入 PATH）')
     try:
-        r = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True,
+        r = subprocess.run([bash, '-lc', cmd], capture_output=True, text=True,
                            encoding='utf-8', errors='replace', timeout=timeout)
-        return r.returncode == 0, (r.stdout or '').strip()
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or '').strip()
+            return False, err[:400] or f'退出码 {r.returncode}'
+        return True, (r.stdout or '').strip()
     except subprocess.TimeoutExpired:
         return False, 'TIMEOUT'
     except Exception as e:
-        return False, str(e)
+        return False, f'{type(e).__name__}: {e}'
 
 
 def server_reachable(server=None) -> bool:
@@ -389,7 +457,15 @@ def probe_full(server=None, force: bool = False) -> dict:
     ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {alias} '
                   f'{shlex.quote(remote)}', 20)
     if not ok:
-        d['error'] = 'SSH 不通（可能关机 / 别名未在 ~/.ssh/config 中）'
+        reason = (out or '').strip()[:160]
+        if 'NO_BASH' in reason:
+            d['error'] = reason            # 本机缺 bash：必须一眼看出，不能伪装成"远程关机"
+        elif reason == 'TIMEOUT':
+            d['error'] = 'SSH 超时（连接 8s 无响应）'
+        elif reason:
+            d['error'] = f'SSH 不通（{reason}）'
+        else:
+            d['error'] = 'SSH 不通（可能关机 / 别名未在 ~/.ssh/config 中）'
     else:
         lines = [ln.strip() for ln in (out or '').splitlines()]
         if 'REACH' not in lines:
