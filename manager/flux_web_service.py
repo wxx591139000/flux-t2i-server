@@ -275,8 +275,23 @@ class _Handler(BaseHTTPRequestHandler):
         data = json.loads(body or '{}')
         prompt = data.get('prompt', '')
         priority = int(data.get('priority', 0) or 0)
+
+        def _pint(name):
+            v = data.get(name)
+            try:
+                return int(v) if v not in (None, '') else None
+            except (TypeError, ValueError):
+                return None
+
+        width = _pint('width')
+        height = _pint('height')
+        seed = _pint('seed')
+        steps = _pint('steps')
+        negative_prompt = data.get('negative_prompt') or None
+
         self._resolve_user(token)
-        result = self.scheduler.submit(token, prompt, priority)
+        result = self.scheduler.submit(token, prompt, priority,
+                                       width, height, seed, steps, negative_prompt)
         self._json(result)
 
     def _api_status(self, q):
@@ -289,6 +304,7 @@ class _Handler(BaseHTTPRequestHandler):
             'job_id': job['job_id'], 'status': job['status'],
             'prompt': job['prompt'], 'error': job['error'],
             'image_path': job['image_path'],
+            'seed': job['seed'], 'width': job['width'], 'height': job['height'],
             'created_at': job['created_at'], 'completed_at': job['completed_at'],
         })
 

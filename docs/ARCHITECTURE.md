@@ -78,9 +78,9 @@ HTTP 码同步：200 / 503
 - **鉴权**：设 `FLUX_RESIDENT_TOKEN` 后所有请求需带 `X-Auth-Token`；不设则不校验（仅本机可绑定）。
 - **错误分流**：`TransportError.kind` 分 `server_down`（进等待恢复池，等机器回来重试）与
   `failed`（业务失败，直接标记失败）。这个区分决定任务是否会被无限重试，必须精确。
-- **能力增量**：`width/height/steps/seed/negative_prompt` 全部可透传（旧 web 层只能传 prompt；
-  服务端固定 768×1024 / steps 25 / seed 42）。同时服务端加硬边界：尺寸归一 16 的倍数并夹在
-  256~2048，steps 限 1~100，越界返回 400。
+- **能力增量**：`width/height/steps/seed/negative_prompt` 全部可透传到底层（**v2.7 起 web 层 `/api/submit`
+  也接通了，不再只传 prompt**；legacy 的 `gen_flux.py` 仍是固定 768×1024 / steps 25）。
+  服务端加硬边界：尺寸归一 16 的倍数并夹在 256~2048，steps 限 1~100，越界返回 400。
 - **两条链路互斥**：常驻服务占住显存后，旧链路再上一份模型会 OOM。故 `flux_queue`（web 队列）
   与 `flux_server_manager.process_job`（小红书配图）**共用同一个 `FLUX_GEN_MODE` 一起切**。
 - **回退**：`FLUX_GEN_MODE=legacy` 一键回到旧链路；旧的文件与函数**全部保留**，未删除。
@@ -212,7 +212,7 @@ watchdog --download → SSH可达? → 带卡? → 模型就绪? → 已在跑? 
 
 ### 提交门（v1.1，对标转录 orchestrator）
 ```
-submit(user,prompt) → 去重(user:prompt) → 配额precheck → 队列上限 → 入队(priority, seq)
+submit(user,prompt,width,height,seed,steps,neg) → 去重(user:prompt:seed:WxH) → 配额precheck → 队列上限 → 入队(priority, seq)
 worker: pop → SSH生成 → 拉图 web_out/<jobid>/ → done；服务器down → [SERVER_DOWN]重排队(3次)
 ```
 

@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## [v2.7] - 2026-09-17
+
+**生图选项层 1：接通「尺寸 / seed / 负向词」透传，让前端选项真正生效。**
+
+### 背景
+下游网站（ecom-image-studio）的 UI 一直有比例 / 负向词 / seed 控件，但适配器源码自己写着
+「上游不支持，会忽略」—— 因为 web 层的 `_api_submit` 只读 `prompt/priority`，尺寸固定在
+768×1024、seed 恒 0、负向词丢弃。本版把这条断链接通。
+
+### 改动
+- `manager/flux_web_service.py` `_api_submit`：读 `width/height/seed/steps/negative_prompt`（均可选，
+  缺省走服务端默认），透传给 `scheduler.submit()`；`_api_status` 回传 `seed/width/height`（供前端读真实种子）。
+- `manager/flux_queue.py` `submit()`：签名加这 5 个可选参数；**去重 key 从 `user:prompt` 扩展为
+  `user:prompt:seed:WxH`**（同提示词换 seed/尺寸 = 不同任务，多张候选靠不同 seed 绕过去重，
+  替代下游用 `(variation N)` 污染提示词的 hack）；`_generate_resident()` 从 job 取参数构造
+  `**gen_kwargs` 传给常驻服务，并把实际 seed 回填进 job。
+- `manager/flux_db.py`：jobs 表加 `width/height/seed/steps/negative_prompt` 5 列（含幂等迁移
+  `_migrate()`，旧生产库自动补列）；`job_insert()` 存这些参数。
+- `docs/ARCHITECTURE.md` / `README.md`：同步「web 层不再只传 prompt」与去重 key 的描述。
+
+### 说明（如实标注）
+- 参数透传只在 **resident 模式**生效；legacy 的 `gen_flux.py` 仍固定 768×1024 / steps 25。
+- `negative_prompt` 虽已透传，但 FLUX.1-dev 是 guidance-distilled，diffusers 会**静默忽略**它
+  （无 `true_cfg_scale`）。透传仅为链路完整，真正要抑制某元素应写进正向提示词。
+
+### 验证（离线，无需 GPU）
+`submit` 存参 → `job_get` 读回、`gen_kwargs` 构造、去重（同 prompt+seed 拒 / 换 seed 放行）全部
+通过；三文件 `py_compile` 通过。下游 ecom-image-studio `tsc --noEmit` 通过。
+真机出图待 GPU 开机后补跑（flux3 已于 2026-09-16 23:20 关机）。
+
 ## [v2.6] - 2026-09-16
 
 **FLUX 生图质量保障：五层方法论 + 翻译层修复 + 双链真机端到端。**

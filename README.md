@@ -139,7 +139,7 @@ ssh autodl-flux "bash /root/autodl-tmp/flux-t2i/start_gen.sh"
 |---|---|---|
 | 生成方式 | `flux_resident_server.py` 常驻进程，模型加载 1 次 | 每张图 `start_gen.sh` 冷启动 `gen_flux.py` |
 | 每张图的模型加载 | **仅首次** | **每张一次**（~31GB 权重重新 `from_pretrained`） |
-| 尺寸 / steps / 负向词 / seed | 支持透传 | web 层只传 prompt，服务端固定 768×1024 / steps 25 / seed 42 |
+| 尺寸 / steps / 负向词 / seed | 支持透传（v2.7 起 web 层接通） | gen_flux.py 固定 768×1024 / steps 25（忽略透传参数） |
 | 失败影响面 | 单张失败，其他张不受影响 | 整批失败 |
 | 逃生口 | — | 出问题时 `FLUX_GEN_MODE=legacy` 一键回退 |
 
@@ -227,6 +227,11 @@ python manager/flux_resident_client.py servers
 
 > ⚠️ 下游站点必须让 `submit` 与 `download` 用**同一个 token**（服务端按 `job.user_id == token` 校验归属，
 > 无 token 时会现场生成新的随机 token，导致下载 403）。
+
+`POST /api/submit` body 基础字段为 `{ prompt, priority }`；自 **v2.7** 起可附带可选生图参数
+`width / height / seed / steps / negative_prompt`（resident 模式生效，缺省 = 服务端默认 768×1024 / steps 25）。
+`GET /api/status` 响应回带 `seed / width / height`，前端可读回实际种子做复现。
+注意：`negative_prompt` 虽已透传，但 FLUX.1-dev 是 guidance-distilled，diffusers 会静默忽略它。
 
 ### 端到端自检（离线，无需 GPU / 无需 SSH）
 

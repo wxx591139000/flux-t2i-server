@@ -68,8 +68,12 @@ class FluxQueueScheduler:
         self._last_notify = 0.0
 
     # ── 提交（入口）──
-    def submit(self, user_id: str, prompt: str, priority: int = 0) -> dict:
-        """提交一个生成任务。成功返回 job dict，失败返回 {error: reason}"""
+    def submit(self, user_id: str, prompt: str, priority: int = 0,
+               width=None, height=None, seed=None, steps=None, negative_prompt=None) -> dict:
+        """提交一个生成任务。成功返回 job dict，失败返回 {error: reason}。
+
+        width/height/seed/steps/negative_prompt 为可选生图参数，透传到底层常驻服务
+        （legacy 链路固定尺寸，这些仅 resident 模式生效）。"""
         prompt = (prompt or '').strip()
         if not prompt:
             return {'error': '提示词不能为空'}
@@ -88,10 +92,11 @@ class FluxQueueScheduler:
             if prompt != original_prompt:
                 logger.info(f'🌐 中文已转换: {original_prompt[:30]} → {prompt[:50]}...')
 
-        # 1. 去重（同用户同提示词在排队/生成中）
-        key = f'{user_id}:{prompt}'
+        # 1. 去重（同用户同提示词同参数在排队/生成中）
+        #    key 纳入 seed/size：同一提示词换 seed 或换尺寸 = 不同任务（B 链多张候选靠这绕过去重）。
+        key = f'{user_id}:{prompt}:{seed}:{width}x{height}'
         if key in self._inflight:
-            return {'error': '相同提示词正在排队/生成中，请勿重复提交'}
+            return {'error': '相同提示词与参数正在排队/生成中，请勿重复提交'}
         # 2. 配额
         ok, reason = self.quota.precheck(user_id)
         if not ok:
@@ -103,7 +108,8 @@ class FluxQueueScheduler:
         # 原先用毫秒时间戳当主键：同毫秒两次并发提交会 INSERT 冲突/互相覆盖。
         # 改 uuid4 前 16 位（32bit 十六进制 ≈ 64bit 熵），冲突概率可忽略。
         job_id = uuid.uuid4().hex[:16]
-        self.db.job_insert(job_id, user_id, prompt, priority, original_prompt)
+        self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
+                           width, height, seed, steps, negative_prompt)
         self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
         self._inflight.add(key)
         self._seq += 1
@@ -229,11 +235,17 @@ class FluxQueueScheduler:
                 return False, f'{prefix}{r["msg"]}'
 
             dest = WEB_OUT / job_id / f'{job_id}.png'
-            st = fr.generate_via_resident(server, job['prompt'], dest)
-            self.db.job_update(job_id, image_path=str(dest), server=server['name'])
+            gen_kwargs = {}
+            for k in ('width', 'height', 'seed', 'steps', 'negative_prompt'):
+                v = job[k]          # job 是 sqlite3.Row，下标访问（无 .get）
+                if v not in (None, ''):
+                    gen_kwargs[k] = v
+            st = fr.generate_via_resident(server, job['prompt'], dest, **gen_kwargs)
+            seed_out = st.get('seed')
+            self.db.job_update(job_id, image_path=str(dest), server=server['name'], seed=seed_out)
             logger.info(f'🗄️  任务 {job_id} 由 {server["name"]} 常驻服务完成'
                         f'（推理 {st.get("runtime")}s / 端到端 {st.get("total_elapsed")}s'
-                        f' / seed {st.get("seed")}）')
+                        f' / seed {seed_out}）')
             return True, ''
         except fr.TransportError as e:
             if e.kind == 'server_down':

@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     original_prompt TEXT,          -- 客户原始中文提示词（若经 LLM 转换）
     status       TEXT NOT NULL DEFAULT 'queued',
     priority     INTEGER NOT NULL DEFAULT 0,
+    width        INTEGER,          -- 生成宽（可空 = 服务端默认 768）
+    height       INTEGER,          -- 生成高（可空 = 服务端默认 1024）
+    seed         INTEGER,          -- 随机种子（可空 = 服务端随机；生成后回填实际值以便复现）
+    steps        INTEGER,          -- 采样步数（可空 = 服务端默认 25）
+    negative_prompt TEXT,          -- 负向提示词（可空；FLUX.1-dev 蒸馏模型会忽略它，透传仅为链路完整）
     image_path   TEXT,
     error        TEXT,
     server       TEXT,              -- 任务执行所在 flux 服务器名 (flux1/flux2/...)；多服务器调度
@@ -93,6 +98,16 @@ class FluxDB:
             if 'refunded_at' not in jcols:
                 self._conn.execute('ALTER TABLE jobs ADD COLUMN refunded_at INTEGER')
                 logger.info('🗄️  jobs 表已加 refunded_at 列（失败退配额幂等标记）')
+            for col, ddl in {
+                'width':           'ALTER TABLE jobs ADD COLUMN width INTEGER',
+                'height':          'ALTER TABLE jobs ADD COLUMN height INTEGER',
+                'seed':            'ALTER TABLE jobs ADD COLUMN seed INTEGER',
+                'steps':           'ALTER TABLE jobs ADD COLUMN steps INTEGER',
+                'negative_prompt': 'ALTER TABLE jobs ADD COLUMN negative_prompt TEXT',
+            }.items():
+                if col not in jcols:
+                    self._conn.execute(ddl)
+                    logger.info(f'🗄️  jobs 表已加 {col} 列（生图参数透传）')
             ccols = {r[1] for r in self._conn.execute('PRAGMA table_info(codes)')}
             for col, ddl in {
                 'created_at': 'ALTER TABLE codes ADD COLUMN created_at INTEGER',
@@ -303,10 +318,13 @@ class FluxDB:
         self._exec('UPDATE accounts SET is_owner=? WHERE account_id=?', (int(is_owner), account_id))
 
     # ── jobs ──
-    def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None):
-        self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, created_at) '
-                   'VALUES(?,?,?,?,?,?,?)',
-                   (job_id, user_id, prompt, original_prompt, 'queued', priority, int(time.time())))
+    def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None,
+                   width=None, height=None, seed=None, steps=None, negative_prompt=None):
+        self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, '
+                   'width, height, seed, steps, negative_prompt, created_at) '
+                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (job_id, user_id, prompt, original_prompt, 'queued', priority,
+                    width, height, seed, steps, negative_prompt, int(time.time())))
 
     def job_update(self, job_id, **fields):
         sets = ', '.join(f'{k}=?' for k in fields)
