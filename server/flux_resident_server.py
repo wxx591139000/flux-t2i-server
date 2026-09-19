@@ -367,6 +367,18 @@ def _prepare_ref_image(im, size: int):
          Display-P3），按裸 RGB 解读损失饱和度；且 resize 未指定重采样
          → 改为带 ICC 时用 ImageCms 转 sRGB + 显式 LANCZOS。
     实测证据（修正前 4 张 edit 的对比度 4/4 全部下降 = 发灰）。
+
+    ⚠️ 【2026-09-19 修 · 缩放基准 min→max】
+      上面第 1 条当时**只改对了一半**：`scale = size / min(w, h)` 让「长边」溢出画布，
+      而 `paste` 的负偏移会被 PIL **静默裁掉**（不报错、不警告）——
+      等于把「压扁 43%」换成了「裁掉 33%」，用户看到的还是「人腿变短」。
+      实测（size=1024，用 klein-setup/refs/ 的原始素材跑本函数）：
+        ref-jeans.jpg 1200×1800 → min 得 1024×1536 → 画布 1024×1024 → **高度只留 66.7%**
+        ref-shoes.jpg 1200×960  → min 得 1280×1024 → 画布 1024×1024 → **宽度只留 80.0%**
+      必须用 `max` 才能保证长边 ≤ 画布，从而真正「完整保留 + 居中 pad」。
+      （同源错误也在 klein-setup/ab_klein_dev.py:178，已同步修 —— 否则 A/B 对照与
+        本函数用的预处理不一致，对照结论就不可比。）
+      回归门：tests/test_prepare_ref_image.py（断言不裁切 + 宽高比保持）。
     """
     from PIL import Image as _Img
 
@@ -386,7 +398,10 @@ def _prepare_ref_image(im, size: int):
     w, h = im.size
     if w == h:
         return im.resize((size, size), _Img.LANCZOS)
-    scale = size / min(w, h)
+    # ⚠️ 必须用 max：用 min 会让长边溢出画布，paste 的负偏移被 PIL 静默裁掉
+    #    （2026-09-18 的版本就是这个错，2026-09-19 修，详见上面 docstring）
+    #    不变量：max(nw, nh) == size，故 paste 偏移恒 >= 0，内容零裁切。
+    scale = size / max(w, h)
     nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
     im = im.resize((nw, nh), _Img.LANCZOS)
     canvas = _Img.new('RGB', (size, size), (127, 127, 127))   # 中灰填充，不引入色彩倾向
