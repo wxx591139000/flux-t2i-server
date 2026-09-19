@@ -248,6 +248,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if path == '/api/submit':
                 self._api_submit(token, body)
+            elif path == '/api/edit':
+                self._api_edit(token, body)
             elif path == '/api/activate':
                 self._api_activate(body, token)
             elif path == '/api/bind':
@@ -302,6 +304,52 @@ class _Handler(BaseHTTPRequestHandler):
         self._resolve_user(token)
         result = self.scheduler.submit(token, prompt, priority,
                                        width, height, seed, steps, negative_prompt)
+        self._json(result)
+
+    def _api_edit(self, token, body):
+        """图生图提交（2026-09-18 新增）。
+
+        与 `/api/submit` 唯一的差别 = body 多一个 `image`（base64 参考图）。
+        参数解析、翻译、计费、配额、队列全部复用 `scheduler.submit`，本条只负责
+        「把参考图取出来 + 把参数异常翻译成 400」。
+
+        ⚠️ 缺 `image` 时**明确 400 拒绝，不静默降级成文生图** —— 那会照常出图、
+        照常扣费，但完全不是用户要的东西，是最难被发现的一类错误。
+        """
+        data = json.loads(body or '{}')
+        prompt = data.get('prompt', '')
+        priority = int(data.get('priority', 0) or 0)
+        ref_image = (data.get('image') or '').strip()
+        if not ref_image:
+            self._json({'error': '缺少参考图（image 字段，base64 或 data URL）'}, 400)
+            return
+
+        def _pint(name):
+            v = data.get(name)
+            if v in (None, ''):
+                return None
+            if isinstance(v, bool):  # bool 是 int 子类，int(True)=1，需显式拒绝
+                raise ValueError(f'{name} 参数非法（应为整数）：{v!r}')
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                raise ValueError(f'{name} 参数非法（应为整数）：{v!r}')
+
+        try:
+            width = _pint('width')
+            height = _pint('height')
+            seed = _pint('seed')
+            steps = _pint('steps')
+        except ValueError as e:
+            self._json({'error': str(e)}, 400)
+            return
+
+        negative_prompt = data.get('negative_prompt') or None
+
+        self._resolve_user(token)
+        result = self.scheduler.submit(token, prompt, priority,
+                                       width, height, seed, steps, negative_prompt,
+                                       ref_image=ref_image)
         self._json(result)
 
     def _api_status(self, q):
@@ -629,8 +677,9 @@ table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:8px;b
 <small style="float:right"><a href="/admin" style="color:#999">商户管理</a></small></div>
 
 <div class="card"><h2>生成图片</h2>
-<textarea id="p" placeholder="用英文描述你想生成的图片，例如: a cute shiba inu running on a beach, cinematic lighting, photorealistic"></textarea>
-<button onclick="submit()">提交生成</button>
+<textarea id="p" placeholder="中文 / English 都可以。中文示例：一只白色陶瓷马克杯，置于木桌，自然光；English: a white ceramic mug on a wooden table, soft natural light"></textarea>
+<small style="color:#888;display:block;margin-top:6px">支持中文与英文。中文会由后台自动翻译成 FLUX 适用的英文提示词后再出图（约多花几秒）</small>
+<button onclick="submit()" style="margin-top:10px">提交生成</button>
 <div id="msg" class="msg"></div></div>
 
 <div class="card"><h2>激活 / 绑定账户</h2>

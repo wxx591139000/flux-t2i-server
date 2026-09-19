@@ -24,7 +24,10 @@ SCREEN=${FLUX_RESIDENT_SCREEN:-fluxd}
 LOG="$WORKDIR/fluxd.log"
 SERVER_PY="$WORKDIR/flux_resident_server.py"
 OUT="$WORKDIR/resident_out"
-OFFLOAD=${FLUX_OFFLOAD:-none}
+# ⚠️ 默认必须是安全档，不能是「最快」的：
+#   32G 卡上 FLUX.1-dev 权重 31.7 GiB > 卡空闲 ~31.1 GiB → 默认 none 必然 OOM（已实测）。
+#   2026-09-18 起默认改为 model；klein 4B 只有 17.3 GB，可用 FLUX_OFFLOAD=balanced 或 none。
+OFFLOAD=${FLUX_OFFLOAD:-model}
 TOKEN=${FLUX_RESIDENT_TOKEN:-}
 
 MODE=${1:-}

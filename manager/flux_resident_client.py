@@ -503,13 +503,25 @@ def wait_model_loaded(server: dict, timeout: int = None, interval: float = 5) ->
 
 # ══════════════════ 高层入口：生成一张 ══════════════════
 def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1800,
-                          wait_model: int = None, **gen_kwargs) -> dict:
+                          wait_model: int = None, ref_image_b64: str = None,
+                          **gen_kwargs) -> dict:
     """提交 → 等模型就绪 → 轮询完成 →（给了 dest 才）拉图。返回 status dict（含 path / seed）。
 
     `dest` 可省略（None）：`bench` 只关心推理耗时，不需要把 PNG 拉回本地 —— 白花时间，
     且这条 AutoDL 中转链路下行只有 ~3.6 KB/s，320KB 的图要 90s+，
     会把吞吐数据完全淹没在传输耗时里。旧版 `dest` 是必填位置参数，导致
     `bench` 一调用就 `TypeError`（该命令此前从未跑通过）。
+
+    `ref_image_b64`（2026-09-18 新增）—— 给了它就走 **`POST /edit`**（图生图），
+    不给就走 `POST /generate`（文生图）。两条路径除端点名与这一个字段外完全同构，
+    所以共用本函数，不做成两份代码。
+
+    参考图传**原样 base64**（可带 `data:` 前缀，服务端会剥）。不要在这里解码或
+    重新编码 —— 服务端 `_save_ref_image` 已经做了严格的图片校验与体积卡口，
+    客户端再动一次只会多一处口径漂移（这个项目在「体积换算」上已经栽过两次）。
+    体积上限由**上游**兜底：`MAX_EDIT_BYTES=12MiB`(HTTP body) / `MAX_REF_BYTES=8MiB`
+    (解码后)。超限时上游返回 400，本函数会把它转成 `TransportError(kind='failed')`
+    → 任务标记 failed → 配额原路退还，不会让用户白扣一张。
 
     gen_kwargs 支持 width / height / steps / seed / negative_prompt / guidance_scale
     —— 这是旧链路（gen_flux.py 固定 768×1024 / steps 25、web 层只传 prompt）做不到的。
@@ -524,9 +536,12 @@ def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1
 
     body = {'prompt': prompt}
     body.update({k: v for k, v in gen_kwargs.items() if v not in (None, '')})
-    sub = t.post_json('/generate', body, timeout=90)
+    if ref_image_b64:
+        body['image'] = ref_image_b64
+    endpoint = '/edit' if ref_image_b64 else '/generate'
+    sub = t.post_json(endpoint, body, timeout=90)
     job_id = sub['job_id']
-    logger.info(f'🎬 常驻任务 {job_id} 已提交（队列深度 {sub.get("queue_depth")}）')
+    logger.info(f'🎬 常驻任务 {job_id} 已提交（{endpoint}，队列深度 {sub.get("queue_depth")}）')
 
     # 自适应退避轮询：SSH 传输下每次轮询都是一次往返，固定 3s 太密
     interval, deadline, t0 = 1.5, time.time() + timeout, time.time()

@@ -72,6 +72,11 @@ DEFAULT_GUIDANCE = 3.5
 MIN_DIM, MAX_DIM, DIM_MULTIPLE = 256, 2048, 16
 MAX_STEPS = 100
 MAX_REQ_BYTES = 64 * 1024
+# 【2026-09-18 新增】/edit 要带参考图：base64 后体积膨胀约 1.37 倍。
+# 1024×1024 PNG 约 1.5–2 MB → base64 后约 2.7 MB。给 12 MiB 上限留足余量，
+# 同时仍拦住「塞个大视频进来」这类滥用。**只对 /edit 放宽，t2i 维持 64 KB**。
+MAX_EDIT_BYTES = 12 * 1024 * 1024
+MAX_REF_BYTES = 8 * 1024 * 1024                     # 参考图解码后上限（8 MB）
 
 STATUS_QUEUED = 'queued'
 STATUS_GENERATING = 'generating'
@@ -121,19 +126,40 @@ class _SeedGen:
 
 
 class StubPipeline:
-    """不加载真实模型的替身。调用签名与 FluxPipeline.__call__ 对齐，供无 GPU 环境自证链路。"""
+    """不加载真实模型的替身。调用签名与 Flux2KleinPipeline.__call__ 对齐，供无 GPU 环境自证链路。
+
+    【2026-09-18 修正】原先没有 `image` 参数 —— 导致 stub 模式下 `/edit` 会在
+    「找不到图像参数」的检查处直接失败，**图生图链路无法离线自证**。
+    klein 的真实签名里该参数名 = `image`（已实测定死），故替身照此对齐。
+
+    另：替身**只声明 image 这一种**，不声明 images/image_latents —— 这样离线就能区分出
+    「按模型签名动态判参名」的逻辑是否真的生效，而不是恒等于某个硬编码名字。
+    """
 
     def __call__(self, prompt, negative_prompt='', num_inference_steps=25,
-                 guidance_scale=3.5, width=768, height=1024, generator=None, **kw):
+                 guidance_scale=3.5, width=768, height=1024, generator=None,
+                 image=None, **kw):
         seed = 0
         if generator is not None:
             try:
                 seed = int(generator.initial_seed())
             except Exception:
                 seed = 0
+        # 传了参考图 → 用它的颜色影响输出，让「edit 确实读到了图」肉眼/断言可辨
+        ref_rgb = None
+        if image is not None:
+            try:
+                small = image.convert('RGB').resize((8, 8))
+                px = list(small.getdata())
+                n = len(px)
+                ref_rgb = (sum(p[0] for p in px) // n,
+                           sum(p[1] for p in px) // n,
+                           sum(p[2] for p in px) // n)
+            except Exception:
+                ref_rgb = (10, 10, 10)
         time.sleep(0.15)                     # 模拟一点耗时，便于观察状态流转
         base = abs(hash(prompt)) % 120
-        rgb = (150 + base % 60, 170 + (seed % 50), 200 - base % 40)
+        rgb = ref_rgb if ref_rgb else (150 + base % 60, 170 + (seed % 50), 200 - base % 40)
         img = _SynthImage(int(width), int(height), rgb)
 
         class _Out:
@@ -283,8 +309,7 @@ class FluxWorker(threading.Thread):
             else:
                 import torch                             # 真实路径才需要 torch
                 generator = torch.Generator('cpu').manual_seed(seed)
-            out = self.holder['pipe'](
-                p['prompt'],
+            kw = dict(
                 negative_prompt=p.get('negative_prompt') or '',
                 num_inference_steps=int(p.get('steps') or DEFAULT_STEPS),
                 guidance_scale=float(p.get('guidance_scale') or DEFAULT_GUIDANCE),
@@ -292,6 +317,27 @@ class FluxWorker(threading.Thread):
                 height=int(p.get('height') or DEFAULT_HEIGHT),
                 generator=generator,
             )
+            # ── 图生图分支（2026-09-18 新增）────────────────────────────
+            # 传了参考图才带图像参数。**参数名按模型签名动态判定**，不硬编码：
+            #   klein → `image`（已实测定死）；FLUX.1-dev 没有该参数 → 自动跳过，不 TypeError。
+            # 这样同一份队列代码能同时服务 t2i 与 edit，且换模型不会炸。
+            ref_path = p.get('image_path')
+            if ref_path:
+                import inspect
+                sig = set(inspect.signature(self.holder['pipe'].__call__).parameters)
+                img_param = next((n for n in ('image', 'images', 'image_latents') if n in sig), None)
+                if img_param is None:
+                    raise RuntimeError(
+                        f'当前模型不支持图生图：__call__ 没有 image/images/image_latents 参数'
+                        f'（可用参数：{sorted(sig)[:15]}...）'
+                    )
+                from PIL import Image as _Img
+                ref_img = _Img.open(ref_path)
+                # 保持宽高比 + 色彩管理（与 klein-setup/ab_klein_dev.py 的 load_ref_image 一致）
+                ref_img = _prepare_ref_image(ref_img, int(kw['width']))
+                kw['image'] = ref_img
+                print(f'[fluxd] edit 模式：参考图 {ref_path} → 参数名 {img_param!r}', flush=True)
+            out = self.holder['pipe'](p['prompt'], **kw)
             img_path = self.store.out_dir / f'{job_id}.png'
             out.images[0].save(str(img_path))
             elapsed = round(time.time() - t0, 2)
@@ -310,6 +356,68 @@ class FluxWorker(threading.Thread):
                 pass
 
 
+def _prepare_ref_image(im, size: int):
+    """把参考图规整成能喂给模型的图。
+
+    【2026-09-18 新增，修掉两个实测问题】
+      1. 「宽高比被破坏 → 人腿变短」：原做法强制 resize 成正方形，1200×1800 的竖构图
+         高度被压掉 43%，主体明显变形 → 改为**保持宽高比 + 居中 pad**。
+         （不用 crop —— 那会把商品裁掉。）
+      2. 「输出偏暗发灰」：`.convert("RGB")` 会丢弃 ICC 色彩配置（Unsplash 等多是
+         Display-P3），按裸 RGB 解读损失饱和度；且 resize 未指定重采样
+         → 改为带 ICC 时用 ImageCms 转 sRGB + 显式 LANCZOS。
+    实测证据（修正前 4 张 edit 的对比度 4/4 全部下降 = 发灰）。
+    """
+    from PIL import Image as _Img
+
+    icc = getattr(im, 'info', {}).get('icc_profile')
+    if icc:
+        try:
+            from io import BytesIO
+            from PIL import ImageCms
+            src = ImageCms.ImageCmsProfile(BytesIO(icc))
+            dst = ImageCms.createProfile('sRGB')
+            im = ImageCms.profileToProfile(im, src, dst, outputMode='RGB')
+        except Exception:  # noqa: BLE001
+            pass                                     # 色彩转换失败不阻断出图
+    if im.mode != 'RGB':
+        im = im.convert('RGB')
+
+    w, h = im.size
+    if w == h:
+        return im.resize((size, size), _Img.LANCZOS)
+    scale = size / min(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    im = im.resize((nw, nh), _Img.LANCZOS)
+    canvas = _Img.new('RGB', (size, size), (127, 127, 127))   # 中灰填充，不引入色彩倾向
+    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
+
+
+def _resolve_pipe_class(model_path: str):
+    """按模型目录的 model_index.json 推断 diffusers 主类。
+
+    【2026-09-18 新增】原先硬编码 `FluxPipeline` —— 换 klein（Flux2KleinPipeline）必失败。
+    以模型自述的 `_class_name` 为准，不硬编码类名：
+      FLUX.1-dev        → FluxPipeline
+      FLUX.2-klein-4B   → Flux2KleinPipeline（diffusers 0.39.0 自带，不需 git 版）
+    """
+    import json
+    from pathlib import Path as _P
+    mi_path = _P(model_path) / 'model_index.json'
+    if not mi_path.is_file():
+        raise RuntimeError(f'{model_path} 下没有 model_index.json，不是 diffusers 格式的模型目录')
+    mi = json.loads(mi_path.read_text(encoding='utf-8'))
+    cls_name = (mi.get('_class_name') or '').strip()
+    if not cls_name:
+        raise RuntimeError(f'{mi_path} 里没有 _class_name 字段')
+    import diffusers
+    cls = getattr(diffusers, cls_name, None)
+    if cls is None:
+        raise RuntimeError(f'diffusers {getattr(diffusers, "__version__", "?")} 里找不到 {cls_name}')
+    return cls, cls_name
+
+
 def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
     """后台加载模型，让 /health 在加载期间就能响应（status=loading）。"""
 
@@ -322,19 +430,29 @@ def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
                 print('[fluxd] STUB 模式：未加载真实模型，输出为合成占位图', flush=True)
                 return
             import torch
-            from diffusers import FluxPipeline
             print(f'[fluxd] 加载模型 {model_path} (offload={offload}) ...', flush=True)
-            pipe = FluxPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
-            if offload == 'sequential':
-                pipe.enable_sequential_cpu_offload()
-            elif offload == 'model':
-                pipe.enable_model_cpu_offload()
+            cls, cls_name = _resolve_pipe_class(model_path)
+            # ⚠️ device_map 与 enable_*_cpu_offload() 是**互斥**的装载策略，不能并用：
+            #    `device_map` 已自动把层摊到 CPU/GPU；再调 offload 会抛
+            #    "you have activated a device mapping strategy ... reset_device_map() first"，
+            #    退到 sequential 仍是同一个错 → 整条加载失败（2026-09-18 实测踩过）。
+            # 所以 'balanced' 必须在**加载时**就带上 device_map，不能先加载再补 offload。
+            if offload == 'balanced':
+                pipe = cls.from_pretrained(model_path, torch_dtype=torch.bfloat16,
+                                           device_map='balanced')
             else:
-                pipe.to('cuda')
+                pipe = cls.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+                if offload == 'sequential':
+                    pipe.enable_sequential_cpu_offload()
+                elif offload == 'model':
+                    pipe.enable_model_cpu_offload()
+                else:  # none / 其余 → 全程显存
+                    pipe.to('cuda')
             holder['pipe'] = pipe
             holder['offload'] = offload
+            holder['class_name'] = cls_name
             holder['ready'] = True
-            print('[fluxd] 模型常驻就绪 ✅', flush=True)
+            print(f'[fluxd] 模型常驻就绪 ✅ ({cls_name}, offload={offload})', flush=True)
         except Exception as e:
             holder['error'] = f'{type(e).__name__}: {e}'
             print(f'[fluxd] 模型加载失败 ❌ {holder["error"]}', flush=True)
@@ -390,12 +508,12 @@ class Handler(BaseHTTPRequestHandler):
         v = parse_qs(urlparse(self.path).query).get(key)
         return v[0] if v else default
 
-    def _body(self) -> dict:
+    def _body(self, max_bytes: int = MAX_REQ_BYTES) -> dict:
         n = int(self.headers.get('Content-Length') or 0)
         if n <= 0:
             return {}
-        if n > MAX_REQ_BYTES:
-            raise BadRequest(f'请求体过大（>{MAX_REQ_BYTES}B）')
+        if n > max_bytes:
+            raise BadRequest(f'请求体过大（{n}B > {max_bytes}B）')
         try:
             return json.loads(self.rfile.read(n).decode('utf-8') or '{}')
         except json.JSONDecodeError as e:
@@ -426,11 +544,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         try:
-            body = self._body()
+            body = self._body(MAX_EDIT_BYTES if path == '/edit' else MAX_REQ_BYTES)
         except BadRequest as e:
             return self._err(400, str(e))
         if path == '/generate':
             return self._generate(body)
+        if path == '/edit':
+            return self._generate(body, is_edit=True)
         if path == '/cancel':
             return self._cancel(body)
         return self._err(404, f'未知路径 {path}')
@@ -463,7 +583,16 @@ class Handler(BaseHTTPRequestHandler):
             'uptime_sec': round(time.time() - self.started_at, 1),
         })
 
-    def _generate(self, body: dict):
+    def _generate(self, body: dict, is_edit: bool = False):
+        """提交生成任务。
+
+        `is_edit=True`（走 POST /edit）时要求带参考图，多接一个 `image` 字段。
+        参考图两种传法：
+          - `image`     : base64（可带 `data:image/png;base64,` 前缀）
+          - `image_url` : 服务端可达的 http(s) URL（本机路径不建议，避免 SSRF 面）
+        落盘到 out_dir/refs/ 后把**路径**放进 params —— 队列是异步的，
+        不能把 PIL 对象或大 base64 长期留在内存里的 job 记录里。
+        """
         prompt = (body.get('prompt') or '').strip()
         if not prompt:
             return self._err(400, 'prompt 不能为空')
@@ -496,10 +625,59 @@ class Handler(BaseHTTPRequestHandler):
             'seed': raw_seed,
             'guidance_scale': float(body.get('guidance_scale') or DEFAULT_GUIDANCE),
         }
+        if is_edit:
+            try:
+                ref_path = self._save_ref_image(body)
+            except BadRequest as e:
+                return self._err(400, str(e))
+            params['image_path'] = ref_path
         rec = self.store.create(params)
         self.worker.submit(rec['job_id'], int(body.get('priority') or 0))
         return self._json(200, {'job_id': rec['job_id'], 'status': STATUS_QUEUED,
                                 'queue_depth': self.worker.depth})
+
+    def _save_ref_image(self, body: dict) -> str:
+        """把 /edit 的参考图落盘，返回路径。
+
+        只接受 base64（`image` 字段，可带 data: 前缀）。**不接受任意本机路径** ——
+        那等于给调用方一个任意文件读取口子。URL 下载也不做（SSRF 面 + 内网探测风险），
+        需要时由调用方自己取回再以 base64 传入。
+        """
+        import base64
+        import binascii
+        raw = (body.get('image') or '').strip()
+        if not raw:
+            raise BadRequest('edit 模式必须提供 image（base64）')
+        if raw.startswith('data:'):
+            try:
+                raw = raw.split(',', 1)[1]
+            except IndexError:
+                raise BadRequest('data: 前缀格式不对（缺逗号）') from None
+        try:
+            blob = base64.b64decode(raw, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise BadRequest(f'image 不是合法 base64: {e}') from None
+        if not blob:
+            raise BadRequest('image 解码后为空')
+        if len(blob) > MAX_REF_BYTES:
+            raise BadRequest(f'参考图过大（{len(blob)}B > {MAX_REF_BYTES}B）')
+        # 用 PIL 校验确实是图片（不信任扩展名），顺便定后缀
+        from io import BytesIO
+        from PIL import Image as _Img
+        try:
+            probe = _Img.open(BytesIO(blob))
+            probe.verify()                      # 校验完整性（会消耗对象，需重开）
+            fmt = (_Img.open(BytesIO(blob)).format or 'PNG').lower()
+        except Exception as e:  # noqa: BLE001
+            raise BadRequest(f'image 不是有效图片: {type(e).__name__}') from None
+        ext = {'jpeg': 'jpg', 'png': 'png', 'webp': 'webp', 'bmp': 'bmp'}.get(fmt, 'png')
+        ref_dir = self.store.out_dir / 'refs'
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}.{ext}"
+        p = ref_dir / name
+        p.write_bytes(blob)
+        print(f'[fluxd] 参考图已落盘 {p} ({len(blob)}B, {fmt})', flush=True)
+        return str(p)
 
     def _status(self):
         job_id = self._query('job_id')
@@ -578,8 +756,17 @@ def main():
     ap.add_argument('--port', type=int, default=int(os.environ.get('FLUX_RESIDENT_PORT', '9630')))
     ap.add_argument('--model', default='/root/autodl-tmp/models/FLUX.1-dev')
     ap.add_argument('--out', default=os.environ.get('FLUX_OUT_DIR', str(SCRIPT_DIR / 'resident_out')))
-    ap.add_argument('--offload', default=os.environ.get('FLUX_OFFLOAD', 'none'),
-                    choices=['none', 'model', 'sequential'])
+    # ⚠️ 默认值必须是**安全**的那一档，不能是「最快」的。
+    # 2026-09-18 实测：32G 卡上 FLUX.1-dev 权重 31.7 GiB > 卡空闲 ~31.1 GiB，
+    #   默认 'none'（= pipe.to('cuda') 全量上卡）**必然 OOM**。
+    #   manager 侧（flux_resident_client.py）已默认 'model'，但**直接跑 start_resident.sh
+    #   或手起本脚本时走的是这里的默认值** —— 所以这里也必须是 'model'。
+    # 'balanced'：交给 accelerate 按可用显存自动摊层（klein 17.3 GB 全程卡上、dev 混合装载），
+    #   它是**独立策略**，与 enable_*_cpu_offload() 互斥，不能并用。
+    ap.add_argument('--offload', default=os.environ.get('FLUX_OFFLOAD', 'model'),
+                    choices=['none', 'model', 'sequential', 'balanced'],
+                    help='none=全程显存(最快但吃满卡) / balanced=自动摊层 / '
+                         'model|sequential=CPU offload（与 balanced 互斥）')
     ap.add_argument('--stub', action='store_true', default=os.environ.get('FLUX_STUB') == '1',
                     help='不加载真实模型，用合成占位图（无需 GPU，供本地联调/自证）')
     args = ap.parse_args()

@@ -60,6 +60,7 @@ _JOBS_DDL = """CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY, user_id TEXT, prompt TEXT, original_prompt TEXT,
     priority INTEGER DEFAULT 0, width INTEGER, height INTEGER, seed INTEGER,
     steps INTEGER, negative_prompt TEXT, status TEXT DEFAULT 'queued',
+    edit_mode INTEGER NOT NULL DEFAULT 0, has_ref INTEGER NOT NULL DEFAULT 0,
     error TEXT, image_path TEXT, server TEXT, created_at INTEGER,
     completed_at INTEGER, refunded_at INTEGER)"""
 
@@ -74,14 +75,15 @@ class StubDB:
         self._lock = threading.Lock()
 
     def job_insert(self, job_id, user_id, prompt, priority, original_prompt=None,
-                   width=None, height=None, seed=None, steps=None, negative_prompt=None):
+                   width=None, height=None, seed=None, steps=None, negative_prompt=None,
+                   edit_mode=0, has_ref=0):
         with self._lock:
             self._c.execute(
                 'INSERT INTO jobs (job_id,user_id,prompt,original_prompt,priority,'
-                'width,height,seed,steps,negative_prompt,status) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                'width,height,seed,steps,negative_prompt,edit_mode,has_ref,status) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (job_id, user_id, prompt, original_prompt, priority, width, height,
-                 seed, steps, negative_prompt, 'queued'))
+                 seed, steps, negative_prompt, edit_mode, has_ref, 'queued'))
             self._c.commit()
 
     def job_get(self, job_id):
@@ -151,9 +153,19 @@ m = re.search(r"key\s*=\s*f['\"]", src)
 ok('C1 源码无自拼去重键（三处必须都走 _dedup_key）', m is None, m.group(0) if m else '')
 
 # ═══ C2 · 单元：键格式含 seed 与尺寸 ═══
+# 末尾的 `:e0` 是 2026-09-18 新增的**图生图标记**（0=文生图 / 1=图生图）。
+# 为什么必须进键：否则「同一句提示词先文生图、再传参考图做图生图」会被判成
+# 重复提交而拒绝，而那是两个完全不同的任务（见 test_manager_edit_offline.py M5）。
 ok('C2 _dedup_key 纳入 seed 与尺寸',
-   _dedup_key('u', 'p', 42, 768, 1024) == 'u:p:42:768x1024',
+   _dedup_key('u', 'p', 42, 768, 1024) == 'u:p:42:768x1024:e0',
    _dedup_key('u', 'p', 42, 768, 1024))
+
+# ═══ C2b · 单元：图生图与文生图必须是不同的键 ═══
+ok('C2b 同提示词下 图生图/文生图 的键必须不同（否则图生图被误拒）',
+   _dedup_key('u', 'p', 42, 768, 1024, edit_mode=0)
+   != _dedup_key('u', 'p', 42, 768, 1024, edit_mode=1),
+   f"{_dedup_key('u', 'p', 42, 768, 1024, edit_mode=0)} vs "
+   f"{_dedup_key('u', 'p', 42, 768, 1024, edit_mode=1)}")
 
 # ═══ C3 · 单元：中文必须用原文，翻译漂移不影响键 ═══
 k1 = _dedup_key('u', 'EN variant A', None, None, None, original_prompt='同一句中文')

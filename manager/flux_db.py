@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     seed         INTEGER,          -- 随机种子（可空 = 服务端随机；生成后回填实际值以便复现）
     steps        INTEGER,          -- 采样步数（可空 = 服务端默认 25）
     negative_prompt TEXT,          -- 负向提示词（可空；FLUX.1-dev 蒸馏模型会忽略它，透传仅为链路完整）
+    edit_mode    INTEGER NOT NULL DEFAULT 0,  -- 1 = 图生图（走 resident /edit，需带参考图）
+    has_ref      INTEGER NOT NULL DEFAULT 0,  -- 1 = 该任务带了参考图（参考图本体只存 GPU 机，不入库）
     image_path   TEXT,
     error        TEXT,
     server       TEXT,              -- 任务执行所在 flux 服务器名 (flux1/flux2/...)；多服务器调度
@@ -108,6 +110,18 @@ class FluxDB:
                 if col not in jcols:
                     self._conn.execute(ddl)
                     logger.info(f'🗄️  jobs 表已加 {col} 列（生图参数透传）')
+            # 图生图标记（2026-09-18）：必须在 DB 里持久化，不能只靠「body 里有没有 image」——
+            # worker 是**异步**的，从内存队列拿不到提交时的原始请求；重启恢复孤儿任务时
+            # 更是只能读 DB。参考图本体**不入库**（base64 可达 MiB 级，SQLite 不该背这个），
+            # 只留 has_ref 标记；恢复时若发现 edit_mode 而参考图已丢，任务明确失败而不是
+            # 静默降级成文生图（那会出图但完全不是用户要的）。
+            for col, ddl in {
+                'edit_mode': 'ALTER TABLE jobs ADD COLUMN edit_mode INTEGER NOT NULL DEFAULT 0',
+                'has_ref':   'ALTER TABLE jobs ADD COLUMN has_ref INTEGER NOT NULL DEFAULT 0',
+            }.items():
+                if col not in jcols:
+                    self._conn.execute(ddl)
+                    logger.info(f'🗄️  jobs 表已加 {col} 列（图生图标记）')
             ccols = {r[1] for r in self._conn.execute('PRAGMA table_info(codes)')}
             for col, ddl in {
                 'created_at': 'ALTER TABLE codes ADD COLUMN created_at INTEGER',
@@ -319,12 +333,14 @@ class FluxDB:
 
     # ── jobs ──
     def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None,
-                   width=None, height=None, seed=None, steps=None, negative_prompt=None):
+                   width=None, height=None, seed=None, steps=None, negative_prompt=None,
+                   edit_mode=0, has_ref=0):
         self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, '
-                   'width, height, seed, steps, negative_prompt, created_at) '
-                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                   'width, height, seed, steps, negative_prompt, edit_mode, has_ref, created_at) '
+                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    (job_id, user_id, prompt, original_prompt, 'queued', priority,
-                    width, height, seed, steps, negative_prompt, int(time.time())))
+                    width, height, seed, steps, negative_prompt,
+                    1 if edit_mode else 0, 1 if has_ref else 0, int(time.time())))
 
     def job_update(self, job_id, **fields):
         sets = ', '.join(f'{k}=?' for k in fields)

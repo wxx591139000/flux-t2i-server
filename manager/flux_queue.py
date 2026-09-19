@@ -22,6 +22,7 @@ import threading
 import shutil
 import subprocess
 import uuid
+from collections import deque
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.parent
@@ -45,6 +46,10 @@ WEB_OUT = Path(os.environ.get('FLUX_WEB_OUT', BASE_DIR / 'web_out'))
 QUEUE_MAX = int(os.environ.get('FLUX_QUEUE_MAX', '50'))
 MAX_RETRY = 3
 
+# 待用参考图的内存暂存上限（FIFO 淘汰）。参考图只在「提交 → worker 取走」之间存活，
+# 不落盘不入库。32 × 本站 6 MiB 上限 ≈ 190 MiB 封顶，防止有人连提交把 web 进程拖 OOM。
+REF_CACHE_MAX = int(os.environ.get('FLUX_REF_CACHE_MAX', '32'))
+
 # 'resident' = 常驻服务（默认，见模块 docstring）；'legacy' = 旧的冷启动链路
 GEN_MODE = (os.environ.get('FLUX_GEN_MODE') or 'resident').strip().lower()
 if GEN_MODE not in ('resident', 'legacy'):
@@ -53,7 +58,7 @@ if GEN_MODE not in ('resident', 'legacy'):
 
 
 def _dedup_key(user_id, prompt, seed=None, width=None, height=None,
-               original_prompt=None) -> str:
+               original_prompt=None, edit_mode=0) -> str:
     """去重键的**唯一**构造入口（2026-09-17 修，两个 bug 一起治）。
 
     bug A —— 键格式漂移：入队处拼 `{user}:{prompt}:{seed}:{w}x{h}`，而 worker
@@ -69,9 +74,15 @@ def _dedup_key(user_id, prompt, seed=None, width=None, height=None,
     用户连点两次就出两张重复图，还各计一次费。
     现在中文一律用**用户原始输入** `original_prompt` 做键：语义相同必定命中去重；
     换 seed / 换尺寸仍算不同任务（B 链一次出多张候选靠这条放行）。
+
+    edit_mode（2026-09-18）—— 必须进键：否则「同一句提示词，先文生图、再传参考图
+    做图生图」会被判成重复提交而拒绝，而那是**两个完全不同的任务**。
+    这里只标「是不是图生图」，不哈希参考图内容 —— 同一提示词配不同参考图若被算作
+    同一任务会被误拒；代价是同提示词多张参考图**不参与去重**（宁可少去重，
+    不可误拒用户）。
     """
     base = original_prompt or prompt
-    return f'{user_id}:{base}:{seed}:{width}x{height}'
+    return f'{user_id}:{base}:{seed}:{width}x{height}:e{1 if edit_mode else 0}'
 
 
 class FluxQueueScheduler:
@@ -83,6 +94,13 @@ class FluxQueueScheduler:
         self._seq = 0
         self._inflight = set()          # 去重键集合（构造见 _dedup_key）
         self._waiting = set()           # 服务器 down 等待恢复池
+        # 待用参考图暂存（job_id → base64）。**内存态、进程重启即失**，这是刻意的：
+        # 参考图可达 MiB 级，SQLite 不该背这个；重启后孤儿 edit 任务会明确失败。
+        self._refs = {}
+        self._order = deque()           # 仅用于 FIFO 淘汰，存 job_id
+        # 参考图暂存**独立**一把锁：绝不与 _submit_lock 嵌套。
+        # 嵌套过 → 自死锁（见 _put_ref docstring），这个坑值得单独一把锁来永久规避。
+        self._ref_lock = threading.Lock()
         # web 层是 ThreadingHTTPServer：连点 / 并发提交会落在**不同线程**上，
         # 「检查去重 → 入队 → 登记 inflight」若不原子，两个线程会同时通过检查、
         # 各入一个队 → 出两张重复图，还各计一次费。
@@ -95,11 +113,16 @@ class FluxQueueScheduler:
 
     # ── 提交（入口）──
     def submit(self, user_id: str, prompt: str, priority: int = 0,
-               width=None, height=None, seed=None, steps=None, negative_prompt=None) -> dict:
+               width=None, height=None, seed=None, steps=None, negative_prompt=None,
+               ref_image: str = None) -> dict:
         """提交一个生成任务。成功返回 job dict，失败返回 {error: reason}。
 
         width/height/seed/steps/negative_prompt 为可选生图参数，透传到底层常驻服务
-        （legacy 链路固定尺寸，这些仅 resident 模式生效）。"""
+        （legacy 链路固定尺寸，这些仅 resident 模式生效）。
+
+        `ref_image` = base64 参考图（可带 `data:image/...;base64,` 前缀）。
+        传了它 = 图生图（走 resident `POST /edit`）；不传 = 文生图。
+        """
         prompt = (prompt or '').strip()
         if not prompt:
             return {'error': '提示词不能为空'}
@@ -128,7 +151,8 @@ class FluxQueueScheduler:
             #    （B 链一次出多张候选靠这条放行）。
             #    中文必须传 original_prompt —— 翻译结果会漂移，见 _dedup_key。
             key = _dedup_key(user_id, prompt, seed, width, height,
-                             original_prompt=original_prompt)
+                             original_prompt=original_prompt,
+                             edit_mode=1 if ref_image else 0)
             if key in self._inflight:
                 return {'error': '相同提示词与参数正在排队/生成中，请勿重复提交'}
             # 2. 配额
@@ -142,14 +166,45 @@ class FluxQueueScheduler:
             # 原先用毫秒时间戳当主键：同毫秒两次并发提交会 INSERT 冲突/互相覆盖。
             # 改 uuid4 前 16 位（32bit 十六进制 ≈ 64bit 熵），冲突概率可忽略。
             job_id = uuid.uuid4().hex[:16]
+            is_edit = bool(ref_image)
             self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
-                               width, height, seed, steps, negative_prompt)
+                               width, height, seed, steps, negative_prompt,
+                               edit_mode=1 if is_edit else 0, has_ref=1 if is_edit else 0)
             self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
             self._inflight.add(key)
             self._seq += 1
             self._pq.put((priority, -self._seq, job_id))
-        logger.info(f'📥 {user_id} 入队 {job_id}: {prompt[:40]}')
+        # 参考图**只放内存**（base64 可达 MiB 级，不该进 SQLite），worker 取用后 pop。
+        # 放在锁外：既避开非可重入锁的自死锁，也避免这段（可能淘汰、可能抛异常）的逻辑
+        # 在锁内把整把 _submit_lock 拖住 —— 那会让**所有**后续提交一起挂死。
+        if is_edit:
+            self._put_ref(job_id, ref_image)
+        logger.info(f'📥 {user_id} 入队 {job_id}{"[edit]" if ref_image else ""}: {prompt[:40]}')
         return {'job_id': job_id, 'status': 'queued'}
+
+    # ── 参考图暂存（内存，不入库）──
+    def _put_ref(self, job_id: str, ref_image: str):
+        """登记待用参考图，并按 FIFO 淘汰，防止内存被拖爆。
+
+        ⚠️ **绝不能在 `_submit_lock` 内被调用**。这里曾经写成
+        `with self._submit_lock:` —— 而 `submit` 已经持有同一把**非可重入**锁
+        → 自死锁。表现：「POST /api/edit 带 image 时永久挂起、连接不断、
+        日志里一行都不打」，且**只在带 image 时触发**（t2i 路径完全正常），
+        极易被误判成网络 / 代理问题（2026-09-18 实际排查了 4 轮才定位）。
+        所以这里自己用一把**独立的** `_ref_lock`，与 `_submit_lock` 无嵌套关系。
+
+        上限 N 是按「单张 base64 ≤ 8 MiB（上游 MAX_REF_BYTES）+ 本站 6 MiB 上限」算的
+        粗口径：N 张 × 6 MiB ≈ N×6 MiB 内存占用，N 取 32 时约 190 MiB 上限。
+        超出说明「提交了但 worker 还没跑到」的积压过多 —— 宁可丢最老的（让那个任务
+        明确失败，用户重提），也不能让 web 进程 OOM。
+        """
+        with self._ref_lock:
+            self._order.append(job_id)
+            self._refs[job_id] = ref_image
+            while len(self._order) > REF_CACHE_MAX:
+                old = self._order.popleft()
+                if old != job_id:
+                    self._refs.pop(old, None)
 
     # ── worker ──
     def start(self):
@@ -208,7 +263,8 @@ class FluxQueueScheduler:
         # 必须与入队时同一把钥匙，否则 discard() 永远清不掉（详见 _dedup_key 的 bug 说明）
         key = _dedup_key(user_id, job.get('prompt'), job.get('seed'),
                          job.get('width'), job.get('height'),
-                         original_prompt=job.get('original_prompt'))
+                         original_prompt=job.get('original_prompt'),
+                         edit_mode=job.get('edit_mode'))
         try:
             self.db.job_update(job_id, status='generating')
             ok, err = self._generate(job)
@@ -255,13 +311,18 @@ class FluxQueueScheduler:
 
     # ── 生成入口：按 FLUX_GEN_MODE 分发 ──
     def _generate(self, job) -> tuple:
+        if job.get('edit_mode'):
+            return self._generate_resident(job, is_edit=True)
         if GEN_MODE == 'legacy':
             return self._generate_legacy(job)
         return self._generate_resident(job)
 
     # ── 生成（常驻服务：模型加载一次常驻显存）──
-    def _generate_resident(self, job) -> tuple:
+    def _generate_resident(self, job, is_edit: bool = False) -> tuple:
         """提交到 GPU 机上的常驻服务并拉图。返回 (ok, err)。
+
+        `is_edit=True` → 打 resident 的 `POST /edit`（body 多一个 base64 `image`），
+        否则打 `POST /generate`。两条路径**除这一个字段外完全同构**，所以共用本函数。
 
         错误分流靠 fr.TransportError.kind：
           'server_down' → 加 '[SERVER_DOWN]' 前缀，_process 会放进等待恢复池（等机器回来再试）
@@ -278,13 +339,24 @@ class FluxQueueScheduler:
                 prefix = '[SERVER_DOWN] ' if r['kind'] == 'server_down' else ''
                 return False, f'{prefix}{r["msg"]}'
 
+            ref_b64 = None
+            if is_edit:
+                # 参考图只存在于「提交那一刻」的内存里（不入库，见 flux_db 的 edit_mode 注释）。
+                # 进程重启后孤儿任务恢复会走到这里且 ref_b64 为 None → **明确失败**，
+                # 绝不静默降级成文生图：那会照常出图、照常扣费，但完全不是用户要的东西。
+                ref_b64 = self._refs.pop(job_id, None)
+                if not ref_b64:
+                    return False, ('参考图已失效（进程重启后内存中的参考图不保留），'
+                                   '请重新提交图生图任务')
+
             dest = WEB_OUT / job_id / f'{job_id}.png'
             gen_kwargs = {}
             for k in ('width', 'height', 'seed', 'steps', 'negative_prompt'):
                 v = job[k]          # job 是 sqlite3.Row，下标访问（无 .get）
                 if v not in (None, ''):
                     gen_kwargs[k] = v
-            st = fr.generate_via_resident(server, job['prompt'], dest, **gen_kwargs)
+            st = fr.generate_via_resident(server, job['prompt'], dest,
+                                          ref_image_b64=ref_b64, **gen_kwargs)
             seed_out = st.get('seed')
             self.db.job_update(job_id, image_path=str(dest), server=server['name'], seed=seed_out)
             logger.info(f'🗄️  任务 {job_id} 由 {server["name"]} 常驻服务完成'
@@ -417,7 +489,8 @@ class FluxQueueScheduler:
             jid = j['job_id']
             key = _dedup_key(j['user_id'], j.get('prompt'), j.get('seed'),
                              j.get('width'), j.get('height'),
-                             original_prompt=j.get('original_prompt'))
+                             original_prompt=j.get('original_prompt'),
+                             edit_mode=j.get('edit_mode'))
             if j['status'] == 'generating':
                 self.db.job_update(jid, status='queued')
             self._inflight.add(key)
