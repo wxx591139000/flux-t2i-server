@@ -126,26 +126,43 @@ class _SeedGen:
 
 
 class StubPipeline:
-    """不加载真实模型的替身。调用签名与 Flux2KleinPipeline.__call__ 对齐，供无 GPU 环境自证链路。
+    """不加载真实模型的替身，供无 GPU 环境自证链路。
 
-    【2026-09-18 修正】原先没有 `image` 参数 —— 导致 stub 模式下 `/edit` 会在
-    「找不到图像参数」的检查处直接失败，**图生图链路无法离线自证**。
-    klein 的真实签名里该参数名 = `image`（已实测定死），故替身照此对齐。
+    ⚠️ **签名必须与真实 Flux2KleinPipeline.__call__ 逐参数一致**（2026-09-19 实测）：
+        真实签名（inspect 实测，**没有 kwargs 兜底**）：
+          image, prompt, height, width, num_inference_steps, sigmas, guidance_scale,
+          num_images_per_prompt, generator, latents, prompt_embeds,
+          negative_prompt_embeds, output_type, return_dict, attention_kwargs,
+          callback_on_step_end, callback_on_step_end_tensor_inputs,
+          max_sequence_length, text_encoder_out_layers
+        ⚠️ 注意 `image` 在**第一位**、`prompt` 在第二位（dev 的 FluxPipeline 相反）。
 
-    另：替身**只声明 image 这一种**，不声明 images/image_latents —— 这样离线就能区分出
-    「按模型签名动态判参名」的逻辑是否真的生效，而不是恒等于某个硬编码名字。
+    为什么必须一致（血泪教训，2026-09-19 带卡实测）：
+      替身原先**多**声明了 `negative_prompt` 并带 `**kw` —— 比真实 klein 宽松。
+      于是 resident 无条件传 negative_prompt 时，离线测试全绿，而真机上 klein
+      **5/5 任务全崩**（TypeError: unexpected keyword argument 'negative_prompt'）。
+      **替身一旦比真实模型宽松，「离线全绿」就不再是任何保证。**
+
+    另：替身**不做** `**kw` 兜底，正是为了让多传的参数在离线就炸掉，而不是留到带卡。
     """
 
-    def __call__(self, prompt, negative_prompt='', num_inference_steps=25,
-                 guidance_scale=3.5, width=768, height=1024, generator=None,
-                 image=None, **kw):
+    def __call__(self, image=None, prompt=None, height=1024, width=1024,
+                 num_inference_steps=4, sigmas=None, guidance_scale=1.0,
+                 num_images_per_prompt=1, generator=None, latents=None,
+                 prompt_embeds=None, negative_prompt_embeds=None,
+                 output_type='pil', return_dict=True, attention_kwargs=None,
+                 callback_on_step_end=None, callback_on_step_end_tensor_inputs=None,
+                 max_sequence_length=None, text_encoder_out_layers=None):
+        if not prompt:
+            # 位置传参错位时（把提示词塞给 image）会在更早处暴露，这里兜住真正的空提示词
+            raise ValueError('prompt 不能为空')
         seed = 0
         if generator is not None:
             try:
                 seed = int(generator.initial_seed())
             except Exception:
                 seed = 0
-        # 传了参考图 → 用它的颜色影响输出，让「edit 确实读到了图」肉眼/断言可辨
+        # 传了参考图 → 用它的颜色影响输出，让「edit 确实读到了图」断言可辨
         ref_rgb = None
         if image is not None:
             try:
@@ -309,22 +326,42 @@ class FluxWorker(threading.Thread):
             else:
                 import torch                             # 真实路径才需要 torch
                 generator = torch.Generator('cpu').manual_seed(seed)
-            kw = dict(
-                negative_prompt=p.get('negative_prompt') or '',
-                num_inference_steps=int(p.get('steps') or DEFAULT_STEPS),
-                guidance_scale=float(p.get('guidance_scale') or DEFAULT_GUIDANCE),
-                width=int(p.get('width') or DEFAULT_WIDTH),
-                height=int(p.get('height') or DEFAULT_HEIGHT),
-                generator=generator,
-            )
+            # ── 调用参数：**一律按 __call__ 签名过滤**（2026-09-19 修）────────────
+            # 教训：原先 `negative_prompt` 是无条件硬传的。FLUX.1-dev 的 FluxPipeline
+            # 接受它，但蒸馏版 klein 的 Flux2KleinPipeline **根本不接受**，而两个 pipeline
+            # 都**没有 kwargs 兜底**（已用 inspect 实测）→ 传错就是硬 TypeError。
+            # 2026-09-19 带卡实测：klein 上 t2i 与 edit 共 5/5 任务全 FAIL，
+            # 报 `TypeError: Flux2KleinPipeline.__call__() got an unexpected keyword
+            # argument 'negative_prompt'`。
+            #
+            # ⚠️ 离线为什么全绿：StubPipeline 当时比真实 klein **更宽松**
+            # （既声明了 negative_prompt、又带 **kw），把真实约束掩盖了。
+            # 替身一旦比真实模型宽松，「离线全绿」就不再是任何保证 —— 本文件已把
+            # StubPipeline 收紧到与 klein 同签名。
+            #
+            # 现在统一按签名过滤：签名里没有的参数**不传**，并打印被丢弃的键，
+            # 让「模型不支持某参数」在日志里看得见，而不是靠人去猜。
+            import inspect
+            sig = set(inspect.signature(self.holder['pipe'].__call__).parameters)
+            cand = {
+                'negative_prompt': p.get('negative_prompt') or '',
+                'num_inference_steps': int(p.get('steps') or DEFAULT_STEPS),
+                'guidance_scale': float(p.get('guidance_scale') or DEFAULT_GUIDANCE),
+                'width': int(p.get('width') or DEFAULT_WIDTH),
+                'height': int(p.get('height') or DEFAULT_HEIGHT),
+                'generator': generator,
+            }
+            kw = {k: v for k, v in cand.items() if k in sig}
+            dropped = sorted(set(cand) - set(kw))
+            if dropped:
+                print(f'[fluxd] 当前模型不支持这些参数，已丢弃: {dropped}', flush=True)
+
             # ── 图生图分支（2026-09-18 新增）────────────────────────────
-            # 传了参考图才带图像参数。**参数名按模型签名动态判定**，不硬编码：
-            #   klein → `image`（已实测定死）；FLUX.1-dev 没有该参数 → 自动跳过，不 TypeError。
-            # 这样同一份队列代码能同时服务 t2i 与 edit，且换模型不会炸。
+            # 传了参考图才带图像参数。**参数名同样按签名动态判定**，不硬编码：
+            #   klein → `image`（已实测定死）；FLUX.1-dev 没有该参数 → 明确报错，
+            #   不静默降级成文生图（那会照常出图、照常扣费，却完全不是用户要的）。
             ref_path = p.get('image_path')
             if ref_path:
-                import inspect
-                sig = set(inspect.signature(self.holder['pipe'].__call__).parameters)
                 img_param = next((n for n in ('image', 'images', 'image_latents') if n in sig), None)
                 if img_param is None:
                     raise RuntimeError(
@@ -334,10 +371,20 @@ class FluxWorker(threading.Thread):
                 from PIL import Image as _Img
                 ref_img = _Img.open(ref_path)
                 # 保持宽高比 + 色彩管理（与 klein-setup/ab_klein_dev.py 的 load_ref_image 一致）
-                ref_img = _prepare_ref_image(ref_img, int(kw['width']))
+                ref_img = _prepare_ref_image(ref_img, int(kw.get('width') or DEFAULT_WIDTH))
                 kw['image'] = ref_img
                 print(f'[fluxd] edit 模式：参考图 {ref_path} → 参数名 {img_param!r}', flush=True)
-            out = self.holder['pipe'](p['prompt'], **kw)
+            # ⚠️ 必须用**关键字**传 prompt（2026-09-19 修，第二个地雷）：
+            #    Flux2KleinPipeline.__call__ 的第一个位置参数是 **image**、prompt 在第二位
+            #    （inspect 实测 ['self','image','prompt','height',...]）；
+            #    FluxPipeline(dev) 才是 ['self','prompt','prompt_2',...]。
+            #    原先写 `pipe(p['prompt'], **kw)` → 对 klein 等于 image=提示词文本，
+            #    图生图时更会撞成 "got multiple values for argument 'image'"。
+            #    统一走关键字，两种模型都对。
+            if 'prompt' not in sig:
+                raise RuntimeError(
+                    f'当前模型的 __call__ 没有 prompt 参数（可用参数：{sorted(sig)[:15]}...）')
+            out = self.holder['pipe'](prompt=p['prompt'], **kw)
             img_path = self.store.out_dir / f'{job_id}.png'
             out.images[0].save(str(img_path))
             elapsed = round(time.time() - t0, 2)
