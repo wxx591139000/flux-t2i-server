@@ -53,13 +53,28 @@ def t_registry_enabled():
     all_items = raw(REGISTRY) if raw is not fsm.load_registry else _load_raw()
     check('注册表可解析且非空', len(all_items) > 0, f'{len(all_items)} 条')
     names_all = [s['name'] for s in all_items]
-    check('含 flux4（已释放的机器仍留痕）', 'flux4' in names_all, str(names_all))
+    check('注册表里所有条目都留痕（含停用的）', len(names_all) >= 2, str(names_all))
     active = [s for s in fsm.FLUX_SERVERS]
     names_active = [s['name'] for s in active]
-    check('enabled=false 的 flux4 不参与探活', 'flux4' not in names_active, str(names_active))
     check('生效候选机不重复', len(names_active) == len(set(names_active)), str(names_active))
     check('每台生效机器都有 remote_base / remote_model',
           all(s.get('remote_base') and s.get('remote_model') for s in active))
+
+    # 数据驱动：谁被标了 enabled:false（用户释放了实例），谁就不许出现在候选里。
+    # 不要硬编码机器名 —— 2026-09-20 就是硬编码 flux4 的用例在它重新启用后立刻误报。
+    disabled = [s['name'] for s in all_items if s.get('enabled') is False]
+    leaked = [n for n in disabled if n in names_active]
+    check('enabled=false 的机器不参与探活', not leaked, f'停用={disabled} 泄漏={leaked}')
+    check('注册表里至少有 1 台生效机', len(names_active) >= 1, str(names_active))
+
+    # ⚠️ 2026-09-20 真 bug：enabled:false 只是不加载该条目，但 ~/.ssh/config 里若还留着
+    #    autodl-flux2 这类同名 alias，自动发现会把它**又塞回候选** → 已释放的机器照样被探活，
+    #    每次轮询白等 SSH 超时。修法：去重用「注册表里出现过的名字全集」（含 disabled）。
+    known = fsm.registry_known_names()
+    check('registry_known_names 含停用机器（去重集合的来源）',
+          all(n in known for n in disabled), f'known={sorted(known)} disabled={disabled}')
+    check('别名自动发现不会把停用机器塞回候选',
+          not [s for s in active if s.get('name') in disabled], str(names_active))
 
 
 def _load_raw():

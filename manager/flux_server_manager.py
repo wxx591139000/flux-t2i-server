@@ -203,6 +203,36 @@ def discover_servers() -> list:
     return servers
 
 
+def registry_known_names(path=None) -> set:
+    """注册表里**所有**条目的 name/alias，含 enabled:false 的。
+
+    为什么需要它（2026-09-20）：
+      `enabled:false` 原本只让条目不进候选，但 `~/.ssh/config` 里若还有同名 alias
+      （如 autodl-flux2），自动发现会**把它又塞回候选** —— 已释放的机器照样被探活，
+      每次轮询白等 SSH 超时，表现为「任务一直不推进」。
+      所以去重集合必须用「注册表里出现过的名字全集」，而不是「生效条目」。
+    """
+    p = Path(path) if path else REGISTRY_PATH
+    try:
+        if not p.exists():
+            return set()
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:                           # noqa: BLE001
+        return set()
+    servers = data.get('servers') if isinstance(data, dict) else data
+    if not isinstance(servers, list):
+        return set()
+    out = set()
+    for s in servers:
+        if not isinstance(s, dict):
+            continue
+        if s.get('name'):
+            out.add(s['name'])
+        if s.get('alias'):
+            out.add(s['alias'])
+    return out
+
+
 def _load_servers() -> list:
     """优先级：FLUX_SERVERS_JSON（完全接管） > manager/servers.json（注册表）
     > 代码内 _DEFAULT_SERVERS + ~/.ssh/config 自动发现（旧行为，兜底）。
@@ -221,7 +251,10 @@ def _load_servers() -> list:
     reg = load_registry()
     if reg:
         servers = list(reg)
-        seen = {(s.get('alias') or '') for s in servers} | {(s.get('name') or '') for s in servers}
+        # ⚠️ 用「注册表里出现过的名字全集」去重，而不是「生效条目」：
+        #    否则 enabled:false 的机器会被 ssh config 自动发现重新塞回候选（已实测）。
+        seen = {(s.get('alias') or '') for s in servers} \
+            | {(s.get('name') or '') for s in servers} | registry_known_names()
         for s in discover_servers():
             if (s.get('alias') or '') in seen or (s.get('name') or '') in seen:
                 continue
