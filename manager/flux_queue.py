@@ -22,6 +22,7 @@ import threading
 import shutil
 import subprocess
 import uuid
+import base64
 from collections import deque
 from pathlib import Path
 
@@ -46,6 +47,15 @@ WEB_OUT = Path(os.environ.get('FLUX_WEB_OUT', BASE_DIR / 'web_out'))
 QUEUE_MAX = int(os.environ.get('FLUX_QUEUE_MAX', '50'))
 MAX_RETRY = 3
 
+# 「服务器不可达」时，waiting 任务能等多久才判死（秒）。默认 4 小时。
+# 为什么不用 MAX_RETRY 管 waiting（2026-09-20 实测踩到）：
+#   waiting 池装的**全是基础设施问题**（机器关机 / SSH 不通），不是生成失败
+#   （生成失败走 'failed' 分支直接终态，不进池）。而 AutoDL 开机要 1~3 分钟，
+#   期间 SSH 会先 refused 再通。旧逻辑每 30s 重试一次、3 次（≈1 分钟）就判死并退款，
+#   于是「用户刚点了开机」的任务反而被杀，机器白开。
+#   改成按**等待总时长**判死：机器慢慢开、甚至隔几小时再开都能接上。
+WAIT_MAX_SEC = int(os.environ.get('FLUX_WAIT_MAX_SEC', str(4 * 3600)))
+
 # 待用参考图的内存暂存上限（FIFO 淘汰）。参考图只在「提交 → worker 取走」之间存活，
 # 不落盘不入库。32 × 本站 6 MiB 上限 ≈ 190 MiB 封顶，防止有人连提交把 web 进程拖 OOM。
 REF_CACHE_MAX = int(os.environ.get('FLUX_REF_CACHE_MAX', '32'))
@@ -55,6 +65,14 @@ GEN_MODE = (os.environ.get('FLUX_GEN_MODE') or 'resident').strip().lower()
 if GEN_MODE not in ('resident', 'legacy'):
     logger.warning(f'未知 FLUX_GEN_MODE={GEN_MODE!r}，回退为 resident')
     GEN_MODE = 'resident'
+
+
+def _strip_data_uri(b64: str) -> str:
+    """去掉 `data:image/xxx;base64,` 前缀（前端 <input type=file> 常见写法）。"""
+    s = (b64 or '').strip()
+    if s.startswith('data:') and ',' in s[:64]:
+        return s.split(',', 1)[1]
+    return s
 
 
 def _dedup_key(user_id, prompt, seed=None, width=None, height=None,
@@ -205,6 +223,43 @@ class FluxQueueScheduler:
                 old = self._order.popleft()
                 if old != job_id:
                     self._refs.pop(old, None)
+        # 落盘（2026-09-20 补）：只放内存时，manager 一重启 → 所有在途编辑任务必失败
+        # 「参考图已失效，请重新提交图生图任务」；FIFO 淘汰也会静默吃掉参考图。
+        # 现在同时写一份到 web_out/<job_id>/ref.png：内存快路径仍在，
+        # 重启 / 被淘汰后从磁盘读回，编辑任务不会因为 infra 抖动白扣一张配额。
+        try:
+            raw = base64.b64decode(_strip_data_uri(ref_image))
+            self._ref_dir(job_id).write_bytes(raw)
+        except Exception as e:                       # noqa: BLE001 落盘失败不该阻断提交
+            logger.warning(f'参考图落盘失败（仅内存可用，重启后会失效）: '
+                           f'{type(e).__name__}: {e}')
+
+    # 参考图：路径 / 取用 / 清理
+    def _ref_dir(self, job_id: str) -> Path:
+        return WEB_OUT / job_id / 'ref.png'
+
+    def _get_ref(self, job_id: str):
+        """取参考图 base64：内存优先；没有则从磁盘读回（重启 / FIFO 淘汰后仍可用）。"""
+        with self._ref_lock:
+            b64 = self._refs.pop(job_id, None)
+        if b64:
+            return b64
+        f = self._ref_dir(job_id)
+        try:
+            if f.exists():
+                return base64.b64encode(f.read_bytes()).decode('ascii')
+        except Exception as e:                       # noqa: BLE001
+            logger.warning(f'读取磁盘参考图失败: {type(e).__name__}: {e}')
+        return None
+
+    def _drop_ref(self, job_id: str):
+        """终态清理：内存 + 磁盘各删一份，避免 ref.png 无限堆积。"""
+        with self._ref_lock:
+            self._refs.pop(job_id, None)
+        try:
+            self._ref_dir(job_id).unlink(missing_ok=True)
+        except Exception:                            # noqa: BLE001
+            pass
 
     # ── worker ──
     def start(self):
@@ -270,6 +325,7 @@ class FluxQueueScheduler:
             ok, err = self._generate(job)
             if ok:
                 self.db.job_update(job_id, status='done', completed_at=int(time.time()))
+                self._drop_ref(job_id)
                 logger.info(f'✅ {job_id} 完成')
             else:
                 # 服务器 down → 进等待恢复池（不失败、不立即重排，等健康监控检测到恢复后统一入队）
@@ -281,6 +337,7 @@ class FluxQueueScheduler:
                     logger.warning(f'⏸ {job_id} 服务器down，进入等待恢复池 (retry {retry+1})')
                 else:
                     self.db.job_update(job_id, status='failed', error=err, completed_at=int(time.time()))
+                    self._drop_ref(job_id)
                     logger.error(f'❌ {job_id} 失败: {err[:120]}')
                     self._refund_quota(job, '业务失败')
         finally:
@@ -330,7 +387,9 @@ class FluxQueueScheduler:
         """
         job_id = job['job_id']
         try:
-            server, p = fr.find_available_server()
+            # need_edit：图生图只有装了 klein 的机器能跑（dev 的 FluxPipeline 没有 image 参数），
+            # 让选机阶段就避开不支持的机器，而不是等 GPU 上跑一遍才报错。
+            server, p = fr.find_available_server(need_edit=is_edit)
             if not server:
                 return False, '[SERVER_DOWN] 无可用 flux 服务器（均关机 / SSH 不通）'
 
@@ -344,9 +403,9 @@ class FluxQueueScheduler:
                 # 参考图只存在于「提交那一刻」的内存里（不入库，见 flux_db 的 edit_mode 注释）。
                 # 进程重启后孤儿任务恢复会走到这里且 ref_b64 为 None → **明确失败**，
                 # 绝不静默降级成文生图：那会照常出图、照常扣费，但完全不是用户要的东西。
-                ref_b64 = self._refs.pop(job_id, None)
+                ref_b64 = self._get_ref(job_id)
                 if not ref_b64:
-                    return False, ('参考图已失效（进程重启后内存中的参考图不保留），'
+                    return False, ('参考图已失效（内存与磁盘均无留存），'
                                    '请重新提交图生图任务')
 
             dest = WEB_OUT / job_id / f'{job_id}.png'
@@ -461,24 +520,34 @@ class FluxQueueScheduler:
             time.sleep(30)
 
     def _recover_waiting_tasks(self):
-        """服务器恢复时，把 waiting 的 [SERVER_DOWN] 任务重新入队。每任务最多恢复 MAX_RETRY 次。"""
+        """服务器恢复时，把 waiting 的 [SERVER_DOWN] 任务重新入队。
+
+        判死口径 = **等待总时长**（WAIT_MAX_SEC），不是重试次数：
+        池里全是「机器关机 / SSH 不通」这类基础设施等待，AutoDL 开机要 1~3 分钟，
+        期间 SSH 先 refused 再通。按次数判死会把「用户刚点开机」的任务误杀
+        （2026-09-20 实测：3 次重试 ≈1 分钟耗尽，机器开了但任务已 failed 并退款）。
+        真正生成失败（kind='failed'）不进池，直接终态，不受这里影响。
+        """
         while self._waiting:
             job_id = self._waiting.pop()
             job = self.db.job_get(job_id)
             if not job:
                 continue
             retry = self._count_retry(job['error'] or '')
-            if retry >= MAX_RETRY:
+            waited = int(time.time()) - int(job.get('created_at') or time.time())
+            if waited > WAIT_MAX_SEC:
                 self.db.job_update(job_id, status='failed',
-                                   error=f'{job["error"] or ""} [RECOVER_SKIP]',
+                                   error=f'{job["error"] or ""} [WAIT_TIMEOUT '
+                                         f'{waited}s>{WAIT_MAX_SEC}s]',
                                    completed_at=int(time.time()))
-                logger.warning(f'⛔ {job_id} 恢复超限({retry})，标记失败')
-                self._refund_quota(job, f'重试超限({retry})')
+                logger.warning(f'⛔ {job_id} 等待服务器 {waited}s 超过上限，标记失败')
+                self._refund_quota(job, f'等待服务器超时({waited//60}分钟)')
                 continue
             self.db.job_update(job_id, status='queued')
             self._pq.put((job['priority'], -self._seq, job_id))
             self._seq += 1
-            logger.info(f'🔄 {job_id} 服务器恢复，重新入队 (retry {retry+1})')
+            logger.info(f'🔄 {job_id} 服务器恢复，重新入队'
+                        f'(第 {retry+1} 次，已等待 {waited//60} 分钟)')
 
     def _recover_orphaned_jobs(self):
         """重启后把 DB 里残留 queued/generating 的任务重新入队。
