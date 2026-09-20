@@ -32,7 +32,10 @@ MARK = 'flux-watchdog'          # 追加行尾标记，便于识别与幂等去�
 
 
 def sh(cmd, timeout=120):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    # ⚠️ errors='replace'：远端/本机可能吐 GBK 字节（Windows 侧中文横幅、AutoDL 登录提示），
+    #    严格 utf-8 解码会直接抛 UnicodeDecodeError 把整条命令判成失败（实测踩到）。
+    r = subprocess.run(cmd, shell=True, capture_output=True,
+                       encoding='utf-8', errors='replace', timeout=timeout)
     return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
 
@@ -65,7 +68,17 @@ def main():
                   f'-o StrictHostKeyChecking=accept-new ' \
                   f'-o UserKnownHostsFile=/opt/flux-watchdog/known_hosts ' \
                   f'-p {s["port"]} {s["user"]}@{s["host"]}'
-            ok, out = sh(f'ssh {a.vps} "ssh {tgt} \\"echo ok; nvidia-smi -L | head -1\\""', 60)
+            # ⚠️ 内层远程命令只能用单引号：本机 Windows 的 subprocess shell=True 走 cmd.exe，
+            #    嵌套 \" 会被 cmd 的引号规则吃掉（实测远端报 head: invalid trailing option -- \）。
+            #    nvidia-smi 在**无卡模式**下输出为空但 rc=0（flux4 实测），所以带一个
+            #    「无卡」兜底文案，别让人误判成机器有问题。
+            #    ⚠️ 内层**不能出现双引号**：cmd 的引号是「遇 " 就切换」而不是配对，
+            #    内层一有 " 就把外层的引号拆开，cmd 随后把剩余片段当路径解析 →
+            #    报 GBK 的「系统找不到指定的路径」（实测踩到，极具迷惑性）。
+            inner = "echo ok; nvidia-smi -L 2>/dev/null | head -1; " \
+                    "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null " \
+                    "| grep -q . && echo GPU_OK || echo NOGPU"
+            ok, out = sh(f"""ssh {a.vps} "ssh {tgt} '{inner}'\"""", 60)
             print(f'{"✅" if ok else "❌"} {s["name"]:6s} {s["host"]}:{s["port"]} '
                   f'{out.strip().splitlines()[0] if ok else out.strip()[:120]}')
             ok_all = ok_all and ok

@@ -32,6 +32,11 @@ printf '#!/bin/bash\necho "FAKE-GPU, 32760 MiB"\n' > "$SB/bin/nvidia-smi"; chmod
 # 桩件 2：失败的 nvidia-smi（模拟无卡模式）。要遮住真机的 /usr/bin/nvidia-smi，
 #         否则在 GPU 机上跑自测时这一条会被真的 nvidia-smi 顶掉 → 用例假失败。
 printf '#!/bin/bash\nexit 1\n' > "$SB/nogpu/nvidia-smi"; chmod +x "$SB/nogpu/nvidia-smi"
+# 桩件 3：「静默」nvidia-smi —— 命令存在、**exit 0**、但**一个字节都不输出**。
+#         这是 AutoDL 无卡模式的真实形态（2026-09-20 于 flux4 实测），
+#         只判退出码会被骗过，是最容易漏掉的一种。
+mkdir -p "$SB/silent"; printf '#!/bin/bash\nexit 0\n' > "$SB/silent/nvidia-smi"
+chmod +x "$SB/silent/nvidia-smi"
 touch "$SB/model/DOWNLOAD_DONE"
 # 判据里要求工作目录有这两个文件（真实环境由看门狗补传），沙箱里放空壳
 : > "$SB/work/flux_resident_server.py"
@@ -81,6 +86,14 @@ echo "[4] 负向：模型目录缺 DOWNLOAD_DONE → 必须判未就绪（哪怕
 mv "$SB/model/DOWNLOAD_DONE" "$SB/model/DOWNLOAD_DONE.bak"
 chk "模型不完整" 1
 mv "$SB/model/DOWNLOAD_DONE.bak" "$SB/model/DOWNLOAD_DONE"
+
+echo "[5] 负向：AutoDL 无卡模式（nvidia-smi 存在、exit 0、但输出为空）→ 必须判未就绪"
+# 这是最阴的一种：常驻服务此时还在跑（用例 3 起的），只有"空输出"这一个信号能识别。
+( export PATH="$SB/silent:$SB/bin:/usr/bin:/bin"
+  FLUX_WORKDIR="$SB/work" FLUX_MODEL="$SB/model" FLUX_RESIDENT_PORT="$PORT" \
+    bash "$READY" --check >/dev/null 2>&1 )
+[ $? -ne 0 ] && { echo "  ✅ 空输出 nvidia-smi → 未就绪（没被 exit 0 骗过）"; PASS=$((PASS+1)); } \
+             || { echo "  ❌ 空输出 nvidia-smi 被判成就绪 —— 无卡机会被当成可接单"; FAIL=$((FAIL+1)); }
 
 echo "──────────────────────────────"
 echo "通过 $PASS / 失败 $FAIL"

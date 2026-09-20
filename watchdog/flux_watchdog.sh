@@ -19,7 +19,12 @@ KH=$DIR/known_hosts
 CONF=$DIR/targets.conf
 SCRIPT=$DIR/flux_server_ready.sh                 # 就地脚本（VPS 本地路径）
 MIRROR=$DIR/mirror                               # 常驻服务文件镜像（VPS 本地，给裸机补件用）
-SSH="/usr/bin/ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KH"
+# ⚠️ 两个都不能省：
+#   -n  ssh 会把循环的标准输入**吃掉**（经典的 "ssh eats stdin in while read loop" 坑）。
+#       不加 -n 的话，处理完第一台机器后 read 直接读到 EOF → 本轮循环提前结束，
+#       后面的机器这一轮根本不会被巡检（实测：只有同步日志、没有判据日志，极难定位）。
+#   BatchMode=yes  免密失败时不要卡在密码提示上
+SSH="/usr/bin/ssh -n -i $KEY -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KH"
 SCP="/usr/bin/scp -i $KEY -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KH"
 INTERVAL=${WATCHDOG_INTERVAL:-60}
 
@@ -33,7 +38,10 @@ if [ ! -f "$CONF" ]; then
 fi
 
 while true; do
-  while IFS=: read -r host port user workdir model offload; do
+  # 每轮重新读一次 targets.conf（改了机器清单不用重启服务）
+  mapfile -t TARGETS < <(grep -v '^#' "$CONF" | grep -v '^$')
+  for line in "${TARGETS[@]}"; do
+    IFS=: read -r host port user workdir model offload <<< "$line"
     [ -z "$host" ] && continue
     case "$host" in \#*) continue ;; esac
     workdir=${workdir:-/root/autodl-tmp/flux-t2i}
@@ -41,26 +49,48 @@ while true; do
     offload=${offload:-model}
     H="$SSH -p $port $user@$host"
     if $H 'true' 2>/dev/null; then                               # 机器在线（sshd 通）
-      # ── 补件（幂等）：缺什么传什么，避免每轮无谓 scp ──
-      # 新克隆/重装的机器上可能没有常驻服务脚本，不补的话预热必然失败，
-      # 只能等本机 manager 开机上传 —— 那就失去「开机即自动可接单」的意义了。
+      # ── 补件 / 版本同步：本地与远端 md5 不一致就传 ──
+      # ⚠️ 只判「文件在不在」是不够的：改了脚本后机器上的旧副本**永远不更新**，
+      #    看门狗表面上在跑、日志也绿，实际执行的还是旧逻辑（2026-09-20 实测踩到：
+      #    加了无卡模式判据，机器上仍是 17:29 的旧脚本，照样去跑 start_resident.sh）。
+      #    新克隆的机器上什么都没有 → md5 不等 → 自动补件，一举两得。
       $H "mkdir -p $workdir" 2>/dev/null
+      sync_file() {                       # sync_file <本地路径> <远端目录> <文件名>
+        local lf=$1 rd=$2 fn=$3 want have
+        want=$(md5sum < "$lf" 2>/dev/null | awk '{print $1}')
+        [ -n "$want" ] || { logger -t flux-watchdog "[$host] ⚠️ 本地 $fn 读不到，跳过同步"; return 1; }
+        have=$($H "md5sum < $rd/$fn 2>/dev/null" 2>/dev/null | awk '{print $1}')
+        if [ "$want" != "$have" ]; then
+          $SCP -P "$port" "$lf" "$user@$host:$rd/$fn" 2>/dev/null \
+            && logger -t flux-watchdog "[$host] 同步 $fn（远端版本不一致）" \
+            || logger -t flux-watchdog "[$host] ⚠️ 同步 $fn 失败"
+        fi
+      }
+      sync_file "$SCRIPT" "$workdir" flux_server_ready.sh
       for f in flux_resident_server.py start_resident.sh; do
-        if ! $H "test -f $workdir/$f" 2>/dev/null; then
-          if [ -f "$MIRROR/$f" ]; then
-            $SCP -P "$port" "$MIRROR/$f" "$user@$host:$workdir/$f" 2>/dev/null \
-              && logger -t flux-watchdog "[$host] 补传 $f" \
-              || logger -t flux-watchdog "[$host] ⚠️ 补传 $f 失败（mirror 有文件但传不过去）"
-          else
-            logger -t flux-watchdog "[$host] ⚠️ 缺 $workdir/$f 且 VPS 镜像 $MIRROR/$f 不存在"
-          fi
+        if [ -f "$MIRROR/$f" ]; then
+          sync_file "$MIRROR/$f" "$workdir" "$f"
+        else
+          logger -t flux-watchdog "[$host] ⚠️ VPS 镜像缺 $MIRROR/$f（跑 deploy_vps.py 补上）"
         fi
       done
-      if ! $H "test -x $workdir/flux_server_ready.sh" 2>/dev/null; then
-        $SCP -P "$port" "$SCRIPT" "$user@$host:$workdir/flux_server_ready.sh" 2>/dev/null
-      fi
       ENV="FLUX_WORKDIR=$workdir FLUX_MODEL=$model FLUX_OFFLOAD=$offload"
-      if ! $H "$ENV bash $workdir/flux_server_ready.sh --check" 2>/dev/null; then
+      # ⚠️ 必须看**退出码**：--check 成功和失败都会打印一行（"已就绪"/"未就绪"），
+      #    判空会永远不成立，看门狗就再也不会预热了（静默失效，最阴的那种）。
+      out=$($H "$ENV bash $workdir/flux_server_ready.sh --check" 2>/dev/null)
+      rc=$?
+      if [ $rc -eq 0 ]; then
+        :                                                        # 已就绪，什么都不做
+      elif echo "$out" | grep -q NOGPU; then
+        # 无卡模式：预热也没用（必须人在控制台切带卡），硬试只会空转 60s + 每轮刷日志。
+        # 节流：状态没变就别每分钟来一条（一天 1440 行会把真正的故障日志淹掉）。
+        mkdir -p "$DIR/state"
+        st="$DIR/state/${host}_${port}"
+        if ! [ -f "$st" ] || [ -z "$(find "$st" -mmin -30 2>/dev/null)" ]; then
+          logger -t flux-watchdog "[$host] ⏸ 无卡模式，跳过预热 —— 需到控制台切【带卡模式】（30 分钟内不再重复）"
+        fi
+        touch "$st"
+      else
         logger -t flux-watchdog "[$host] 未就绪，预热中（model=$model offload=$offload）"
         $H "$ENV bash $workdir/flux_server_ready.sh" 2>/dev/null
         ok=0
@@ -72,6 +102,6 @@ while true; do
                        || logger -t flux-watchdog "[$host] ⚠️ 预热未完成，下轮重试"
       fi
     fi
-  done < <(grep -v '^#' "$CONF" | grep -v '^$')
+  done
   sleep "$INTERVAL"
 done

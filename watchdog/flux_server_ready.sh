@@ -38,8 +38,23 @@ f_loaded() {
     | tr -d ' \n' | grep -q '"model_loaded":true'
 }
 
+# ⚠️ 带卡判定不能用 `nvidia-smi` 的退出码（2026-09-20 实测于 flux4 无卡模式）：
+#    命令存在（/usr/bin/nvidia-smi）、**exit 0**，但输出 **0 字节**，/dev/nvidia* 也不存在。
+#    只判退出码会把无卡机当成有卡机 → 后续白等 400s 模型加载，
+#    看门狗这一轮被这台机器卡住 ~8 分钟，其他机器的巡检全被拖住。
+f_gpu() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local name
+  name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -d '\r')
+  [ -n "$name" ] || return 1                       # 无卡模式：空输出
+  case "$name" in
+    *"has failed"*|*"Error"*|*"error"*) return 1 ;;  # 驱动没起来的报错文本也算无卡
+  esac
+  return 0
+}
+
 f_check() {
-  nvidia-smi >/dev/null 2>&1                  || return 1   # 带卡模式
+  f_gpu                                           || return 1   # 带卡模式（空输出不算）
   [ -f "$MODEL/DOWNLOAD_DONE" ]               || return 1   # 模型完整
   [ -f "$WORKDIR/flux_resident_server.py" ]   || return 1   # 常驻脚本已上传
   [ -f "$WORKDIR/start_resident.sh" ]         || return 1   # 启动脚本
@@ -53,12 +68,29 @@ if f_check; then
   fi
 else
   if [ $CHECK -eq 1 ]; then
-    echo "[flux-ready] 未就绪"; exit 1
+    # 把「为什么不就绪」说出来：看门狗据此决定是预热还是跳过。
+    # 无卡模式预热也没用（还得等人在控制台切带卡），硬试只会空转 + 刷日志。
+    if ! f_gpu; then
+      echo "[flux-ready] 未就绪（无卡模式 NOGPU —— 需到控制台切【带卡模式】）"
+    else
+      echo "[flux-ready] 未就绪"
+    fi
+    exit 1
   fi
 fi
 
 # ── 全量预热 ──
 echo "===== FLUX 常驻服务预热 ====="
+
+# 无卡模式**立刻早退**，不要往下试：
+#   不早退的话，下面 start_resident.sh 会因为模型加载不出来而白等 400s，
+#   看门狗这一整轮就被这台机器占住，其他机器的巡检被拖 8 分钟（真实可用性问题）。
+if ! f_gpu; then
+  echo "[flux-ready] ⏸ 当前是**无卡模式**（nvidia-smi 无输出 / 驱动未就绪）"
+  echo "    → 不启动常驻服务。请到 AutoDL 控制台切到【带卡模式】，看门狗下轮自动接管"
+  exit 1
+fi
+
 screen -wipe 2>/dev/null          # 清僵尸会话：Dead 会话会让"是否在跑"误判（既有坑）
 
 # 只动常驻自己的会话与进程，**绝不碰旧链路 fluxgen / gen_flux.py**（两条链路互不干扰）

@@ -67,6 +67,11 @@ def t_resident_chain():
     src = read(READY)
     for kw in ('flux_resident_server.py', 'start_resident.sh', 'model_loaded', '9630'):
         check(f'判据含常驻关键字 {kw}', kw in src)
+    # 无卡模式：nvidia-smi 存在、exit 0、输出 0 字节（2026-09-20 flux4 实测）
+    check('带卡判定有独立函数 f_gpu（不靠退出码）', 'f_gpu()' in src)
+    check('f_gpu 要求 nvidia-smi 输出非空', '--query-gpu=name' in src and '-n "$name"' in src)
+    check('无卡模式早退（不白等 400s 拖住巡检）',
+          '无卡模式' in src and code_only(src).count('exit 1') >= 2)
     legacy = [kw for kw in ('gen_flux.py', 'start_gen.sh', 'fluxgen') if kw in code_only(src)]
     check('判据代码里不含旧链路关键字（注释里的说明不算）', not legacy, f'残留: {legacy}')
 
@@ -81,6 +86,9 @@ def t_no_hardcoded_targets():
     src = read(WATCH)
     check('从 targets.conf 读机器', 'targets.conf' in src and 'CONF=' in src)
     check('不硬编码 TARGETS 数组', 'TARGETS=(' not in src)
+    # --check 成功和失败都会打印一行，判空永远不成立 → 看门狗再也不预热（静默失效）
+    check('按**退出码**分支而不是判输出为空', 'rc=$?' in src and 'if [ $rc -eq 0 ]' in src)
+    check('无卡模式跳过预热（不空转、不刷日志）', 'NOGPU' in src and '无卡模式' in src)
     gsrc = read(GEN)
     check('gen_targets 源是 servers.json', 'servers.json' in gsrc or 'load_registry' in gsrc)
     check('gen_targets 会跳过 enabled=false', 'enabled' in gsrc)
@@ -119,6 +127,8 @@ def t_selftest():
     check('有假 nvidia-smi 桩件', 'nvidia-smi' in src)
     check('有假常驻服务（model_loaded:true）', 'model_loaded' in src and 'HTTPServer' in src)
     check('正向用例期望 0 / 负向用例期望 1', 'chk "常驻已加载模型" 0' in src and 'chk "常驻未起" 1' in src)
+    check('覆盖无卡模式「空输出但 exit 0」桩件',
+          "$SB/silent" in src and 'exit 0' in src)
     check('沙箱建在 /tmp，不碰真实工作目录', '/tmp/flux-ready-selftest' in src)
 
 
