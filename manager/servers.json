@@ -75,7 +75,20 @@
       "remote_model": "/root/klein-models/FLUX.2-klein-4B",
       "offload": "none",
       "supports_edit": true,
-      "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。**现存唯一能跑图生图的机器**：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1 上会直接报「当前模型不支持图生图」。supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）。2026-09-20 确认：实例**未被释放**（当时只释放了 flux.2 klein 4B / 4B2），已重新启用；开机后若端口变了改这里即可，不用动代码"
+      "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。**现存唯一能跑图生图的机器**：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1 上会直接报「当前模型不支持图生图」。supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）。2026-09-20 确认：实例**未被释放**（当时只释放了 flux.2 klein 4B / 4B2），已重新启用；开机后若端口变了改这里即可，不用动代码｜⚠️ flux4 已被 flux5 取代，停用留痕，不再探活",
+      "enabled": false
+    },
+    {
+      "name": "flux5",
+      "host": "connect.westc.seetacloud.com",
+      "port": 27602,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/klein-models/FLUX.2-klein-4B",
+      "offload": "none",
+      "supports_edit": true,
+      "note": "flux.2 klein 4B4，2026-09-20 从 flux.2 klein 4B3 克隆，RTX 4080 SUPER 32G｜模型预设 klein：klein 4B 约 15 GiB，32G 卡可 offload=none；pipeline 接受 image → 能图生图"
     }
   ]
 }

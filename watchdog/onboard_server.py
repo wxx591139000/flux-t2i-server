@@ -28,6 +28,7 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -60,8 +61,16 @@ PY = 'py -3.11'
 
 
 def run(cmd, timeout=600):
-    print('\n$ ' + cmd)
-    r = subprocess.run(cmd, shell=True, cwd=str(BASE_DIR), timeout=timeout)
+    print('\n$ ' + cmd, flush=True)
+    # ⚠️ PYTHONUNBUFFERED=1 + 自己转印输出：子进程直接写管道、父进程 Python 缓冲，
+    #    两边顺序会错乱（实测：子命令的输出跑到父命令打印之前，看着像流程乱了）。
+    env = dict(os.environ, PYTHONUNBUFFERED='1')
+    r = subprocess.run(cmd, shell=True, cwd=str(BASE_DIR), env=env, timeout=timeout,
+                       capture_output=True, encoding='utf-8', errors='replace')
+    if r.stdout:
+        print(r.stdout, end='')
+    if r.stderr:
+        print(r.stderr, end='')
     if r.returncode != 0:
         print(f'   ❌ 退出码 {r.returncode} —— 后续步骤已中止，先解决这一步')
         return False
@@ -115,8 +124,10 @@ def main():
             print(f'\n❌ --retire {a.retire} 在注册表里找不到')
             return 1
         hit[0]['enabled'] = False
-        hit[0]['note'] = (hit[0].get('note', '') +
-                          f'｜⚠️ {a.retire} 已被 {a.name} 取代，停用留痕，不再探活').strip('｜')
+        # 幂等：重复跑 onboard 不要一遍遍往备注里追加同一句话
+        tag = f'已被 {a.name} 取代，停用留痕，不再探活'
+        if tag not in hit[0].get('note', ''):
+            hit[0]['note'] = (hit[0].get('note', '') + f'｜⚠️ {tag}').strip('｜')
         print(f'\n♻️  旧机 {a.retire} 已标 enabled=false（留痕，不参与探活）')
 
     old = [s for s in servers if s.get('name') == a.name]

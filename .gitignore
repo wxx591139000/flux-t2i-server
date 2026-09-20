@@ -22,3 +22,5 @@ server/prompts.json        # 业务提示词不入库，用 example 模板
 # 系统
 .DS_Store
 Thumbs.db
+# tests/manual 是一次性验证脚本目录：脚本入库，产物不入库
+tests/manual/_*

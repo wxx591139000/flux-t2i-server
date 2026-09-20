@@ -51,9 +51,11 @@ RESULTS = []
 
 
 def check(no, name, ok, detail='', critical=True):
-    RESULTS.append({'no': no, 'name': name, 'ok': bool(ok), 'critical': critical,
-                    'detail': str(detail)[:300]})
-    flag = '✅' if ok else ('❌' if critical else '⚠️')
+    # ok=None = **未验证**（上游依赖没跑到），既不算通过也不算失败 ——
+    # 混进"通过"会虚高，混进"失败"会让人去改根本没被测到的配置。
+    RESULTS.append({'no': no, 'name': name, 'ok': (None if ok is None else bool(ok)),
+                    'critical': critical, 'detail': str(detail)[:300]})
+    flag = '⏸' if ok is None else ('✅' if ok else ('❌' if critical else '⚠️'))
     print(f'  {flag} [{no:2d}] {name}' + (f'  → {detail}' if detail else ''))
     return bool(ok)
 
@@ -172,11 +174,13 @@ def main():
 
     # 10 图生图（用第 9 步的图当参考图，不依赖外部素材）
     edit_ok = False
+    edit_ran = False                     # 图生图**有没有真的跑到**（没跑到 ≠ 不支持）
     if t2i_png and t2i_png.exists():
         ref_b64 = base64.b64encode(t2i_png.read_bytes()).decode('ascii')
         edit_png = out_dir / 'edit.png'
         t0 = time.time()
         try:
+            edit_ran = True
             st = frc.generate_via_resident(srv, EDIT_PROMPT, edit_png,
                                            ref_image_b64=ref_b64,
                                            width=a.size, height=a.size)
@@ -187,7 +191,8 @@ def main():
         except Exception as e:                                # noqa: BLE001
             check(10, '图生图/编辑', False, f'{type(e).__name__}: {e}')
     else:
-        check(10, '图生图/编辑', False, '第 9 步没出图，无参考图可用')
+        check(10, '图生图/编辑', False, '第 9 步没出图，无参考图可用（**未验证**，不是不支持）',
+              critical=False)
 
     # 11 日志健康
     log = frc.tail_log(srv, 120)
@@ -198,7 +203,14 @@ def main():
 
     # 12 能力声明核对
     declared = bool(srv.get('supports_edit'))
-    if declared != edit_ok:
+    if not edit_ran:
+        # ⚠️ 图生图**根本没跑到**（上游文生图没出图 / 没参考图）时，绝不能据此判
+        #    "声明与实测不符" —— 那会让人把 klein 的 supports_edit 改成 false，
+        #    而它其实完全支持图生图（2026-09-20 flux5 实测踩到这个假结论）。
+        check(12, '能力声明 vs 实测（supports_edit）', None,
+              f'未验证：图生图没跑到（缺参考图），不能据此改 supports_edit（当前声明={declared}）',
+              critical=False)
+    elif declared != edit_ok:
         check(12, '能力声明 vs 实测（supports_edit）', False,
               f'注册表声明 supports_edit={declared}，实测图生图={"成功" if edit_ok else "失败"}'
               f' → 请把 manager/servers.json 里该机器的 supports_edit 改成 {str(edit_ok).lower()}',
@@ -209,8 +221,10 @@ def main():
 
     _dump(a.json_out)
     bad_critical = [r for r in RESULTS if r['critical'] and not r['ok']]
+    n_pass = len([r for r in RESULTS if r['ok']])
+    n_skip = len([r for r in RESULTS if r['ok'] is None])
     print('\n' + '=' * 66)
-    print(f'共 {len(RESULTS)} 项 · 通过 {len([r for r in RESULTS if r["ok"]])} · '
+    print(f'共 {len(RESULTS)} 项 · 通过 {n_pass} · 未验证 {n_skip} · '
           f'关键项失败 {len(bad_critical)}')
     if bad_critical:
         for r in bad_critical:

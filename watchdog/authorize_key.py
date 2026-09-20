@@ -54,6 +54,9 @@ def main():
     ap = argparse.ArgumentParser(description='把 VPS 看门狗公钥装到各 GPU 机')
     ap.add_argument('--vps', default='vps-aliyun')
     ap.add_argument('--check', action='store_true', help='只验证 VPS→各机 免密可达')
+    ap.add_argument('--strict', action='store_true',
+                    help='离线也算失败（默认不算：机器关机时连不上是**预期状态**，'
+                         '不该让整条部署命令失败）')
     a = ap.parse_args()
 
     servers = [s for s in fsm.FLUX_SERVERS if s.get('host')]
@@ -90,7 +93,11 @@ def main():
         return 1
     print(f'🔑 看门狗公钥: {pub[:40]}…（{len(pub)} 字节）')
 
-    ok_all = True
+    # 「连不上」是预期状态（机器关机），不是本命令的失败 —— 否则每次有一台机器关机
+    # 就会让 onboard/deploy 整条链路中止，逼着人手动跳过。真失败（权限/路径错）才报错。
+    OFFLINE_MARK = ('Connection refused', 'Connection timed out', 'timed out',
+                    'No route to host', 'Network is unreachable')
+    n_ok = n_off = n_err = 0
     for s in servers:
         tgt = fsm.ssh_target(s)
         # 幂等：先 grep 掉带标记的旧行，再追加；chmod 保证文件权限正确（权限不对 sshd 会忽略）
@@ -100,12 +107,23 @@ def main():
                f'echo \'{pub} {MARK}\' >> ~/.ssh/ak.tmp && mv ~/.ssh/ak.tmp ~/.ssh/authorized_keys && '
                f'chmod 600 ~/.ssh/authorized_keys && echo INSTALLED"')
         ok, out = sh(cmd, 60)
-        print(f'{"✅" if ok else "❌"} {s["name"]:6s} {s["host"]}:{s["port"]} '
-              f'{out.strip()[:160]}')
-        ok_all = ok_all and ok
+        if ok:
+            n_ok += 1
+            print(f'✅ {s["name"]:6s} {s["host"]}:{s["port"]} 已装机')
+        elif any(m in out for m in OFFLINE_MARK):
+            n_off += 1
+            print(f'💤 {s["name"]:6s} {s["host"]}:{s["port"]} 离线（关机/释放）—— 开机后重跑本命令')
+        else:
+            n_err += 1
+            print(f'❌ {s["name"]:6s} {s["host"]}:{s["port"]} {out.strip()[:160]}')
 
-    print('\n验证：python watchdog/authorize_key.py --check')
-    return 0 if ok_all else 1
+    print(f'\n装机 {n_ok} 台 / 离线 {n_off} 台 / 失败 {n_err} 台')
+    print('验证：python watchdog/authorize_key.py --check')
+    if n_err:
+        return 1
+    if a.strict and n_off:
+        return 1
+    return 0
 
 
 if __name__ == '__main__':

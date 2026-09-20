@@ -93,6 +93,14 @@ def t_targets():
     check('ssh 用小写 -p', ' -p 26081 ' in f' {ssh_t} ' or ssh_t.endswith(' -p 26081'), ssh_t)
     check('scp 用大写 -P', ' -P 26081' in scp_t, scp_t)
     check('两者都带上私钥 -i', '-i ~/.ssh/id_rsa_musetalk' in ssh_t and '-i ~/.ssh/id_rsa_musetalk' in scp_t)
+    # ⚠️ 新克隆的机器不在 known_hosts：没有 accept-new 首次必失败；
+    #    没有 BatchMode 会卡在 "Are you sure you want to continue" 的交互提示上，
+    #    非 tty 下等到超时，报错退化成没头没尾的 "TIMEOUT"（2026-09-20 flux5 实测）。
+    check('带 StrictHostKeyChecking=accept-new（新机自动信任）',
+          'StrictHostKeyChecking=accept-new' in ssh_t and 'StrictHostKeyChecking=accept-new' in scp_t,
+          ssh_t)
+    check('带 BatchMode=yes（不卡交互提示）',
+          'BatchMode=yes' in ssh_t and 'BatchMode=yes' in scp_t, scp_t)
     check('两者都是 user@host', ssh_t.endswith('root@h.example.com') and scp_t.endswith('root@h.example.com'))
     check('scp 不残留小写 -p（语义是保留时间戳）', ' -p ' not in scp_t, scp_t)
     a = {'name': 'y', 'alias': 'autodl-flux'}
