@@ -84,6 +84,78 @@ FLUX_REMOTE_BASE = os.environ.get('FLUX_REMOTE_BASE', '/root/autodl-tmp/flux-t2i
 FLUX_REMOTE_MODEL = os.environ.get('FLUX_REMOTE_MODEL', '/root/autodl-tmp/models/FLUX.1-dev')
 
 
+# ═══════════════ 仓库内机器注册表（manager/servers.json） ═══════════════
+# 为什么要有它（2026-09-20 事故）：候选机原本只从 ~/.ssh/config 匹配
+# autodl-flux* 别名「自动发现」，而那个文件在仓库**外**、不在版本控制里。
+# 克隆实例到新服务器后忘了加 Host 条目 → manager 永远看不见那台机器 →
+# 站点提交的任务进 waiting 池死等（当天卡了 8 分钟无人处理）。
+# 现在注册表进仓库（可评审、换人换 AI 都看得见），且支持 host/port/user
+# **直连**，不再依赖 ~/.ssh/config。
+REGISTRY_PATH = BASE_DIR / 'manager' / 'servers.json'
+
+
+def load_registry(path=None) -> list:
+    """读 manager/servers.json。文件不存在 / 内容写坏 → 返回 []（回退旧逻辑，绝不因此崩）。"""
+    p = Path(path) if path else REGISTRY_PATH
+    try:
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception as e:                      # noqa: BLE001 注册表坏了不能拖垮整个服务
+        logging.getLogger('flux_manager').warning(f'读取服务器注册表 {p} 失败: {e}')
+        return []
+    servers = data.get('servers') if isinstance(data, dict) else data
+    if not isinstance(servers, list):
+        return []
+    out = []
+    for s in servers:
+        if not isinstance(s, dict) or not s.get('name'):
+            continue
+        if s.get('enabled') is False:
+            continue                       # 已释放 / 停用的机器：保留记录做留痕，但不探活
+        item = dict(s)
+        # 直连条目没有 alias，兜一个给缓存 key / 日志 / jobs.server 用
+        item.setdefault('alias', item.get('name'))
+        item['from_registry'] = True
+        out.append(item)
+    return out
+
+
+def _ssh_target_from(host: str, port, user: str, ident: str) -> str:
+    parts = []
+    ident = (ident or '').strip()
+    if ident:
+        # 命令由 bash -lc 执行，`~` 会展开；只有路径含空格才加引号
+        # （ssh.exe 是原生程序，不解析单引号，无谓加引号反而会连不上）
+        parts.append(f'-o IdentitiesOnly=yes -i {ident if " " not in ident else chr(34) + ident + chr(34)}')
+    parts.append(f'-p {int(port) if str(port).strip().isdigit() else 22}')
+    parts.append(f'{user or "root"}@{host}')
+    return ' '.join(parts)
+
+
+def ssh_target(server: dict) -> str:
+    """把 server 解析成 ssh 的**连接目标**片段（不含 'ssh' 本身）。
+
+    有 host → 直连 `-i <key> -p <port> <user>@<host>`（不查 ~/.ssh/config）
+    无 host → 回退旧行为 `<alias>`
+    """
+    host = (server.get('host') or '').strip()
+    if not host:
+        return server.get('alias') or server.get('name') or ''
+    return _ssh_target_from(host, server.get('port') or 22,
+                            server.get('user') or 'root', server.get('identity_file') or '')
+
+
+def scp_target(server: dict) -> str:
+    """同 ssh_target，但 scp 的端口是**大写 -P**（scp 的 -p 是「保留时间戳」，语义完全不同）。"""
+    host = (server.get('host') or '').strip()
+    if not host:
+        return server.get('alias') or server.get('name') or ''
+    return _ssh_target_from(host, server.get('port') or 22,
+                            server.get('user') or 'root',
+                            server.get('identity_file') or '').replace(' -p ', ' -P ', 1)
+
+
 def ssh_config_aliases() -> list:
     """从 ~/.ssh/config 读出所有 Host 别名（跳过含通配符的模板项）。"""
     cfg = Path(os.path.expanduser('~')) / '.ssh' / 'config'
@@ -132,14 +204,29 @@ def discover_servers() -> list:
 
 
 def _load_servers() -> list:
+    """优先级：FLUX_SERVERS_JSON（完全接管） > manager/servers.json（注册表）
+    > 代码内 _DEFAULT_SERVERS + ~/.ssh/config 自动发现（旧行为，兜底）。
+
+    注册表存在时接管，但 ssh config 里「同名之外」的匹配别名仍会追加进来，
+    保证老机器上原来能用的别名不会因为加了注册表而失效。
+    """
     raw = os.environ.get('FLUX_SERVERS_JSON')
     if raw:
         try:
             loaded = json.loads(raw)
             if isinstance(loaded, list) and loaded:
                 return loaded
-        except Exception:
+        except Exception:                  # noqa: BLE001
             pass
+    reg = load_registry()
+    if reg:
+        servers = list(reg)
+        seen = {(s.get('alias') or '') for s in servers} | {(s.get('name') or '') for s in servers}
+        for s in discover_servers():
+            if (s.get('alias') or '') in seen or (s.get('name') or '') in seen:
+                continue
+            servers.append(s)
+        return servers
     return discover_servers()
 
 
@@ -286,20 +373,20 @@ def run(cmd, timeout=30):
 
 def server_reachable(server=None) -> bool:
     s = _get_server(server)
-    ok, _ = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {s["alias"]} echo ok', 15)
+    ok, _ = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {ssh_target(s)} echo ok', 15)
     return ok
 
 
 def gpu_ready(server=None) -> tuple:
     s = _get_server(server)
-    ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+    ok, out = run(f'ssh -o ConnectTimeout=8 {ssh_target(s)} '
                   "'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1'", 15)
     return ok and 'NVIDIA' in out, out
 
 
 def model_ready(server=None) -> bool:
     s = _get_server(server)
-    ok, _ = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+    ok, _ = run(f'ssh -o ConnectTimeout=8 {ssh_target(s)} '
                 f"'test -f {s['remote_model']}/DOWNLOAD_DONE && echo READY'", 15)
     return ok
 
@@ -307,7 +394,7 @@ def model_ready(server=None) -> bool:
 def gen_running(server=None) -> bool:
     s = _get_server(server)
     # 先 screen -wipe 清僵尸会话，避免 Dead 会话被 grep -c 误判为"运行中"（否则崩溃后残留会挡住重启）
-    ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+    ok, out = run(f'ssh -o ConnectTimeout=8 {ssh_target(s)} '
                   "'screen -wipe 2>/dev/null; screen -ls 2>/dev/null | grep -c fluxgen'", 15)
     return ok and '1' in out
 
@@ -324,14 +411,14 @@ def upload_prompts(job: dict, server=None) -> bool:
     prompts_path.write_text(json.dumps({'notes': notes}, ensure_ascii=False), encoding='utf-8')
     local_p = str(prompts_path).replace('\\', '/')
     local_g = str(LOCAL_GEN).replace('\\', '/')
-    ok1, _ = run(f'scp {local_p} {s["alias"]}:{s["remote_base"]}/prompts.json', 30)
-    ok2, _ = run(f'scp {local_g} {s["alias"]}:{s["remote_base"]}/gen_flux.py', 30)
+    ok1, _ = run(f'scp {local_p} {scp_target(s)}:{s["remote_base"]}/prompts.json', 30)
+    ok2, _ = run(f'scp {local_g} {scp_target(s)}:{s["remote_base"]}/gen_flux.py', 30)
     return ok1 and ok2
 
 
 def start_generation(server=None) -> bool:
     s = _get_server(server)
-    ok, out = run(f'ssh -o ConnectTimeout=15 {s["alias"]} '
+    ok, out = run(f'ssh -o ConnectTimeout=15 {ssh_target(s)} '
                   f'bash {s["remote_base"]}/start_gen.sh', 60)
     log.info(out)
     return ok
@@ -343,13 +430,13 @@ def wait_generation(n_images: int, server=None, timeout_sec=3600) -> bool:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         time.sleep(20)
-        ok, out = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+        ok, out = run(f'ssh -o ConnectTimeout=8 {ssh_target(s)} '
                       f'find {s["remote_base"]}/out -name "*.png" | wc -l', 15)
         if ok and out.strip().isdigit() and int(out.strip()) >= n_images:
             log.info(f'✅ 生成完成: {out.strip()}/{n_images} 张 ({s["name"]})')
             return True
         # 检查是否报错
-        ok2, err = run(f'ssh -o ConnectTimeout=8 {s["alias"]} '
+        ok2, err = run(f'ssh -o ConnectTimeout=8 {ssh_target(s)} '
                        f'tail -5 {s["remote_base"]}/gen.log 2>/dev/null | tr "\\r" "\\n" | grep -E "❌|Error|Traceback" | tail -1', 15)
         if ok2 and err:
             log.warning(f'⚠️  生成疑似报错: {err[:120]}')
@@ -364,7 +451,7 @@ def pull_images(job: dict, server=None) -> str:
     dest = OBSIDIAN_IMAGES / batch
     dest.mkdir(parents=True, exist_ok=True)
     dest_posix = str(dest).replace('\\', '/')
-    ok, _ = run(f'scp -r {s["alias"]}:{s["remote_base"]}/out/. "{dest_posix}" 2>/dev/null', 120)
+    ok, _ = run(f'scp -r {scp_target(s)}:{s["remote_base"]}/out/. "{dest_posix}" 2>/dev/null', 120)
     # gen_flux 输出在 out/00_<title>/xxx.png，需上移一层到 batch/
     moved = 0
     for sub in dest.iterdir():
@@ -454,7 +541,7 @@ def probe_full(server=None, force: bool = False) -> dict:
          'gpu_ok': False, 'gpu': '', 'model_ok': False,
          'resident': False, 'model_loaded': False, 'status': '',
          'health': None, 'error': ''}
-    ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {alias} '
+    ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {ssh_target(s)} '
                   f'{shlex.quote(remote)}', 20)
     if not ok:
         reason = (out or '').strip()[:160]

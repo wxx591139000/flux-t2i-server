@@ -1,0 +1,80 @@
+{
+  "_readme": [
+    "FLUX 服务器注册表 —— 候选机的**唯一事实来源**（source of truth）。进 git，可评审，换人/换 AI 也能一眼看到有哪些机器。",
+    "",
+    "为什么要有这个文件（2026-09-20 事故）：",
+    "  以前候选机只从 ~/.ssh/config 里匹配 autodl-flux* 的别名「自动发现」。但 ~/.ssh/config 在仓库外、",
+    "  不在版本控制里。克隆实例到新服务器后忘了加 Host 条目 → manager 永远看不见那台机器 →",
+    "  任务只能进 waiting 池死等（实测：站点提交的任务卡了 8 分钟无人处理）。",
+    "",
+    "现在：机器登记在这里，且推荐写 host/port/user 走**直连**（不再依赖 ~/.ssh/config）。",
+    "",
+    "字段说明：",
+    "  name            必填，唯一（会写进 jobs.server，排查时看得到是哪台出的图）",
+    "  host/port/user  直连三件套（推荐）。给了 host 就用 -i/-p/-o 直连，不再查 ~/.ssh/config",
+    "  alias           可选，回退方案：不写 host 时才用它（`ssh <alias>`，依赖 ~/.ssh/config）",
+    "  identity_file   私钥路径（支持 ~）。留空则用 ssh 默认密钥",
+    "  remote_base     远端工作目录（放 flux_resident_server.py / resident_out）",
+    "  remote_model    远端模型目录（必须含 DOWNLOAD_DONE 标记）",
+    "  offload         none|model|sequential。32G 卡跑 FLUX.1-dev **必须 model**（none 必 OOM，实测过）",
+    "  note            备注（什么时候建的、从哪克隆的、有什么坑）",
+    "",
+    "优先级：环境变量 FLUX_SERVERS_JSON（完全接管，调试用） > 本文件 > 代码内 _DEFAULT_SERVERS + ssh config 自动发现",
+    "",
+    "加机器的最短路径：AutoDL 控制台开机 → 复制 SSH 命令里的 host/port → 在这里加一条 →",
+    "跑 `python manager/flux_resident_client.py servers` 看它是否 可达✓ 带卡✓ 模型✓（不需要改任何代码）",
+    "",
+    "  enabled: false → 机器已释放/停用，保留记录做留痕但**不参与探活**（否则每次轮询都要白等 SSH 超时）"
+  ],
+  "servers": [
+    {
+      "name": "flux1",
+      "host": "connect.westd.seetacloud.com",
+      "port": 53806,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/autodl-tmp/models/FLUX.1-dev",
+      "offload": "model",
+      "supports_edit": false,
+      "note": "原始 FLUX 服务器。32G 卡（RTX 4080 SUPER 32760 MiB），offload 必须 model。FLUX.1-dev 的 FluxPipeline 没有 image 参数 → **跑不了图生图/编辑**"
+    },
+    {
+      "name": "flux2",
+      "host": "connect.weste.seetacloud.com",
+      "port": 23192,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/autodl-tmp/models/FLUX.1-dev",
+      "offload": "model",
+      "supports_edit": false,
+      "note": "2026-09 新克隆，接 flux 任务中心。32G 卡。同 flux1：只支持文生图，不支持图生图"
+    },
+    {
+      "name": "flux3",
+      "host": "connect.westc.seetacloud.com",
+      "port": 17624,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/autodl-tmp/models/FLUX.1-dev",
+      "offload": "model",
+      "supports_edit": false,
+      "note": "2026-09-16 从 flux2 克隆（当日 flux1/flux2 无卡）。32G 卡。同 flux1：只支持文生图，不支持图生图"
+    },
+    {
+      "name": "flux4",
+      "host": "connect.westc.seetacloud.com",
+      "port": 26081,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/klein-models/FLUX.2-klein-4B",
+      "offload": "none",
+      "supports_edit": true,
+      "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。⚠️ 2026-09-20 用户已释放，地址作废 —— 后续重新克隆的实例请**新开一条**并填新 host:port。它是当时唯一能跑图生图的机器：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1/2/3 上会直接报「当前模型不支持图生图」。新实例若装的是 klein，记得 supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）",
+      "enabled": false
+    }
+  ]
+}

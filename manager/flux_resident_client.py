@@ -215,7 +215,8 @@ class SshCurlTransport:
 
     def _ssh(self, remote_cmd: str, timeout: int) -> str:
         ok, out = fsm.run(
-            f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {self.alias} {shlex.quote(remote_cmd)}',
+            f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} '
+            f'{fsm.ssh_target(self.server)} {shlex.quote(remote_cmd)}',
             timeout)
         if not ok:
             raise TransportError(f'SSH 调用失败（{self.alias}）: {out[:200]}', kind='server_down')
@@ -245,7 +246,8 @@ class SshCurlTransport:
         """SSH：常驻服务已把 PNG 落盘，直接 scp 拉回（沿用项目原有模式）。"""
         dest.parent.mkdir(parents=True, exist_ok=True)
         remote = f'{server["remote_base"]}/resident_out/{job_id}.png'
-        ok, out = fsm.run(f'scp {self.alias}:{remote} "{str(dest).replace(chr(92), "/")}"', 180)
+        ok, out = fsm.run(f'scp {fsm.scp_target(self.server)}:{remote} '
+                          f'"{str(dest).replace(chr(92), "/")}"', 180)
         if not ok or not dest.exists():
             raise TransportError(f'拉回图片失败: {out[:200]}', kind='server_down')
         return dest
@@ -300,7 +302,7 @@ def probe_all(force: bool = False) -> list:
     return fsm.probe_all(force=force)
 
 
-def _pick_from(cands: list) -> tuple:
+def _pick_from(cands: list, need_edit: bool = False) -> tuple:
     """从 [(server, probe)] 里按分级规则挑一台。返回 (server|None, probe|None)。
 
     抽出来是为了让 CLI 的 `servers` 视图和生产选机走**同一套**判断 ——
@@ -308,9 +310,21 @@ def _pick_from(cands: list) -> tuple:
 
     分级（同 find_available_server 的文档）：
       1 常驻在跑+模型已加载 → 2 可达+有卡+模型就绪 → 3 可达+有卡 → 4 可达(含无卡)
+
+    need_edit=True → **先按能力过滤**：只留注册表里 supports_edit 的机器。
+    为什么必须有这道闸（2026-09-20）：图生图要 pipeline 的 __call__ 接受 `image`，
+    而 FLUX.1-dev 的 FluxPipeline 没有这个参数，edit 任务在 dev 机上必然报
+    「当前模型不支持图生图」。全平台只有装了 klein 的机器能跑编辑。
+    字段缺失时不过滤（向后兼容老部署）。
     """
     if not cands:
         return None, None
+    if need_edit:
+        capable = [(s, p) for s, p in cands if s.get('supports_edit', True)]
+        if capable:
+            cands = capable
+        else:
+            logger.warning('🟡 没有任何机器声明 supports_edit，本次不按能力过滤')
 
     def pick(pred):
         for s, p in cands:
@@ -341,8 +355,10 @@ def _pick_from(cands: list) -> tuple:
     return None, cands[0][1]
 
 
-def find_available_server(force: bool = False) -> tuple:
+def find_available_server(force: bool = False, need_edit: bool = False) -> tuple:
     """挑一台「当前最该用」的服务器。返回 (server, probe)；全不可用返回 (None, probe)。
+
+    need_edit=True：只在支持图生图（supports_edit）的机器里挑，见 _pick_from。
 
     分级选择（这是「换了机器 / 克隆到新机后自动接上」的核心）：
 
@@ -356,7 +372,7 @@ def find_available_server(force: bool = False) -> tuple:
     「可达但无卡（需到 AutoDL 控制台切【带卡模式】）」这条很有用的报错。
     这里把无卡机器降到最低优先级，但**不剔除**，正是为了不丢这条诊断信息。
     """
-    return _pick_from(probe_all(force=force))
+    return _pick_from(probe_all(force=force), need_edit=need_edit)
 
 
 def any_ready() -> bool:
@@ -376,7 +392,7 @@ def any_usable() -> bool:
 
 # ══════════════════ 生命周期：幂等拉起常驻服务 ══════════════════
 def tail_log(server: dict, lines: int = 30) -> str:
-    ok, out = fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {server["alias"]} '
+    ok, out = fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {fsm.ssh_target(server)} '
                       f'"tail -{lines} {server["remote_base"]}/{RESIDENT_LOG} 2>/dev/null"', 25)
     return out if ok and out else '(日志为空或读取失败)'
 
@@ -386,10 +402,10 @@ def upload_scripts(server: dict) -> tuple:
     for local in (LOCAL_SERVER_PY, LOCAL_START_SH):
         if not local.exists():
             return False, f'本地缺少 {local}'
-    alias, rb = server['alias'], server['remote_base']
-    fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {alias} "mkdir -p {rb}"', 20)
+    tgt, stgt, rb = fsm.ssh_target(server), fsm.scp_target(server), server['remote_base']
+    fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {tgt} "mkdir -p {rb}"', 20)
     for local in (LOCAL_SERVER_PY, LOCAL_START_SH):
-        ok, out = fsm.run(f'scp "{str(local).replace(chr(92), "/")}" {alias}:{rb}/', 60)
+        ok, out = fsm.run(f'scp "{str(local).replace(chr(92), "/")}" {stgt}:{rb}/', 60)
         if not ok:
             return False, f'上传 {local.name} 失败: {out[:160]}'
     return True, 'ok'
@@ -464,7 +480,8 @@ def ensure_resident(server: dict, p: dict = None, wait_ready: bool = True) -> di
         env_parts.append(f'FLUX_RESIDENT_TOKEN={shlex.quote(TOKEN)}')
     ssh_cmd = (f'cd {shlex.quote(remote_base)} && ' + ' '.join(env_parts)
                + f' bash start_resident.sh {flag}').strip()
-    ok, out = fsm.run(f'ssh -o ConnectTimeout=15 {server["alias"]} {shlex.quote(ssh_cmd)}', 120)
+    ok, out = fsm.run(f'ssh -o ConnectTimeout=15 {fsm.ssh_target(server)} '
+                      f'{shlex.quote(ssh_cmd)}', 120)
     logger.info(f'拉起常驻服务({server["name"]}): {out[:400]}')
     if not ok:
         return {'ok': False, 'kind': 'server_down',
@@ -614,7 +631,7 @@ def main():
                    if fsm.FLUX_SERVER_DISCOVER else '自动发现关')
             print(f'候选机 {len(cands)} 台 · {src} · 连线方式='
                   f'{"直连 " + DIRECT_BASE if DIRECT_BASE else "SSH"}')
-            print(f'  {"":3s}{"NAME":11s}{"ALIAS":19s}{"可达":5s}{"带卡":5s}'
+            print(f'  {"":3s}{"NAME":9s}{"连接目标":34s}{"来源":7s}{"可达":5s}{"带卡":5s}'
                   f'{"模型":5s}{"常驻":5s}{"已加载":7s}备注')
             for s, p in cands:
                 mark = '▶' if s['alias'] == chosen_alias else ' '
@@ -625,7 +642,10 @@ def main():
                     note = '可直接出图'
                 elif p['reachable'] and not p['gpu_ok']:
                     note = note or '无卡（需切带卡模式）'
-                print(f'  {mark:3s}{s["name"]:11s}{s["alias"]:19s}'
+                src = '注册表' if s.get('from_registry') else 'ssh配置'
+                tgt = (f'{s.get("host")}:{s.get("port")}' if s.get('host')
+                       else (s.get('alias') or ''))
+                print(f'  {mark:3s}{s["name"]:9s}{tgt[:33]:34s}{src:7s}'
                       f'{"✓" if p["reachable"] else "✗":5s}'
                       f'{"✓" if p["gpu_ok"] else "✗":5s}'
                       f'{"✓" if p["model_ok"] else "✗":5s}'
