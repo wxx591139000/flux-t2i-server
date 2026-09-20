@@ -108,6 +108,34 @@ def t_targets():
     p = {'name': 'z', 'host': 'h2', 'port': 22, 'user': 'ubuntu'}
     check('无 identity_file 时不带 -i', '-i' not in fsm.ssh_target(p), fsm.ssh_target(p))
 
+    # ⚠️ scp 的 getopt 遇到第一个非选项参数就**停止解析选项**。
+    #    所以上传（源文件在前）必须走 scp_upload_cmd()，让选项整体排在文件名之前；
+    #    写成 `scp "<file>" <opts> user@host:` 时 -i / accept-new / BatchMode 全失效
+    #    → "Host key verification failed"（2026-09-20 flux5 上传常驻脚本必失败）。
+    up = fsm.scp_upload_cmd(s, 'E:/repo/server/flux_resident_server.py', '/root/autodl-tmp/flux-t2i')
+    toks = up.split()
+    check('上传命令以 scp 开头', toks[0] == 'scp', up)
+    # 跳掉「带参数的选项」再找第一个操作数：-o / -i / -P / -p 各吃掉后面一个 token
+    i, first_op = 1, None            # 跳过 'scp' 本身
+    while i < len(toks):
+        if toks[i] in ('-o', '-i', '-P', '-p'):
+            i += 2
+            continue
+        if toks[i].startswith('-'):
+            i += 1
+            continue
+        first_op = i
+        break
+    tail = ' '.join(toks[first_op:]) if first_op is not None else ''
+    check('上传时选项全在文件名之前（scp 才会真的解析它们）',
+          first_op is not None and '-o ' not in tail and '-P ' not in tail
+          and '-i ' not in tail, up)
+    check('上传命令的目标带 user@host 且选项里没有重复 endpoint',
+          'root@h.example.com:/root/autodl-tmp/flux-t2i/' in up
+          and up.count('root@h.example.com') == 1, up)
+    check('scp_endpoint 只返回 user@host（不含选项）',
+          fsm.scp_endpoint(s) == 'root@h.example.com', fsm.scp_endpoint(s))
+
 
 def _cand(name, supports_edit, **probe):
     p = {'name': name, 'reachable': False, 'gpu_ok': False, 'model_ok': False,
@@ -149,12 +177,16 @@ def t_source_level():
           f'{src.count("self._drop_ref(job_id)")} 处')
 
     tree = ast.parse(src)
-    has_persist = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == 'write_bytes' and 'ref_dir' in ast.dump(node.func.value):
-                has_persist = True
-    check('_put_ref 确实写盘（AST 断言）', has_persist)
+    # 改成「看 _put_ref 整个函数体」而不是匹配 `self._ref_dir(...).write_bytes(...)`
+    # 这种具体写法 —— 后者会因为一次无害的重构（先赋给局部变量）就假红。
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == '_put_ref'), None)
+    body = ast.unparse(fn) if fn else ''
+    check('_put_ref 确实写盘（AST 断言）',
+          '_ref_dir' in body and 'write_bytes' in body, body[:120])
+    # ⚠️ 真正的坑：WEB_OUT/<job_id>/ 此时还不存在 → write_bytes 直接 FileNotFoundError，
+    #    被 except 吞成一条 warning →「重启不丢参考图」从来没兑现过（2026-09-20 发现）。
+    check('_put_ref 写盘前先 mkdir（父目录不存在会静默丢图）', 'mkdir' in body, body[:160])
     check('WAIT_MAX_SEC 默认 4 小时', 'str(4 * 3600)' in src or '14400' in src)
 
 

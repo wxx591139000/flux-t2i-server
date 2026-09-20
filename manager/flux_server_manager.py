@@ -121,16 +121,43 @@ def load_registry(path=None) -> list:
     return out
 
 
-def _ssh_target_from(host: str, port, user: str, ident: str) -> str:
+def _target_parts(server: dict, port_flag: str) -> tuple:
+    """返回 (选项片段, 远端前缀 `user@host`)。
+
+    ⚠️ 为什么要拆成两部分（2026-09-20 血的教训）：scp 的 getopt **遇到第一个非选项
+    参数就停止解析选项**。所以 `scp "<本地文件>" -o ... -P 27602 user@host:/path`
+    这种「源文件在最前」的写法里，后面的 `-i / -o` **全都不生效** ——
+    表现为 "Host key verification failed"（accept-new 没生效）或
+    "Permission denied"（-i 没生效），而同一个 host 用 ssh 连却完全正常，
+    极易被误判成网络 / 跳转机问题（flux5 上传常驻脚本必失败，查了两轮）。
+    正确写法只能是：选项全部排在文件名之前 —— `scp <opts> <src> user@host:<path>`。
+    所以调用方需要能分别拿到 opts 与 user@host，用 `scp_endpoint()` 拼目标。
+    """
+    host = (server.get('host') or '').strip()
+    if not host:
+        return '', (server.get('alias') or server.get('name') or '')
+    ident = (server.get('identity_file') or '').strip()
     parts = []
-    ident = (ident or '').strip()
     if ident:
         # 命令由 bash -lc 执行，`~` 会展开；只有路径含空格才加引号
         # （ssh.exe 是原生程序，不解析单引号，无谓加引号反而会连不上）
         parts.append(f'-o IdentitiesOnly=yes -i {ident if " " not in ident else chr(34) + ident + chr(34)}')
-    parts.append(f'-p {int(port) if str(port).strip().isdigit() else 22}')
-    parts.append(f'{user or "root"}@{host}')
-    return ' '.join(parts)
+    # ⚠️ 新克隆的机器**不在 known_hosts 里**：不开 accept-new 首次连接必然
+    #    "Host key verification failed"；更糟的是不开 BatchMode 时它会卡在
+    #    "Are you sure you want to continue connecting" 的**交互提示**上，
+    #    非 tty 环境下一直等到超时，报错就变成没头没尾的 "TIMEOUT"（2026-09-20 flux5 实测：
+    #    上传脚本报 host key 失败，拉图直接超时 180s，看着像网络问题，其实是首次信任）。
+    #    用 accept-new（首次自动记录、之后照常校验），不是 yes（那样等于放弃校验）。
+    parts.append('-o StrictHostKeyChecking=accept-new')
+    parts.append('-o BatchMode=yes')
+    port = server.get('port') or 22
+    parts.append(f'{port_flag} {int(port) if str(port).strip().isdigit() else 22}')
+    return ' '.join(parts), f'{server.get("user") or "root"}@{host}'
+
+
+def _join_target(server: dict, port_flag: str) -> str:
+    opts, ep = _target_parts(server, port_flag)
+    return f'{opts} {ep}'.strip()
 
 
 def ssh_target(server: dict) -> str:
@@ -139,21 +166,32 @@ def ssh_target(server: dict) -> str:
     有 host → 直连 `-i <key> -p <port> <user>@<host>`（不查 ~/.ssh/config）
     无 host → 回退旧行为 `<alias>`
     """
-    host = (server.get('host') or '').strip()
-    if not host:
-        return server.get('alias') or server.get('name') or ''
-    return _ssh_target_from(host, server.get('port') or 22,
-                            server.get('user') or 'root', server.get('identity_file') or '')
+    return _join_target(server, '-p')
 
 
 def scp_target(server: dict) -> str:
-    """同 ssh_target，但 scp 的端口是**大写 -P**（scp 的 -p 是「保留时间戳」，语义完全不同）。"""
-    host = (server.get('host') or '').strip()
-    if not host:
-        return server.get('alias') or server.get('name') or ''
-    return _ssh_target_from(host, server.get('port') or 22,
-                            server.get('user') or 'root',
-                            server.get('identity_file') or '').replace(' -p ', ' -P ', 1)
+    """同 ssh_target，但 scp 的端口是**大写 -P**（scp 的 -p 是「保留时间戳」，语义完全不同）。
+
+    只适用于**选项后面紧跟远端路径**的写法（`scp <opts> user@host:src <本地dest>`）。
+    若要「源文件在前」（上传），必须用 `scp_endpoint()`，见 _target_parts 的注释。
+    """
+    return _join_target(server, '-P')
+
+
+def scp_endpoint(server: dict) -> str:
+    """scp 的**远端前缀** `user@host`（不含任何选项、不带冒号）。
+
+    上传时用：`scp {scp_target 的选项部分} "<本地文件>" {scp_endpoint}:<远端路径>/`
+    —— 但本模块没单独暴露选项部分，上传统一用 helper `scp_upload_cmd()`。
+    """
+    return _target_parts(server, '-P')[1]
+
+
+def scp_upload_cmd(server: dict, local_path, remote_dir: str) -> str:
+    """构造**上传**用的 scp 命令：选项必须排在文件名之前（见 _target_parts 注释）。"""
+    opts, ep = _target_parts(server, '-P')
+    local = str(local_path).replace('\\', '/')
+    return f'scp {opts} "{local}" {ep}:{remote_dir}/'
 
 
 def ssh_config_aliases() -> list:
@@ -379,13 +417,23 @@ def find_bash():
     return None
 
 
-def run(cmd, timeout=30):
+def run(cmd, timeout=30, stdin_data=None):
     """执行命令。用 bash -lc（避免 Windows cmd 解析管道/引号）+ UTF-8 解码（避免 GBK 解码中文失败）。
 
     与旧版的差别：
       1. bash 走 find_bash() 定位，不再假定它在 PATH 里；
       2. 失败时把 **stderr** 带回来（旧版只取 stdout，ssh 的报错全在 stderr，
          于是所有失败都退化成一句'SSH 不通'，真因不可见）。
+
+    `stdin_data`（2026-09-20 加）—— 需要把大 payload 喂给命令 stdin 时用。
+    ⚠️ 为什么必须有这个参数：Windows 的 CreateProcess 命令行上限约 32K，
+    超了直接 `FileNotFoundError: [WinError 206] 文件名或扩展名太长`。
+    图生图的参考图 base64 动辄 1~2MB，内联进 `echo <b64> | ...` 必然爆，
+    而且**报的是 FileNotFoundError**，看着像文件丢了、其实是大 payload 问题
+    （2026-09-20 站点任务 ceff1b2c 卡死的真因）。payload 只能走 stdin。
+
+    不给 stdin_data 时也显式传空串：把 stdin 关掉，避免 ssh 继承父进程 stdin
+    后在无控制台的服务环境里空等。
     """
     bash = find_bash()
     if not bash:
@@ -393,7 +441,8 @@ def run(cmd, timeout=30):
                        '（装 Git for Windows 或把 <Git>\\bin 加入 PATH）')
     try:
         r = subprocess.run([bash, '-lc', cmd], capture_output=True, text=True,
-                           encoding='utf-8', errors='replace', timeout=timeout)
+                           encoding='utf-8', errors='replace', timeout=timeout,
+                           input=stdin_data if stdin_data is not None else '')
         if r.returncode != 0:
             err = (r.stderr or r.stdout or '').strip()
             return False, err[:400] or f'退出码 {r.returncode}'
@@ -442,10 +491,11 @@ def upload_prompts(job: dict, server=None) -> bool:
     }]
     prompts_path = BASE_DIR / 'manager' / 'tmp_prompts.json'
     prompts_path.write_text(json.dumps({'notes': notes}, ensure_ascii=False), encoding='utf-8')
-    local_p = str(prompts_path).replace('\\', '/')
-    local_g = str(LOCAL_GEN).replace('\\', '/')
-    ok1, _ = run(f'scp {local_p} {scp_target(s)}:{s["remote_base"]}/prompts.json', 30)
-    ok2, _ = run(f'scp {local_g} {scp_target(s)}:{s["remote_base"]}/gen_flux.py', 30)
+    opts, ep = _target_parts(s, '-P')
+    ok1, _ = run(f'scp {opts} "{str(prompts_path).replace(chr(92), "/")}" '
+                 f'{ep}:{s["remote_base"]}/prompts.json', 30)
+    ok2, _ = run(f'scp {opts} "{str(LOCAL_GEN).replace(chr(92), "/")}" '
+                 f'{ep}:{s["remote_base"]}/gen_flux.py', 30)
     return ok1 and ok2
 
 

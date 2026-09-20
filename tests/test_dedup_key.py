@@ -247,6 +247,46 @@ depth, waiting, inflight = s6._pq.qsize(), len(s6._waiting), len(s6._inflight)
 hint = 'server_down' if waiting else ('busy' if (depth or inflight) else 'idle')
 ok('C10 全部跑完后 backend_hint = idle（bug A 这里恒 busy）', hint == 'idle', hint)
 
+# ═══ C11 · waiting 恢复：sqlite3.Row 没有 .get()，恢复逻辑不许炸（bug D）═══
+# 事故（2026-09-20，站点任务 ceff1b2c 卡死 49 分钟且会永远卡下去）：
+#   `_recover_waiting_tasks` 里 `job_get()` 返回 sqlite3.Row，旧代码 `job.get('created_at')`
+#   每次必抛 AttributeError，被 health_loop 的 except 吞掉 → 47 分钟一次恢复都没做；
+#   更糟的是异常发生在 `self._waiting.pop()` **之后** → 任务被弹出池子却没入队也没判死
+#   → 内存里彻底丢失，DB 还显示 waiting → 永远卡住、连 4 小时超时判死都等不到。
+# 替身 StubDB 返回**真实 sqlite3.Row**（不是 dict），旧代码在这里必红。
+s7 = new_sched()
+s7._generate = lambda job: (False, '[SERVER_DOWN] 机器down模拟')
+r7 = s7.submit('u7', 'a rainy day', seed=5, width=512, height=512)
+run_process(s7, r7['job_id'])
+_in_waiting = r7['job_id'] in s7._waiting
+recover_err = None
+try:
+    s7._recover_waiting_tasks()          # 旧代码：AttributeError（Row.get 不存在）
+except Exception as e:
+    recover_err = f'{type(e).__name__}: {e}'
+# 注意：run_process 直接调 _process、不从 _pq 取任务，submit 残留 1 个队列项；
+# recover 成功会再 put 1 个 → qsize 应为 2（1 残留 + 1 新入队）。
+job7 = dict(s7.db.job_get(r7['job_id']))
+ok('C11 服务器恢复后 waiting 任务能重新入队（Row.get 坑，旧代码 AttributeError）',
+   recover_err is None and job7['status'] == 'queued' and s7._pq.qsize() == 2,
+   f'err={recover_err} status={job7["status"]} qsize={s7._pq.qsize()}')
+
+# ═══ C12 · 等待超时要能判死退款，不能无限等 ═══
+fq.WAIT_MAX_SEC = 60                    # 测试里把 4 小时上限压到 60s
+s8 = new_sched()
+s8._generate = lambda job: (False, '[SERVER_DOWN] 机器一直down')
+r8 = s8.submit('u8', 'a foggy morning', seed=6, width=512, height=512)
+run_process(s8, r8['job_id'])
+# 直接把 created_at 拨到 2 小时前 → waited > 60s → 应判死 + 退款
+s8.db.job_update(r8['job_id'], created_at=int(time.time()) - 7200)
+s8._recover_waiting_tasks()
+job8 = dict(s8.db.job_get(r8['job_id']))
+fq.WAIT_MAX_SEC = int(os.environ.get('FLUX_WAIT_MAX_SEC', str(4 * 3600)))   # 还原
+ok('C12 等待超上限 → 判 failed 并退款（不无限等）',
+   job8['status'] == 'failed' and 'WAIT_TIMEOUT' in (job8['error'] or '')
+   and s8._pq.qsize() == 1 and len(s8._waiting) == 0,
+   f'status={job8["status"]} err={(job8["error"] or "")[:60]}')
+
 print()
 print(f'== dedup_key 回归门: {RESULTS.count(True)}/{len(RESULTS)} 通过 ==')
 sys.exit(0 if all(RESULTS) else 1)

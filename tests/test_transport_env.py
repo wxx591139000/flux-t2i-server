@@ -22,7 +22,16 @@
      → 必然 "CUDA out of memory, total capacity 31.48 GiB"，每张图都失败。
      教训：**默认值要选「一定能跑」，不是「最快」**；想追速度的机器自己声明。
 
-这两条都是"知识型约束"，光改一次代码不能防止下次被改回去 —— 所以固化成断言，
+  C. 图生图（/edit）的 body 含参考图 base64，旧写法把它**内联进 ssh 命令行**
+     （`echo <b64> | base64 -d | curl ...`）。Windows 的 CreateProcess 命令行
+     上限约 32K → `FileNotFoundError: [WinError 206] 文件名或扩展名太长`。
+     报的是 FileNotFoundError，看着像"文件丢了"，实际是"参数太长"；
+     上层把它归类成 SERVER_DOWN 一直重试 → 站点任务永远卡在「生成中，已等待」
+     （2026-09-20 站点任务 ceff1b2c 卡死的真因）。
+     修法：body 走 **ssh 的 stdin**（curl `--data-binary @-` 从 stdin 读）。
+     教训：**大 payload 永远不要进 argv**。
+
+这三条都是"知识型约束"，光改一次代码不能防止下次被改回去 —— 所以固化成断言，
 改动 flux_server_manager.py / flux_resident_client.py 后跑一遍，几秒钟出结果。
 
 跑法
@@ -45,6 +54,7 @@ PY = sys.executable
 PRELUDE = (
     'import os, sys\n'
     f'sys.path.insert(0, r"{BASE}")\n'
+    f'BASE = r"{BASE}"\n'
 )
 
 CASES = []
@@ -199,6 +209,100 @@ except fr.TransportError as e:
     print('PASS|', 'OOM 立即失败，不干等 30s')
 else:
     raise AssertionError('模型加载报错时竟然没抛异常（会死等到超时）')
+'''
+
+
+# ── C 组：图生图大 payload 走 stdin，不进 argv ──────────────────────────
+
+@case('C1', '2MB 参考图提交时，ssh 命令行保持很短（WinError 206 防回归）')
+def _c1():
+    return r'''
+from manager import flux_resident_client as fr
+cap = {}
+
+
+def fake_run(cmd, timeout=30, stdin_data=None):
+    cap['cmd'] = cmd
+    cap['stdin'] = stdin_data
+    return True, '{"status":"done","job_id":"x"}'
+
+
+fr.fsm.run = fake_run
+big = 'A' * (2 * 1024 * 1024)          # 2MB base64，远超 Windows 32K 上限
+t = fr.SshCurlTransport({'name': 't', 'alias': 't'})
+t.post_json('/edit', {'prompt': 'x', 'image': big}, timeout=60)
+cmd = cap['cmd']
+assert len(cmd) < 4000, (
+    f'命令行 {len(cmd)} 字符 —— 大 payload 又回到 argv 了，'
+    f'Windows 上必然 WinError 206（图生图任务会永久卡在「生成中」）')
+assert 'A' * 200 not in cmd, 'body 出现在命令行里'
+print('PASS|', f'命令行仅 {len(cmd)} 字符，与 body 大小无关')
+'''
+
+
+@case('C2', 'body 确实走 stdin_data 传给 ssh（curl 用 --data-binary @- 读它）')
+def _c2():
+    return r'''
+import json
+from manager import flux_resident_client as fr
+cap = {}
+fr.fsm.run = lambda cmd, timeout=30, stdin_data=None: (
+    cap.setdefault('cmd', cmd), cap.setdefault('stdin', stdin_data),
+    (True, '{"status":"done","job_id":"x"}'))[2]
+big = 'B' * (300 * 1024)
+t = fr.SshCurlTransport({'name': 't', 'alias': 't'})
+t.post_json('/edit', {'prompt': '中文提示词', 'image': big}, timeout=60)
+assert cap.get('stdin'), 'stdin 是空的 —— body 没走 stdin'
+assert big in cap['stdin'], 'body 内容不在 stdin 里'
+assert '中文提示词' in cap['stdin'], '中文被转义/丢失'
+assert '@-' in cap['cmd'], f'curl 不从 stdin 读 body 了: {cap["cmd"][:200]}'
+print('PASS|', f'stdin {len(cap["stdin"])} 字符，含中文与完整 body')
+'''
+
+
+@case('C3', 'fsm.run 真的把 stdin_data 喂给命令（端到端走一次 bash）')
+def _c3():
+    return r'''
+from manager import flux_server_manager as fsm
+ok, out = fsm.run('cat', stdin_data='hello-stdin-payload')
+assert ok, f'run() 失败: {out}'
+assert 'hello-stdin-payload' in out, f'stdin 没喂进去: {out!r}'
+# 不传 stdin 时也不该卡住（显式关掉 stdin，不继承父进程）
+ok2, out2 = fsm.run('echo no-stdin-ok')
+assert ok2 and 'no-stdin-ok' in out2, f'不传 stdin 时异常: {out2!r}'
+print('PASS|', 'stdin 透传正常，且缺省时立即关闭不空等')
+'''
+
+
+@case('C4', '源码里不再有「base64 内联进命令行」的旧写法')
+def _c4():
+    # ⚠️ 必须剥掉 docstring 再查：修 bug 时留下的注释/文档里**会引用旧写法**
+    #    （`echo <b64> | base64 -d | curl`），不剥就会误报，跟 watchdog 那个
+    #    「判据不含旧链路关键字」的假红是同一类坑。
+    return r'''
+import ast
+from pathlib import Path
+
+
+def code_only(path):
+    tree = ast.parse(Path(path).read_text(encoding='utf-8'))
+    for node in ast.walk(tree):
+        body = getattr(node, 'body', None)
+        if isinstance(body, list) and body:
+            first = body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                body[0] = ast.Pass()
+    return ast.unparse(tree)
+
+
+code = code_only(Path(BASE) / 'manager' / 'flux_resident_client.py')
+assert 'base64 -d' not in code, '_curl_cmd 又把 body 内联成 echo <b64> | base64 -d 了'
+assert 'body_b64' not in code, '内联 payload 的参数回来了'
+fsm_code = code_only(Path(BASE) / 'manager' / 'flux_server_manager.py')
+assert 'input=stdin_data' in fsm_code or 'stdin_data' in fsm_code, \
+    'fsm.run 不再把 stdin_data 交给 subprocess'
+print('PASS|', '无内联 payload；fsm.run 已接 stdin')
 '''
 
 

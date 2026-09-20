@@ -229,7 +229,13 @@ class FluxQueueScheduler:
         # 重启 / 被淘汰后从磁盘读回，编辑任务不会因为 infra 抖动白扣一张配额。
         try:
             raw = base64.b64decode(_strip_data_uri(ref_image))
-            self._ref_dir(job_id).write_bytes(raw)
+            p = self._ref_dir(job_id)
+            # ⚠️ 必须 mkdir：WEB_OUT/<job_id>/ 此时**还不存在**（目录是生成阶段才建的）。
+            # 少了这一行就是 FileNotFoundError，被下面 except 吞成一条 warning ——
+            # 于是「重启不丢参考图」的承诺**从来没真正兑现过**（2026-09-20 查卡死任务
+            # ceff1b2c 时才发现：web_out/ceff1b2c116b4c95/ 整个目录都不存在）。
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(raw)
         except Exception as e:                       # noqa: BLE001 落盘失败不该阻断提交
             logger.warning(f'参考图落盘失败（仅内存可用，重启后会失效）: '
                            f'{type(e).__name__}: {e}')
@@ -527,27 +533,47 @@ class FluxQueueScheduler:
         期间 SSH 先 refused 再通。按次数判死会把「用户刚点开机」的任务误杀
         （2026-09-20 实测：3 次重试 ≈1 分钟耗尽，机器开了但任务已 failed 并退款）。
         真正生成失败（kind='failed'）不进池，直接终态，不受这里影响。
+
+        ⚠️ 两个曾经的真实事故（2026-09-20，站点任务 ceff1b2c 卡死 49 分钟的叠加根因）：
+          1. `job_get()` 返回 sqlite3.Row，Row **没有 .get()** —— 旧代码
+             `job.get('created_at')` 每次必抛 AttributeError，被 health_loop 的
+             except 吞掉 → **每次恢复窗口都一个任务也恢复不了**；
+          2. 更糟的是异常发生在 `self._waiting.pop()` **之后** → 任务被弹出池子
+             却没入队也没判死 → 内存里彻底丢失，DB 还显示 waiting →
+             **永远卡住、连 4 小时超时判死都等不到**（用户看到「已等待 49 分 53 秒」）。
+        修法：拿到 Row 先 `dict()` 再碰；单个任务异常绝不吞掉 —— 标 failed 退款，
+        让用户能重提，而不是无声消失。
         """
         while self._waiting:
             job_id = self._waiting.pop()
-            job = self.db.job_get(job_id)
-            if not job:
-                continue
-            retry = self._count_retry(job['error'] or '')
-            waited = int(time.time()) - int(job.get('created_at') or time.time())
-            if waited > WAIT_MAX_SEC:
-                self.db.job_update(job_id, status='failed',
-                                   error=f'{job["error"] or ""} [WAIT_TIMEOUT '
-                                         f'{waited}s>{WAIT_MAX_SEC}s]',
-                                   completed_at=int(time.time()))
-                logger.warning(f'⛔ {job_id} 等待服务器 {waited}s 超过上限，标记失败')
-                self._refund_quota(job, f'等待服务器超时({waited//60}分钟)')
-                continue
-            self.db.job_update(job_id, status='queued')
-            self._pq.put((job['priority'], -self._seq, job_id))
-            self._seq += 1
-            logger.info(f'🔄 {job_id} 服务器恢复，重新入队'
-                        f'(第 {retry+1} 次，已等待 {waited//60} 分钟)')
+            try:
+                job = self.db.job_get(job_id)
+                if not job:
+                    continue
+                job = dict(job)          # ⚠️ Row 没有 .get()，先转 dict（坑 1）
+                retry = self._count_retry(job['error'] or '')
+                waited = int(time.time()) - int(job.get('created_at') or time.time())
+                if waited > WAIT_MAX_SEC:
+                    self.db.job_update(job_id, status='failed',
+                                       error=f'{job["error"] or ""} [WAIT_TIMEOUT '
+                                             f'{waited}s>{WAIT_MAX_SEC}s]',
+                                       completed_at=int(time.time()))
+                    logger.warning(f'⛔ {job_id} 等待服务器 {waited}s 超过上限，标记失败')
+                    self._refund_quota(job, f'等待服务器超时({waited//60}分钟)')
+                    continue
+                self.db.job_update(job_id, status='queued')
+                self._pq.put((job['priority'], -self._seq, job_id))
+                self._seq += 1
+                logger.info(f'♻️ {job_id} 服务器恢复，重新入队 (retry {retry+1})')
+            except Exception as e:                        # noqa: BLE001 坑 2：绝不让任务无声消失
+                logger.exception(f'♻️ 恢复 waiting 任务 {job_id} 异常，标记失败并退款')
+                try:
+                    self.db.job_update(job_id, status='failed',
+                                       error=f'[RECOVER_ERROR] {type(e).__name__}: {e}',
+                                       completed_at=int(time.time()))
+                    self._refund_quota(dict(self.db.job_get(job_id) or {}), '恢复异常')
+                except Exception:                         # noqa: BLE001 退款失败也不许再炸
+                    logger.exception(f'♻️ {job_id} 异常收尾再失败')
 
     def _recover_orphaned_jobs(self):
         """重启后把 DB 里残留 queued/generating 的任务重新入队。

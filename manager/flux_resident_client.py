@@ -47,7 +47,6 @@ FLUX 常驻生成服务 —— 调用侧客户端 / 传输层
     FLUX_PROBE_TTL              探测结果缓存秒数（默认 20，0=关闭）
 """
 import argparse
-import base64
 import json
 import logging
 import os
@@ -81,7 +80,13 @@ WAIT_MODEL = int(os.environ.get('FLUX_RESIDENT_WAIT_MODEL', '900'))
 AUTOSTART = os.environ.get('FLUX_RESIDENT_AUTOSTART', '1') == '1'
 FORCE_SYNC = os.environ.get('FLUX_RESIDENT_SYNC') == '1'
 SSH_CONNECT_TIMEOUT = int(os.environ.get('FLUX_RESIDENT_SSH_CONNECT_TIMEOUT', '8'))
-HEALTH_TIMEOUT = int(os.environ.get('FLUX_RESIDENT_HEALTH_TIMEOUT', '10'))
+HEALTH_TIMEOUT = int(os.environ.get('FLUX_RESIDENT_HEALTH_TIMEOUT', '20'))
+# ⚠️ SSH 往返的**固有开销**（建连 + 跳转机转发），不计入 HTTP 超时。
+#    旧代码把 HTTP 超时（10s）直接当 ssh 整体超时传给 subprocess，于是
+#    「ssh 建连慢一点」就被报成 TIMEOUT，而 curl 那边其实还没到 --max-time。
+#    表现为验收脚本在 wait_model_loaded 第一步就崩（2026-09-20 flux5 两次必现）。
+#    HTTP 语义（curl --max-time）与传输语义（subprocess timeout）必须分开算。
+SSH_ROUNDTRIP_OVERHEAD = int(os.environ.get('FLUX_RESIDENT_SSH_OVERHEAD', '20'))
 
 LOCAL_SERVER_PY = BASE_DIR / 'server' / 'flux_resident_server.py'
 LOCAL_START_SH = BASE_DIR / 'server' / 'start_resident.sh'
@@ -187,8 +192,8 @@ class DirectTransport:
 class SshCurlTransport:
     """远端 GPU 机：HTTP 调用都通过 `ssh <alias> curl ...` 执行。
 
-    调用一次 = 一次 ssh 往返。POST 的 JSON 用 base64 内联（base64 字符集
-    只有 A-Za-z0-9+/=，不含任何 shell 元字符），避免临时文件与第二次 scp 往返。
+    调用一次 = 一次 ssh 往返。POST 的 JSON 走 **ssh 的 stdin**（`curl --data-binary @-`
+    从 stdin 读 body），不再内联进命令行 —— 见下面 `_ssh` 的注释。
     """
 
     kind = 'ssh-curl'
@@ -198,8 +203,8 @@ class SshCurlTransport:
         self.alias = server['alias']
         self.token = token
 
-    def _curl_cmd(self, path: str, method: str = 'GET', body_b64: str = None,
-                  timeout: int = 60) -> str:
+    def _curl_cmd(self, path: str, method: str = 'GET', timeout: int = 60) -> str:
+        """只造 curl 命令；body 由 stdin 喂（`@-`），不出现在本方法返回的字符串里。"""
         url = f'http://127.0.0.1:{REMOTE_PORT}{path}'
         parts = ['curl', '-sS', '--max-time', str(max(int(timeout) - 5, 5))]
         if method == 'POST':
@@ -208,16 +213,23 @@ class SshCurlTransport:
         if self.token:
             parts.append(f"-H 'X-Auth-Token: {self.token}'")
         parts.append(shlex.quote(url))
-        cmd = ' '.join(parts)
-        if body_b64:
-            cmd = f'echo {body_b64} | base64 -d | {cmd}'
-        return cmd
+        return ' '.join(parts)
 
-    def _ssh(self, remote_cmd: str, timeout: int) -> str:
+    def _ssh(self, remote_cmd: str, timeout: int, stdin_data: str = None) -> str:
+        """⚠️ 大 payload 只能走 stdin，不能进 argv（2026-09-20）。
+
+        Windows 的 CreateProcess 命令行上限约 32K。图生图的 body 含参考图 base64
+        （8MiB 图 → 约 11MB base64），旧写法 `echo <b64> | base64 -d | curl ...`
+        把它整个塞进 ssh 的命令行 → `FileNotFoundError: [WinError 206]`
+        → 上层归类成 SERVER_DOWN 一直重试 → 站点任务永远卡在「生成中，已等待」。
+        现在命令行只留 curl（约 200 字符），body 由 ssh 转发 stdin 到远端 stdin。
+        """
+        # timeout 是 **HTTP 语义**（curl --max-time = timeout-5）；ssh 建连/转发的固有
+        # 开销另加，否则「ssh 慢一点」会被误报成 TIMEOUT（见 SSH_ROUNDTRIP_OVERHEAD 注释）。
         ok, out = fsm.run(
             f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} '
             f'{fsm.ssh_target(self.server)} {shlex.quote(remote_cmd)}',
-            timeout)
+            timeout + SSH_ROUNDTRIP_OVERHEAD, stdin_data=stdin_data)
         if not ok:
             raise TransportError(f'SSH 调用失败（{self.alias}）: {out[:200]}', kind='server_down')
         return out
@@ -235,8 +247,10 @@ class SshCurlTransport:
             raise TransportError(f'返回体不是 JSON: {out[:200]}', kind='failed') from None
 
     def post_json(self, path: str, body: dict, timeout: int = 60) -> dict:
-        b64 = base64.b64encode(json.dumps(body, ensure_ascii=False).encode('utf-8')).decode('ascii')
-        out = self._ssh(self._curl_cmd(path, 'POST', b64, timeout), timeout)
+        """body 直接以 UTF-8 文本喂 stdin（不额外 base64：省 33% 体积，
+        且 `text=True` 的 subprocess 会按 utf-8 编码，中文提示词无损）。"""
+        payload = json.dumps(body, ensure_ascii=False)
+        out = self._ssh(self._curl_cmd(path, 'POST', timeout), timeout, stdin_data=payload)
         try:
             return json.loads(out)
         except json.JSONDecodeError:
@@ -246,8 +260,11 @@ class SshCurlTransport:
         """SSH：常驻服务已把 PNG 落盘，直接 scp 拉回（沿用项目原有模式）。"""
         dest.parent.mkdir(parents=True, exist_ok=True)
         remote = f'{server["remote_base"]}/resident_out/{job_id}.png'
+        # ⚠️ 别急着缩这个超时：AutoDL 中转链路下行实测只有 ~3.6 KB/s，
+        #    783KB 的 PNG 要 200s+。180s 是 2026-09-20 验收实测超时炸掉的值
+        #    （推理 7s 成功、拉回 TIMEOUT → 任务被判失败）。300s 也只是勉强够用。
         ok, out = fsm.run(f'scp {fsm.scp_target(self.server)}:{remote} '
-                          f'"{str(dest).replace(chr(92), "/")}"', 180)
+                          f'"{str(dest).replace(chr(92), "/")}"', 300)
         if not ok or not dest.exists():
             raise TransportError(f'拉回图片失败: {out[:200]}', kind='server_down')
         return dest
@@ -402,10 +419,15 @@ def upload_scripts(server: dict) -> tuple:
     for local in (LOCAL_SERVER_PY, LOCAL_START_SH):
         if not local.exists():
             return False, f'本地缺少 {local}'
-    tgt, stgt, rb = fsm.ssh_target(server), fsm.scp_target(server), server['remote_base']
-    fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {tgt} "mkdir -p {rb}"', 20)
+    rb = server['remote_base']
+    fsm.run(f'ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT} {fsm.ssh_target(server)} '
+            f'"mkdir -p {rb}"', 20)
     for local in (LOCAL_SERVER_PY, LOCAL_START_SH):
-        ok, out = fsm.run(f'scp "{str(local).replace(chr(92), "/")}" {stgt}:{rb}/', 60)
+        # ⚠️ 选项必须在文件名**之前**：写成 `scp "<file>" <opts> user@host:` 时
+        #    scp 的 getopt 在遇到第一个非选项参数后就停止解析 → -i / accept-new /
+        #    BatchMode 全失效 → "Host key verification failed"（2026-09-20 flux5 实测）。
+        #    统一走 fsm.scp_upload_cmd()，别再手写 scp 命令。
+        ok, out = fsm.run(fsm.scp_upload_cmd(server, local, rb), 60)
         if not ok:
             return False, f'上传 {local.name} 失败: {out[:160]}'
     return True, 'ok'

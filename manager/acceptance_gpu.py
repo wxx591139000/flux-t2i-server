@@ -143,10 +143,17 @@ def main():
     r = frc.ensure_resident(srv)
     check(7, '拉起常驻服务', r['ok'], r['msg'])
     if r['ok']:
-        w = frc.wait_model_loaded(srv, timeout=frc.WAIT_MODEL)
-        loaded = bool(w.get('model_loaded'))
-        check(8, f'模型加载（{int(time.time() - t0)}s）', loaded,
-              w.get('error') or f"status={w.get('status')}")
+        # ⚠️ 必须兜住：wait_model_loaded 抛 TransportError 时若不捕获，整个验收
+        #    会以 traceback 崩掉、拿不到 json 报告（2026-09-20 flux5：第 8 项之前
+        #    所有项目都过了，却因为这一步抛异常，报告里一项结论都没有）。
+        try:
+            w = frc.wait_model_loaded(srv, timeout=frc.WAIT_MODEL)
+            loaded = bool(w.get('model_loaded'))
+            check(8, f'模型加载（{int(time.time() - t0)}s）', loaded,
+                  w.get('error') or f"status={w.get('status')}")
+        except Exception as e:                       # noqa: BLE001 验收脚本不许崩
+            check(8, f'模型加载（{int(time.time() - t0)}s）', False,
+                  f'{type(e).__name__}: {e}')
     else:
         check(8, '模型加载', False, '常驻未起，跳过')
 

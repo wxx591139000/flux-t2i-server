@@ -17,9 +17,12 @@
   M5 去重键含 edit 标记：同提示词「先文生图、再图生图」不被误判为重复提交
   M6 计费与退还：图生图失败时配额原路退还（不能白扣）
   M7 参考图不入库：jobs 表里只有 edit_mode/has_ref 标记，没有 base64 本体
-  M8 重启后孤儿 edit 任务**明确失败**（参考图在内存态，恢复不了就不该假装能跑）
-  M9 参数异常（steps 非整数）→ 400
-  M10 /api/edit 缺 image 字段时不消耗配额
+  M8 参考图**必须真落盘**，且内存丢光后能从磁盘读回（目录得先建，否则静默丢失）
+  M9 终态清理：ref.png 不无限堆积
+  M10 参数异常（steps 非整数）→ 400
+  M11 /api/edit 缺 image 字段时不消耗配额
+  M12 上游报错可读（非法参考图 → failed 且带原因）
+  M13 manager /health 仍是浅探针（不外呼 resident）
 
 用法：
   python tests/test_manager_edit_offline.py
@@ -315,8 +318,48 @@ def main():
             con.close()
             return f'{len(edits)}/{len(rows)} 行 edit_mode=1，均无 base64 本体'
 
+        # ── M8 参考图真落盘 + 模拟重启能回读（mkdir 缺失防回归）──
+        @case('M8 参考图真落盘，且内存丢光后能从磁盘读回')
+        def _m8():
+            # ⚠️ 为什么必须有这条：_put_ref 曾直接 write_bytes 到 WEB_OUT/<job_id>/ref.png，
+            #    而那个目录**此时还不存在**（目录是生成阶段才建的）→ FileNotFoundError，
+            #    被 `except Exception` 吞成一条 warning。于是「重启不丢参考图」的承诺
+            #    从来没兑现过 —— 2026-09-20 查卡死任务 ceff1b2c 时才发现
+            #    web_out/ceff1b2c116b4c95/ 整个目录都不存在。
+            #
+            # ⚠️ 为什么不直接查线上任务的目录：任务到终态时 `_drop_ref` 会把 ref.png
+            #    删掉（避免无限堆积），所以等任务跑完再去查必然查不到 —— 必须自己
+            #    造一次 _put_ref，在清理发生前断言。
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            os.environ['FLUX_WEB_OUT'] = str(web_out)
+            import importlib
+            import manager.flux_queue as fq
+            importlib.reload(fq)              # 让模块级 WEB_OUT 吃到上面的环境变量
+            q = fq.FluxQueueScheduler(db=None, quota=None)
+            jid = 'selftest-ref-0001'
+            try:
+                q._put_ref(jid, 'data:image/png;base64,' + b64(png_blue))
+                p = web_out / jid / 'ref.png'
+                assert p.exists(), f'落盘失败（父目录没 mkdir？）: {p}'
+                assert p.read_bytes() == png_blue, '落盘内容与原图不一致'
+                q._refs.clear()               # 模拟进程重启：内存态全丢
+                got = q._get_ref(jid)
+                assert got, '磁盘回读失败 → 重启后编辑任务会「参考图已失效」'
+                assert base64.b64decode(got) == png_blue, '回读内容与原图不一致'
+            finally:
+                q._drop_ref(jid)
+            return f'{jid}/ref.png 落盘 {len(png_blue)}B，清空内存后回读一致'
+
+        # ── M9 终态清理：ref.png 不堆积 ──
+        @case('M9 任务到终态后 ref.png 被清理（不无限堆积）')
+        def _m9():
+            left = sorted(str(p.relative_to(web_out)) for p in web_out.rglob('ref.png'))
+            assert not left, f'终态任务仍留着参考图副本: {left[:5]}'
+            return f'web_out 下无残留 ref.png（{len(list(web_out.iterdir()))} 个任务目录）'
+
         # ── M7 参数异常 → 400 ──
-        @case('M7 steps 非整数 → 400（参数给了却没法用要明说）')
+        @case('M10 steps 非整数 → 400（参数给了却没法用要明说）')
         def _m7():
             s, d = post(f'/api/edit?token={TOKEN}',
                         {'prompt': 'x', 'image': data_url(png_red), 'steps': 'abc'})
@@ -324,7 +367,7 @@ def main():
             return f'HTTP 400 · {d.get("error")}'
 
         # ── M8 缺 image 不扣配额 ──
-        @case('M8 缺 image 被拒时不消耗配额')
+        @case('M11 缺 image 被拒时不消耗配额')
         def _m8():
             before, _ = usage_now()
             post(f'/api/edit?token={TOKEN}', {'prompt': 'should not charge'})
@@ -337,7 +380,7 @@ def main():
             return f'用量保持 {before}'
 
         # ── M9 上游不支持图生图时报错可读 ──
-        @case('M9 上游模型不支持图生图 → 任务 failed 且错误可读（不静默出图）')
+        @case('M12 上游报错可读：非法参考图 → failed 且带原因')
         def _m9():
             # stub 用环境变量切「假装是 dev（无 image 参数）」不易做，
             # 这里改验证「参考图非法」这条同样走失败路径的分支：
@@ -352,7 +395,7 @@ def main():
             return f'failed: {(st.get("error") or "")[:70]}'
 
         # ── M10 manager 浅探针不外呼（补 edit 后不能破坏这条铁律）──
-        @case('M10 manager /health 仍是浅探针（不外呼 resident）')
+        @case('M13 manager /health 仍是浅探针（不外呼 resident）')
         def _m10():
             t0 = time.time()
             s, d = get('/health', timeout=5)
