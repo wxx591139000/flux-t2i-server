@@ -31,7 +31,7 @@
 | `deploy_vps.py` | **一条命令部署**：生成清单 → 传文件 → 装 systemd → 启服务 → 跑自测 |
 | `authorize_key.py` | 把 VPS 看门狗的公钥装到各 GPU 机（幂等）；`--check` 验证 VPS→各机 免密可达 |
 | `selftest_ready.sh` | 判据自测：/tmp 沙箱 + 假 GPU + 假常驻服务，**不开机就能验证判据没写错** |
-| `flux-watchdog.service` | VPS systemd unit（`Restart=always`） |
+| `onboard_server.py` | **克隆/新增一台 GPU 机后的一条命令**：登记进 servers.json → 同步看门狗清单 → 装公钥 → 可选端到端验收 |
 
 ## 部署（改完代码随手跑一次）
 
@@ -49,13 +49,29 @@ python watchdog/deploy_vps.py --dry-run            # 只打印将执行的命令
 > 为什么是 `restart` 不是 `enable --now`：服务已在跑时 `enable --now` 不会重新读脚本，
 > 改完代码重新部署后跑着的还是旧逻辑（表现为「我明明改了怎么没生效」）。
 
-## 加一台新 GPU 机（三步，其实是两条命令）
+## 加一台新 GPU 机（一条命令）
 
-1. `manager/servers.json` 加一条（`host` / `port` / `user` / `remote_model` / `offload` /
-   `supports_edit`）—— **唯一事实来源**，不写进任何脚本。
-2. `python watchdog/deploy_vps.py` → 刷新 `targets.conf` 并同步到 VPS。
-3. 机器开机后：`python watchdog/authorize_key.py` → 把看门狗公钥装进去，再
-   `python watchdog/authorize_key.py --check` 确认 VPS 能连。
+2026-09-20 现状：GPU 拿不到 → 需要克隆实例到新服务器。克隆完只需：
+
+```powershell
+# 克隆了一台 klein 机（能图生图），并把被取代的旧机停机留痕
+python watchdog\onboard_server.py --name flux5 --host connect.westc.seetacloud.com --port 31234 ^
+    --model klein --retire flux4
+
+# 克隆的是 dev 机（只能文生图）
+python watchdog\onboard_server.py --name flux6 --host ... --port ... --model dev
+
+# 登记完顺手做端到端验收（真出图，几分钟）
+python watchdog\onboard_server.py --name flux5 --host ... --port ... --model klein --accept
+
+# 先看会写成什么样，不动文件
+python watchdog\onboard_server.py --name flux5 --host ... --port ... --model klein --dry-run
+```
+
+`--model klein|dev` 会自动带上正确的模型路径 / offload / supports_edit
+（klein：`offload=none` + 能图生图；dev：`offload=model` + **不能**图生图，32G 卡 `none` 必 OOM）。
+它还会：同名条目**原地更新**不重复追加、写盘后**回读校验**、调 `deploy_vps.py --authorize`
+同步清单并装公钥。
 
 之后它就自治了：开机 → 看门狗 60s 内发现 → 缺件自动补传 → 拉起常驻 → 等模型加载 → 可接单。
 **不再需要改 `~/.ssh/config`**（那是 2026-09-20 事故的根：仓库外的文件漏改 → 机器永远看不见）。

@@ -37,6 +37,7 @@ SELFTEST = os.path.join(WATCHDOG, 'selftest_ready.sh')
 DEPLOY = os.path.join(WATCHDOG, 'deploy_vps.py')
 GEN = os.path.join(WATCHDOG, 'gen_targets.py')
 AUTH = os.path.join(WATCHDOG, 'authorize_key.py')
+ONBOARD = os.path.join(WATCHDOG, 'onboard_server.py')
 
 RESULTS = []
 
@@ -143,6 +144,22 @@ def t_syntax():
         check(f'bash -n {os.path.basename(p)}', r.returncode == 0, (r.stderr or '').strip()[:160])
 
 
+def t_onboard():
+    print('\n[7] 新机接入 onboard_server.py（克隆实例后的一条命令）')
+    import onboard_server as ob
+    check('有 klein / dev 两套模型预设', set(ob.PRESETS) >= {'klein', 'dev'})
+    k, d = ob.PRESETS['klein'], ob.PRESETS['dev']
+    check('klein: offload=none 且能图生图',
+          k['offload'] == 'none' and k['supports_edit'] is True, str(k))
+    check('dev: offload=model 且不能图生图（32G 卡 none 必 OOM）',
+          d['offload'] == 'model' and d['supports_edit'] is False, str(d))
+    src = read(ONBOARD)
+    check('同名条目原地更新，不重复追加', 'old[0].update(entry)' in src)
+    check('支持 --retire 停用被取代的旧机', '--retire' in src and "enabled'] = False" in src)
+    check('写盘后回读校验（写完读不回来就报错）', '回读校验' in src)
+    check('默认走 --dry-run 之外的路径会同步 VPS', 'deploy_vps.py' in src)
+
+
 def main():
     print('=' * 60)
     print('VPS 看门狗 回归门（常驻链路 / 单一清单 / 可部署）')
@@ -153,6 +170,7 @@ def main():
     t_deploy()
     t_selftest()
     t_syntax()
+    t_onboard()
     bad = [n for n, ok, _ in RESULTS if not ok]
     print('\n' + '=' * 60)
     print(f'共 {len(RESULTS)} 项，通过 {len(RESULTS) - len(bad)}，失败 {len(bad)}')
