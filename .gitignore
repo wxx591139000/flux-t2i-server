@@ -4,6 +4,9 @@ output/
 __pycache__/
 *.pyc
 
+# 看门狗：targets.conf 是 servers.json 的派生物，由 gen_targets.py 生成，不入库
+watchdog/targets.conf
+
 # FLUX 对外服务运行时数据（不入库）
 data/
 web_out/
