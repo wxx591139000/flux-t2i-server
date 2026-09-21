@@ -18,9 +18,13 @@
   5. deploy_vps 会带上常驻服务镜像文件（裸机能自补件）+ 用 restart 而非仅 enable --now
   6. selftest_ready.sh 正反路径都在（无卡/无模型/常驻未起 → 1；常驻已加载 → 0）
 
+  7.（2026-09-21 新增）**反向覆盖**：看门狗会用 VPS 镜像覆盖远端文件 ——
+     这是它最反直觉、也最贵的性质，必须被钉住（见 [8] 组）。
+
 用法: python tests/test_watchdog_offline.py    # 全绿 exit 0，有红 exit 1
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,8 +47,14 @@ RESULTS = []
 
 
 def check(name, ok, extra=''):
+    """`extra` 只在**失败**时打印。
+
+    原因：那些 extra 写的是"这条断言如果红了意味着什么"，通过时打出来会被读成
+    "问题说明"（实测：52 项全绿时输出里混着"未见到 sync_file…同步源变了"，
+    看起来像报错）。诊断信息只在需要诊断时出现。
+    """
     RESULTS.append((name, bool(ok), extra))
-    print(f'  {"✅" if ok else "❌"} {name}' + (f' — {extra}' if extra else ''))
+    print(f'  {"✅" if ok else "❌"} {name}' + (f' — {extra}' if extra and not ok else ''))
 
 
 def read(p):
@@ -160,9 +170,65 @@ def t_onboard():
     check('默认走 --dry-run 之外的路径会同步 VPS', 'deploy_vps.py' in src)
 
 
+def t_reverse_overwrite():
+    """[8] 反向覆盖：看门狗用 VPS 镜像覆盖远端 —— 最反直觉的性质，必须钉住。
+
+    2026-09-21 实锤事故：改了 server/ 下的常驻文件后 scp 到 GPU 机，
+    **上传后立刻校验 PASS，几十秒后 md5 变回旧值**（mtime 却是新的，很像"写入未落盘"）。
+    真因是看门狗每 60s 比对「GPU 机文件 vs VPS mirror」，不一致就用 mirror **反向覆盖**。
+
+    为什么值得单开一组：它把「本地 → 远端」的直觉**整个反过来**了。
+    正常的部署心智是"改了就往机器上推"，而这里推上去等于白推 ——
+    必须**先更新 VPS 的 mirror**（deploy_vps.py），把权威副本换掉。
+    这一条不写成断言，下一个人（或下一个 AI）会必然重踩：
+    因为症状（md5 回退）看起来像磁盘问题，不像"另一个进程在覆盖我"。
+
+    守三条：
+      8a. 看门狗**确实**会做 md5 比对 + 同步（这是特性不是缺陷，别被人当成 bug 删掉）
+      8b. 同步的是 **mirror 里的副本**，不是仓库里的源文件 —— 所以改仓库源文件不生效
+      8c. mirror 缺失时必须**报警**（否则机器永远收不到新代码，且静默无日志）
+    """
+    print('\n[8] 反向覆盖：VPS 镜像会盖掉远端改动（改了常驻文件必须先更新 mirror）')
+    src = read(WATCH)
+    body = code_only(src)
+    # 8a：md5 比对 + 不一致才传（而不是无条件覆盖 —— 无条件传等于每轮都断连接）
+    check('用 md5 比对决定是否同步（不是无条件覆盖）',
+          'md5sum' in body and 'want' in body and 'have' in body)
+    check('比对两侧：本地命令替换取 want / ssh 取 have',
+          re.search(r'want=.*md5sum', body) is not None
+          and re.search(r'have=.*md5sum', body) is not None)
+    # 8b ★ 关键：同步的源是 $MIRROR/，不是仓库路径。
+    #     这条决定了「改代码后第一动作是 deploy_vps.py」这个正确顺序。
+    check('★ 同步源是 $MIRROR 下的副本（不是仓库源文件）',
+          re.search(r'sync_file\s+"\$MIRROR/', body) is not None,
+          '未见到 sync_file "$MIRROR/..." —— 同步源变了，部署顺序的结论要重写')
+    check('镜像文件清单含常驻两件（flux_resident_server.py / start_resident.sh）',
+          'flux_resident_server.py' in body and 'start_resident.sh' in body)
+    # 8c：mirror 缺件必须报警（静默失效是最阴的失败模式）
+    check('镜像缺件时打 warning（否则永不更新且无日志）',
+          '⚠️ VPS 镜像缺' in src and 'deploy_vps.py' in src)
+    # 覆盖是每轮都重做的 —— 所以"改完不生效"会在下一轮被反复打回，不是一次性的
+    check('同步发生在每轮巡检内（会让手动上传在 ≤ 一个周期后被回滚）',
+          body.count('sync_file') >= 2)
+
+    # 变异断言：把"同步源写成仓库路径"喂进来，8b 的检测器必须报红。
+    # 否则这条断言恒真（永远看不到 sync_file "$MIRROR/...）等于没守。
+    mutated = body.replace('sync_file "$MIRROR/$f"', 'sync_file "$DIR/../server/$f"')
+    check('变异断言：同步源改成仓库路径后必须报红',
+          re.search(r'sync_file\s+"\$MIRROR/', mutated) is None,
+          '检测器失效 —— 它认不出被改过的同步源')
+
+    # deploy_vps 必须真的把常驻文件放进 mirror（否则 8b 的链路起点断了）
+    dsrc = code_only(read(DEPLOY))
+    check('★ deploy_vps 把常驻文件放进 mirror（这是让新代码生效的唯一正确入口）',
+          'mirror' in dsrc and 'flux_resident_server.py' in dsrc)
+    check('deploy_vps 里有 md5 核对（传完要证明传对了）',
+          'md5' in dsrc.lower())
+
+
 def main():
     print('=' * 60)
-    print('VPS 看门狗 回归门（常驻链路 / 单一清单 / 可部署）')
+    print('VPS 看门狗 回归门（常驻链路 / 单一清单 / 可部署 / 反向覆盖）')
     print('=' * 60)
     t_resident_chain()
     t_no_hardcoded_targets()
@@ -171,6 +237,7 @@ def main():
     t_selftest()
     t_syntax()
     t_onboard()
+    t_reverse_overwrite()
     bad = [n for n, ok, _ in RESULTS if not ok]
     print('\n' + '=' * 60)
     print(f'共 {len(RESULTS)} 项，通过 {len(RESULTS) - len(bad)}，失败 {len(bad)}')

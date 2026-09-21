@@ -10,8 +10,16 @@
   1. 从 manager/servers.json 生成 targets.conf（机器清单唯一来源，不手抄）
   2. 传到 VPS：targets.conf / flux_watchdog.sh / flux_server_ready.sh / flux-watchdog.service
      + mirror/（常驻服务两个文件，给裸机补件用）
+  2b. **校验落盘 md5**（2026-09-21 新增）—— mirror/ 是权威副本，看门狗会拿它反向
+      覆盖 GPU 机。一次静默截断的上传会变成"所有机器一起跑半截文件"。任一文件
+      md5 不符即**中止部署**，绝不把坏副本推成权威版本。
   3. 远端：落盘到 /opt/flux-watchdog、chmod +x、装 systemd unit、daemon-reload、enable + restart
   4. 回读 systemctl status + 最近日志，肉眼可验收
+
+⚠️ 顺序铁律（2026-09-21 实锤）：改了 `server/` 下的常驻文件后，**第一动作是跑本脚本**，
+   不是 scp 到 GPU 机。因为看门狗每 60s 用 mirror 覆盖远端 —— 先 scp 会被打回，
+   症状是「上传后立刻校验 PASS，几十秒后 md5 变回旧值，mtime 却是新的」。
+   更新 mirror 后 GPU 机 ≤60s 自动同步，**可以完全不手动上传**。
 
 用法：
   python watchdog/deploy_vps.py                     # 部署（默认别名 vps-aliyun）
@@ -20,6 +28,7 @@
   python watchdog/deploy_vps.py --status            # 只看远端状态，不传文件
 """
 import argparse
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -110,6 +119,30 @@ def main():
         ok, _ = run(f'scp "{local.as_posix()}" {vps}:{REMOTE_TMP}/{sub}{name}', 120, dry)
         if not ok:
             return 1
+
+    # ── 2b. 校验落盘字节与本地一致（2026-09-21 新增）──
+    #
+    # ⚠️ 为什么必须校验：mirror/ 里的副本是**权威副本** —— 看门狗每 60s 拿它去覆盖
+    #    GPU 机上的文件。于是一次**静默截断的上传**会变成"所有机器一起跑半截文件"，
+    #    而且症状是远端语法错误/莫名 AttributeError，看起来像代码 bug 而不是传输问题。
+    #    scp 在断连时不一定返回非零（尤其被超时截断时），所以只判退出码不够。
+    #    这里逐文件比 md5，任一个不一致就**中止部署**（宁可不部署，也不能把坏副本推成权威版本）。
+    if not dry:
+        bad = []
+        for local, name in payload:
+            sub = 'mirror/' if (local, name) in MIRROR_FILES else ''
+            want = hashlib.md5(local.read_bytes()).hexdigest()
+            ok_h, out_h = run(
+                f'ssh {vps} "md5sum < {REMOTE_TMP}/{sub}{name}"', 60, False)
+            have = (out_h or '').strip().split()[0] if out_h.strip() else ''
+            if not ok_h or want != have:
+                bad.append(f'{sub}{name}（本地 {want[:8]} vs 远端 {have[:8] or "读不到"}）')
+        if bad:
+            print('❌ 落盘校验失败，已中止部署（避免把坏副本推成权威版本）：')
+            for b in bad:
+                print(f'   - {b}')
+            return 1
+        print(f'✅ 落盘校验通过：{len(payload)} 个文件 md5 与本地一致')
 
     # ── 3. 远端安装 ──
     install = (
