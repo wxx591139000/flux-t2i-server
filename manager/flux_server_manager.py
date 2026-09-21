@@ -260,6 +260,120 @@ def discover_servers() -> list:
     return servers
 
 
+def watchdog_cfg(path=None) -> dict:
+    """读 servers.json 顶层的 `watchdog` 块（VPS 地址 + active 文件路径 + TTL）。
+
+    为什么要放在注册表里：改了 VPS 只改一处 —— 与「机器清单唯一来源」同一个道理，
+    不在代码里再藏一份 VPS 地址。
+    默认值保证老注册表（没有这个块）照旧能跑：只是拿不到 active，走降级全量扫描。
+    """
+    p = Path(path) if path else REGISTRY_PATH
+    cfg = {'ssh': '', 'active_path': '/opt/flux-watchdog/active.json', 'ttl_sec': 20}
+    try:
+        if not p.exists():
+            return cfg
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception as e:                      # noqa: BLE001
+        logging.getLogger('flux_manager').warning(f'读取 watchdog 配置失败: {e}')
+        return cfg
+    blk = data.get('watchdog') if isinstance(data, dict) else None
+    if isinstance(blk, dict):
+        for k in cfg:
+            if blk.get(k) not in (None, ''):
+                cfg[k] = blk[k]
+    # 环境变量可覆盖（调试 / 临时指向另一个 VPS，不用改仓库）
+    for env_key, k in (('FLUX_WATCHDOG_SSH', 'ssh'),
+                       ('FLUX_WATCHDOG_ACTIVE_PATH', 'active_path'),
+                       ('FLUX_WATCHDOG_TTL', 'ttl_sec')):
+        v = os.environ.get(env_key)
+        if v:
+            cfg[k] = v
+    try:
+        cfg['ttl_sec'] = float(cfg['ttl_sec'])
+    except (TypeError, ValueError):
+        cfg['ttl_sec'] = 20.0
+    return cfg
+
+
+# ── 看门狗 active 状态（谁此刻开着）──────────────────────────────
+# 背景（2026-09-21，用户需求）：用户有多台 GPU 机，同一时刻只开一台。
+# 看门狗跑在 VPS 上每 60s 巡检，**只有它知道此刻哪台活着**，所以由它把事实写进
+# VPS 上的 active.json，manager 每轮直接读 —— 候选机收敛成「开着的那一台」，
+# 关机机器**零 SSH 开销**（这才是重点：否则每轮都要为每台关机机白等一次超时）。
+_ACTIVE_CACHE = {'ts': 0.0, 'data': None}
+_ACTIVE_LOCK = threading.Lock()
+
+
+def read_active(force: bool = False, cfg: dict = None) -> dict | None:
+    """从 VPS 读 active.json。返回 dict；读不到 / 太旧 / 解析失败 → None（调用方降级）。
+
+    返回结构（看门狗写什么就返回什么，本函数不改语义）：
+      {'active': ['flux6'], 'checked_at': 1789..., 'servers': {'flux6': {...}}, ...}
+
+    为什么不缓存到本地文件：这个事实的**归属在 VPS**。落到本机文件就多一个
+    「同步」的人肉动作，用户开机后如果忘了同步，manager 就还在按旧事实选机
+    （正是用户最反感的那类隐形一致性负担）。每轮一次 ssh 读一个小 JSON 的代价
+    远小于「整轮 N 台关机机各等一次 SSH 超时」。
+    TTL 缓存（默认 20s）只是为了避免同一轮里多个调用点重复 ssh。
+    """
+    cfg = cfg or watchdog_cfg()
+    vps = (cfg.get('ssh') or '').strip()
+    if not vps:
+        return None                              # 没配 VPS → 直接降级，不打日志刷屏
+    ttl = float(cfg.get('ttl_sec') or 20)
+    if not force and ttl > 0:
+        with _ACTIVE_LOCK:
+            if _ACTIVE_CACHE['data'] is not None and (time.time() - _ACTIVE_CACHE['ts']) < ttl:
+                return _ACTIVE_CACHE['data']
+    path = cfg.get('active_path') or '/opt/flux-watchdog/active.json'
+    ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {vps} cat {path}', 20)
+    data = None
+    if ok and out:
+        txt = (out or '').strip()
+        # 容忍远端 shell 在 JSON 前后夹带的杂音（motd / 告警行）：取第一个 { 到最后一个 }
+        i, j = txt.find('{'), txt.rfind('}')
+        if i >= 0 and j > i:
+            try:
+                data = json.loads(txt[i:j + 1])
+            except Exception as e:               # noqa: BLE001
+                log.warning(f'🟡 VPS active.json 解析失败（将降级全量扫描）: {e}')
+    if data is None:
+        log.warning(f'🟡 读不到 VPS active 状态（{vps}:{path}），降级为全量扫描所有候选机')
+    with _ACTIVE_LOCK:
+        _ACTIVE_CACHE['ts'] = time.time()
+        _ACTIVE_CACHE['data'] = data            # None 也缓存：避免 VPS 挂了时每张图都 ssh 一次
+    return data
+
+
+def clear_active_cache():
+    """清掉 active 状态缓存（测试 / 强制刷新用）。"""
+    with _ACTIVE_LOCK:
+        _ACTIVE_CACHE['ts'] = 0.0
+        _ACTIVE_CACHE['data'] = None
+
+
+def active_names(force: bool = False) -> set | None:
+    """当前「VPS 确认开着」的机器名集合。
+
+    None = 拿不到事实（调用方降级成全量扫描）。
+    空集 = 拿到了事实，且**确实一台都没开** —— 与 None 语义完全不同，
+    不能混：前者是「不知道所以都试试」，后者是「知道，一台都没有」。
+    """
+    d = read_active(force=force)
+    if not isinstance(d, dict):
+        return None
+    names = d.get('active')
+    if isinstance(names, str):                   # 容忍写成单台字符串
+        names = [names]
+    if isinstance(names, list):
+        # ⚠️ 剥掉首尾空白与 \r（2026-09-21 实测踩到）：看门狗读的 targets.conf 若带 CRLF，
+        #    name 会变成 `flux1\r`，这里不归一就会**永远匹配不上** → 候选集为空、
+        #    机器明明开着却不出图，且全程无报错。归一让两侧各自独立地安全。
+        # ⚠️ 先判 `n is None` 再 str()：否则 None 会变成字面量字符串 'None' 混进名单。
+        return {s for s in (str(n).strip() for n in names if n is not None) if s}
+    return None                                  # 结构不认识 → 不猜，降级
+
+
 def registry_known_names(path=None) -> set:
     """注册表里**所有**条目的 name/alias，含 enabled:false 的。
 
@@ -746,20 +860,58 @@ def probe_full(server=None, force: bool = False) -> dict:
 
 
 def probe_all(servers=None, force: bool = False) -> list:
-    """并行探测所有候选机，返回 [(server, probe), ...]，保持注册顺序。
+    """并行探测候选机，返回 [(server, probe), ...]，保持注册顺序。
 
     并行是关键：N 台全关机时，串行要 N × ConnectTimeout(8s)；
     并行后总耗时 ≈ 1 个 timeout。
+
+    ★ active 收敛（2026-09-21，用户需求「只扫开机的这台」）：
+    传 servers=None（日常路径）时，先问 VPS 看门狗「此刻哪台开着」，
+    候选集收敛成那几台 —— 关机机器**完全不发 SSH**，省掉每轮白等的超时。
+    显式传入 servers（CLI 指定机器 / 测试）时**不做收敛**：调用者说了算，
+    否则会出现「我明明 --server flux6，它却说没有候选机」这种最难查的不一致。
     """
+    explicit = servers is not None
     servers = list(servers if servers is not None else FLUX_SERVERS)
     if not servers:
         return []
+    if not explicit:
+        servers = filter_active(servers)
+        if not servers:
+            log.info('ℹ️ VPS 报告当前没有任何开机机器，候选集为空')
+            return []
     if len(servers) == 1:
         return [(servers[0], probe_full(servers[0], force=force))]
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(len(servers), 8)) as ex:
         probes = list(ex.map(lambda s: probe_full(s, force=force), servers))
     return list(zip(servers, probes))
+
+
+def filter_active(servers: list) -> list:
+    """把候选机收敛成「VPS 看门狗确认开着」的那些。拿不到事实 → 原样返回（降级）。
+
+    匹配口径：server 的 name 或 alias 命中 active 名单。
+    为什么两个都比：看门狗只知道 targets.conf 里的 host/port，它按 **name** 回报
+    （gen_targets 里 name 是最稳定的标识），而自动发现的机器可能只有 alias。
+    宁可多比一次也不能漏 —— 漏了表现为「机器明明开着却不出图」。
+
+    空集与 None 的处理（关键，别合并）：
+      · active_names() 返回 None（读不到 VPS）→ **原样返回**，全量扫描。可用性优先。
+      · active_names() 返回空集（读到了、确实没开机）→ **返回 []**，一台都不探。
+        这是准确答案，不能让 manager 去瞎猜。
+    """
+    names = active_names()
+    if names is None:
+        return servers                            # 降级：VPS 不可得，按老逻辑全扫
+    if not names:
+        return []
+    keep = [s for s in servers
+            if (s.get('name') in names) or (s.get('alias') in names)]
+    dropped = [s.get('name') for s in servers if s not in keep]
+    if dropped:
+        log.info(f'ℹ️ active 收敛：跳过 {len(dropped)} 台未开机机器 {dropped}（零 SSH 开销）')
+    return keep
 
 
 def clear_probe_cache():

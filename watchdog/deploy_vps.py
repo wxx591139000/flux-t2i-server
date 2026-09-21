@@ -90,10 +90,13 @@ def main():
             print(f'   - {n}: {why}')
         return 1
     conf = WATCHDOG_DIR / 'targets.conf'
-    conf.write_text(
-        '# 由 watchdog/gen_targets.py 从 manager/servers.json 生成 —— **不要手改**\n'
-        '# 格式: host:port:user:workdir:model:offload\n' + '\n'.join(lines) + '\n',
-        encoding='utf-8')
+    # ⚠️ 必须显式写 LF：本机 Windows 的 write_text 默认写出 CRLF，看门狗（Linux）
+    #    的 read 会把 \r 留在最后一个字段 → name 变 "flux1\r" → manager 匹配不上
+    #    → active 收敛静默失效。2026-09-21 实测踩到。
+    conf_body = ('# 由 watchdog/gen_targets.py 从 manager/servers.json 生成 —— **不要手改**\n'
+                 '# 格式: host:port:user:workdir:model:offload:name\n'
+                 + '\n'.join(lines) + '\n')
+    conf.write_bytes(conf_body.encode('utf-8'))
     print(f'✅ targets.conf：{len(lines)} 台')
     for n, why in skipped:
         print(f'   ⏭  跳过 {n}: {why}')

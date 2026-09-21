@@ -15,6 +15,7 @@
   2. 判据里**不出现**旧链路关键字（gen_flux.py / start_gen.sh / fluxgen）
   3. 看门狗从 targets.conf 读机器，不硬编码 TARGETS
   4. gen_targets 生成的每行 6 段 host:port:user:workdir:model:offload，且跳过 enabled=false
+     （2026-09-21 起追加第 7 段 name，见 test_active_server.py）
   5. deploy_vps 会带上常驻服务镜像文件（裸机能自补件）+ 用 restart 而非仅 enable --now
   6. selftest_ready.sh 正反路径都在（无卡/无模型/常驻未起 → 1；常驻已加载 → 0）
 
@@ -110,8 +111,13 @@ def t_gen_lines():
     import gen_targets
     lines, skipped = gen_targets.build_lines()
     check('至少产出 1 台', len(lines) >= 1, f'{len(lines)} 台')
-    ok_fmt = all(len(l.split(':')) == 6 for l in lines)
-    check('每行 6 段 host:port:user:workdir:model:offload', ok_fmt, lines[0] if lines else '')
+    # ⚠️ 第 7 段 = name（2026-09-21 加）：看门狗要用它在 active.json 里回报「哪台开机」，
+    #    manager 再据此把候选集收敛成开机的那些。断言改成「≥7 段且第 7 段非空」，
+    #    而不是写死 ==7 —— 以后再加字段（如 per-host 端口覆盖）不该无谓报红。
+    ok_fmt = all(len(l.split(':')) >= 6 for l in lines)
+    check('每行 ≥6 段 host:port:user:workdir:model:offload(:name)', ok_fmt, lines[0] if lines else '')
+    ok_name = all(len(l.split(':')) >= 7 and l.split(':')[6].strip() for l in lines)
+    check('第 7 段 name 非空（active.json 回报用）', ok_name, lines[0] if lines else '')
     ok_port = all(l.split(':')[1].isdigit() for l in lines)
     check('port 段是数字', ok_port)
     # 被释放的机器（enabled:false）不得出现 —— 否则每轮轮询都白等 SSH 超时

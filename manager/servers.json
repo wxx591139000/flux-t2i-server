@@ -24,8 +24,23 @@
     "加机器的最短路径：AutoDL 控制台开机 → 复制 SSH 命令里的 host/port → 在这里加一条 →",
     "跑 `python manager/flux_resident_client.py servers` 看它是否 可达✓ 带卡✓ 模型✓（不需要改任何代码）",
     "",
-    "  enabled: false → 机器已释放/停用，保留记录做留痕但**不参与探活**（否则每次轮询都要白等 SSH 超时）"
+    "  enabled: false → 机器已释放/停用，保留记录做留痕但**不参与探活**（否则每次轮询都要白等 SSH 超时）",
+    "",
+    "★ active（2026-09-21 新增，由**看门狗自动维护，不要手写**）：",
+    "  用户有多台 GPU 机，但同一时刻只开一台。看门狗跑在 VPS 上，每 60s 逐台巡检，",
+    "  **只有它知道此刻哪台开着**。所以「当前使能哪台」这个事实由看门狗写进 VPS 上的",
+    "  active.json，manager 每轮直接去读（见下面 watchdog 块），再据此把候选机收敛成",
+    "  「开机的这一台」—— 关机机器**完全不参与探活**，省掉每轮白等的 SSH 超时。",
+    "  读不到 VPS 状态（VPS 挂了/网络不通）→ manager **降级成全量扫描**，宁可慢也要能出图。",
+    "  语义分工：enabled=false 是「这台永久停用（已释放）」的人工开关，",
+    "           active 是「VPS 探测到这台此刻活着」的自动事实。两者正交，都满足才进候选。"
   ],
+  "watchdog": {
+    "_readme": "VPS 看门狗的位置与状态文件路径。改了 VPS 只改这里一处。",
+    "ssh": "vps-aliyun",
+    "active_path": "/opt/flux-watchdog/active.json",
+    "ttl_sec": 20
+  },
   "servers": [
     {
       "name": "flux1",

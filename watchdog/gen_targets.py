@@ -50,6 +50,10 @@ def build_lines(registry_path=None) -> tuple:
             s.get('remote_base') or '/root/autodl-tmp/flux-t2i',
             s.get('remote_model') or '/root/autodl-tmp/models/FLUX.1-dev',
             s.get('offload') or 'model',
+            # 第 7 段 = name（2026-09-21 加）。看门狗用它在 active.json 里回报
+            # 「哪台开机」，manager 再用 name/alias 匹配回候选机条目。
+            # 没有它就只能回报 host —— 而 host 会随实例重建变化，name 才是稳定标识。
+            s.get('name') or '',
         ]))
     return lines, skipped
 
@@ -77,7 +81,13 @@ def main():
     else:
         out = Path(a.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(body, encoding='utf-8')
+        # ⚠️ 必须显式写 LF（2026-09-21 实测踩到）：本机是 Windows，`write_text` 的默认
+        #    newline 会把每行结尾写成 CRLF。看门狗跑在 Linux 上，`read` 会把末尾的 `\r`
+        #    留在**最后一个字段**里 → targets.conf 第 7 段 name 变成 `flux1\r`，
+        #    而 manager 用 `'flux1'` 去匹配 → **永远不中** → active 收敛静默失效
+        #    （症状：机器明明开着，候选集却是空的，且全程无报错）。
+        #    这是「Windows 生成 / Linux 消费」的经典坑，必须在这里断根。
+        out.write_bytes(body.encode('utf-8'))
         print(f'✅ 已写入 {out}（{len(lines)} 台）')
         for n, why in skipped:
             print(f'   ⏭  跳过 {n}: {why}')
