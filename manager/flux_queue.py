@@ -148,7 +148,7 @@ class FluxQueueScheduler:
     # ── 提交（入口）──
     def submit(self, user_id: str, prompt: str, priority: int = 0,
                width=None, height=None, seed=None, steps=None, negative_prompt=None,
-               ref_image: str = None) -> dict:
+               ref_image: str = None, model: str = None) -> dict:
         """提交一个生成任务。成功返回 job dict，失败返回 {error: reason}。
 
         width/height/seed/steps/negative_prompt 为可选生图参数，透传到底层常驻服务
@@ -156,6 +156,11 @@ class FluxQueueScheduler:
 
         `ref_image` = base64 参考图（可带 `data:image/...;base64,` 前缀）。
         传了它 = 图生图（走 resident `POST /edit`）；不传 = 文生图。
+
+        `model` = 模型 id（如 `FLUX.2-klein-4B`），2026-09-21 新增。
+        可空 = 用 GPU 上当前已加载的模型。**不在这里校验合法性** ——
+        合法清单是 GPU 机的属性（扫盘得出），manager 不该复制一份；
+        非法值由 resident 侧按白名单拒绝，任务会明确 failed 并退款。
         """
         prompt = (prompt or '').strip()
         if not prompt:
@@ -222,7 +227,8 @@ class FluxQueueScheduler:
             is_edit = bool(ref_image)
             self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
                                width, height, seed, steps, negative_prompt,
-                               edit_mode=1 if is_edit else 0, has_ref=1 if is_edit else 0)
+                               edit_mode=1 if is_edit else 0, has_ref=1 if is_edit else 0,
+                               model=model)
             self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
             self._inflight.add(key)
             self._seq += 1
@@ -545,10 +551,19 @@ class FluxQueueScheduler:
         """
         job_id = job['job_id']
         try:
+            # need_model：用户指定了模型（模型选择器）时，只在装了该模型的机器里挑。
+            # 放在选机阶段而不是等 GPU 报错，是为了不白占一次排队 + 一次 SSH 往返。
+            _want_model = job['model'] if 'model' in job.keys() else None
             # need_edit：图生图只有装了 klein 的机器能跑（dev 的 FluxPipeline 没有 image 参数），
             # 让选机阶段就避开不支持的机器，而不是等 GPU 上跑一遍才报错。
-            server, p = fr.find_available_server(need_edit=is_edit)
+            server, p = fr.find_available_server(need_edit=is_edit,
+                                                 need_model=_want_model or None)
             if not server:
+                # 区分「机器都关机」与「机器在、但没装这个模型」——
+                # 前者等机器回来就行，后者必须让用户换模型，等多久都没用。
+                if _want_model:
+                    return False, (f'没有可用的 flux 服务器能跑模型「{_want_model}」'
+                                   f'（候选机都没装它，或机器均关机）')
                 return False, '[SERVER_DOWN] 无可用 flux 服务器（均关机 / SSH 不通）'
 
             r = fr.ensure_resident(server, p)          # 幂等：在跑则直接返回
@@ -568,7 +583,7 @@ class FluxQueueScheduler:
 
             dest = WEB_OUT / job_id / f'{job_id}.png'
             gen_kwargs = {}
-            for k in ('width', 'height', 'seed', 'steps', 'negative_prompt'):
+            for k in ('width', 'height', 'seed', 'steps', 'negative_prompt', 'model'):
                 v = job[k]          # job 是 sqlite3.Row，下标访问（无 .get）
                 if v not in (None, ''):
                     gen_kwargs[k] = v

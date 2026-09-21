@@ -347,6 +347,29 @@ def _resolve_default(servers: list) -> dict:
 
 SERVER_DEFAULT = _resolve_default(FLUX_SERVERS)
 
+
+def known_models() -> list:
+    """平台已知的 (模型 id, 远端路径) 清单，**去重**后返回。2026-09-21 新增。
+
+    数据来源 = 注册表里各机的 remote_model（取 basename 当 id）。为什么不写死：
+    加模型/换路径的唯一动作仍然只是改 servers.json —— 不在代码里再维护一份
+    「有哪些模型」的清单，否则就是又一处「改一处要同步三处」的人肉负担。
+
+    顺序 = 注册表里首次出现的顺序（dict 保序），让 MODEL_OK 的语义仍然是
+    「默认机的那一个」。去重是为了不让 probe_full 对同一路径重复发 test -f。
+    """
+    seen, out = set(), []
+    for s in FLUX_SERVERS:
+        p = (s.get('remote_model') or '').rstrip('/')
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append((p.rsplit('/', 1)[-1], p))
+    if out:
+        return out
+    # 兜底：注册表为空时仍让 probe 有东西可问（不该发生，但别让它崩在选机路径上）
+    return [('FLUX.1-dev', '/root/autodl-tmp/models/FLUX.1-dev')]
+
 # 探测结果缓存：SSH 往返是这个模块最贵的操作，而选机逻辑每张图都会调用。
 # FLUX_PROBE_TTL=0 可关闭（调试/测试时用）。
 _PROBE_TTL = float(os.environ.get('FLUX_PROBE_TTL', '20'))
@@ -459,14 +482,28 @@ def run(cmd, timeout=30, stdin_data=None):
         return False, ('NO_BASH: 本机未找到 bash，无法执行 ssh/scp'
                        '（装 Git for Windows 或把 <Git>\\bin 加入 PATH）')
     try:
-        r = subprocess.run([bash, '-lc', cmd], capture_output=True, text=True,
-                           encoding='utf-8', errors='replace', timeout=timeout,
-                           input=stdin_data if stdin_data is not None else '',
-                           creationflags=SUBPROC_FLAGS)
+        # ⚠️ 这里**故意不用 text=True**，全程自己管 bytes ↔ str。
+        # 原因（2026-09-21 实测踩到，藏了很久的坑）：
+        # Windows 上 subprocess 的 text 模式会对 stdin 做通用换行转换 ——
+        # 写入的每个 '\n' 变成 '\r\n'，远端 bash 收到的每行都带 \r：
+        #   sleep: invalid time interval '3\r'
+        #   cd: $'/root/autodl-tmp/flux-t2i\r': No such file or directory
+        # 症状极像引号/转义写错，实际与引号毫无关系。
+        # 单行 payload（base64 参考图 / 提示词）没有 \n 可转所以一直没暴露；
+        # 一旦用 stdin 传多行脚本（如重启常驻服务）就必然炸。
+        # 修法：input 给 bytes、stdout/stderr 拿 bytes 再自己 decode ——
+        # bytes 路径下 Python 不做任何换行翻译。
+        # （不能用 newline='\n'：本机 Popen 不接受该参数。）
+        in_bytes = (stdin_data.encode('utf-8')
+                    if isinstance(stdin_data, str) else (stdin_data or b''))
+        r = subprocess.run([bash, '-lc', cmd], capture_output=True, timeout=timeout,
+                           input=in_bytes, creationflags=SUBPROC_FLAGS)
+        out_s = (r.stdout or b'').decode('utf-8', 'replace')
+        err_s = (r.stderr or b'').decode('utf-8', 'replace')
         if r.returncode != 0:
-            err = (r.stderr or r.stdout or '').strip()
+            err = (err_s or out_s or '').strip()
             return False, err[:400] or f'退出码 {r.returncode}'
-        return True, (r.stdout or '').strip()
+        return True, out_s.strip()
     except subprocess.TimeoutExpired:
         return False, 'TIMEOUT'
     except Exception as e:
@@ -636,14 +673,25 @@ def probe_full(server=None, force: bool = False) -> dict:
             return hit[1]
 
     port = int(os.environ.get('FLUX_RESIDENT_PORT', '9630'))
+    # 模型清单也要在这一趟里问掉（2026-09-21，为「界面选模型」服务）。
+    # 单问默认模型（remote_model）不够：flux6 上同时装了 dev 和 klein，
+    # 「有 klein」不代表「有 dev」。站点要按模型选机，就必须知道每台**各有哪些**。
+    # 仍然只花 1 次 SSH：把 N 个 test -f 串在同一条命令里。
+    # 注册表里的 remote_model 恒为 known_models[0] 对应的路径，故 model_ok 语义不变。
+    known = known_models()
+    remote_files = ''
+    for _mid, _mpath in known:
+        remote_files += f"test -f {_mpath}/DOWNLOAD_DONE && echo HAVE:{_mid} || true; "
+
     remote = (f"echo REACH; "
               f"nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; "
               f"test -f {s['remote_model']}/DOWNLOAD_DONE && echo MODEL_OK || echo MODEL_MISSING; "
+              f"{remote_files}"
               f"curl -s -m 5 http://127.0.0.1:{port}/health || echo HEALTH_FAIL")
     d = {'name': s.get('name'), 'alias': alias, 'reachable': False,
          'gpu_ok': False, 'gpu': '', 'model_ok': False,
          'resident': False, 'model_loaded': False, 'status': '',
-         'health': None, 'error': ''}
+         'health': None, 'error': '', 'models': []}
     ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {ssh_target(s)} '
                   f'{shlex.quote(remote)}', 20)
     if not ok:
@@ -663,11 +711,18 @@ def probe_full(server=None, force: bool = False) -> dict:
         else:
             d['reachable'] = True
             marks = {'REACH', 'MODEL_OK', 'MODEL_MISSING', 'HEALTH_FAIL'}
-            for ln in lines[1:]:                  # 跳过 REACH 行；GPU 名是第 2 行
+            # 扫描**全部**行，不能一碰到 GPU 名就 break ——
+            # GPU 名固定在第 2 行，HAVE: 行排在它后面（见 remote 命令的拼接顺序），
+            # break 会让 models 恒为空 → 模型过滤静默失效。
+            # 2026-09-21 实测踩到：探针输出 gpu 正常、models=[]，全程无报错。
+            for ln in lines[1:]:                  # 跳过 REACH 行
                 if ln in marks or ln.startswith('{'):
                     continue
-                d['gpu'] = ln[:80]
-                break
+                if ln.startswith('HAVE:'):
+                    d['models'].append(ln[5:])    # 本机已就绪的模型 id 清单
+                    continue
+                if not d['gpu']:                  # 第一非标记行 = GPU 名
+                    d['gpu'] = ln[:80]
             d['gpu_ok'] = bool(d['gpu']) and 'NVIDIA' in d['gpu']
             d['model_ok'] = 'MODEL_OK' in lines
             for ln in reversed(lines):            # /health 的 JSON 落在最后一段

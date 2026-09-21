@@ -319,7 +319,8 @@ def probe_all(force: bool = False) -> list:
     return fsm.probe_all(force=force)
 
 
-def _pick_from(cands: list, need_edit: bool = False) -> tuple:
+def _pick_from(cands: list, need_edit: bool = False,
+               need_model: str = None) -> tuple:
     """从 [(server, probe)] 里按分级规则挑一台。返回 (server|None, probe|None)。
 
     抽出来是为了让 CLI 的 `servers` 视图和生产选机走**同一套**判断 ——
@@ -333,6 +334,15 @@ def _pick_from(cands: list, need_edit: bool = False) -> tuple:
     而 FLUX.1-dev 的 FluxPipeline 没有这个参数，edit 任务在 dev 机上必然报
     「当前模型不支持图生图」。全平台只有装了 klein 的机器能跑编辑。
     字段缺失时不过滤（向后兼容老部署）。
+
+    need_model=<id>（2026-09-21 新增）→ **先按「本机有没有这个模型文件」过滤**。
+    这是「界面选模型」能真正生效的关键：dev 只在 flux1 上，klein 在 flux5/flux6 上，
+    不按模型过滤就会把「要 dev」的活派给只有 klein 的机器 —— GPU 侧白名单会拒
+    （400），但那时已经占了一次排队 + 一次 SSH，用户只看到「提交成功然后失败」。
+    分级在过滤后的子集里照常生效。
+
+    probe 里的 `models` 为空（旧版探针 / 直连模式）时**不过滤**：
+    保持旧行为，让 GPU 侧白名单去做最终判断，而不是在这里误判成「没有机器」。
     """
     if not cands:
         return None, None
@@ -342,6 +352,25 @@ def _pick_from(cands: list, need_edit: bool = False) -> tuple:
             cands = capable
         else:
             logger.warning('🟡 没有任何机器声明 supports_edit，本次不按能力过滤')
+
+    if need_model:
+        probed = [p for _s, p in cands if p.get('models')]
+        if probed:                       # 至少一台能报清单 → 才敢按模型过滤
+            has = [(s, p) for s, p in cands if need_model in (p.get('models') or [])]
+            if has:
+                cands = has
+            else:
+                # ★ 有清单、但谁都没有这个模型 → **返回 (None, ...)**，不硬挑。
+                # 为什么不能「仍按原列表挑」（2026-09-21 实测踩到）：
+                # 需要 edit+dev 时，edit 过滤先把 dev 机（supports_edit=false）剔掉，
+                # 只剩 klein 机；若这里回退成"挑 klein"，用户会看到
+                # 「提交成功 → 排队 → GPU 报模型不存在」，白等一整轮。
+                # 直接说「没有机器装这个模型」才是准确答案。
+                logger.warning(f'🔴 没有任何候选机装有所需模型 {need_model}'
+                               f'（候选：{[(p.get("name"), p.get("models")) for _s, p in cands]}）')
+                return None, (cands[0][1] if cands else None)
+        else:
+            logger.warning('🟡 探针未返回模型清单（旧版探针/直连模式），本次不按模型过滤')
 
     def pick(pred):
         for s, p in cands:
@@ -372,10 +401,12 @@ def _pick_from(cands: list, need_edit: bool = False) -> tuple:
     return None, cands[0][1]
 
 
-def find_available_server(force: bool = False, need_edit: bool = False) -> tuple:
+def find_available_server(force: bool = False, need_edit: bool = False,
+                          need_model: str = None) -> tuple:
     """挑一台「当前最该用」的服务器。返回 (server, probe)；全不可用返回 (None, probe)。
 
     need_edit=True：只在支持图生图（supports_edit）的机器里挑，见 _pick_from。
+    need_model=<id>：只在装了这个模型的机器里挑（界面选模型用），见 _pick_from。
 
     分级选择（这是「换了机器 / 克隆到新机后自动接上」的核心）：
 
@@ -389,7 +420,8 @@ def find_available_server(force: bool = False, need_edit: bool = False) -> tuple
     「可达但无卡（需到 AutoDL 控制台切【带卡模式】）」这条很有用的报错。
     这里把无卡机器降到最低优先级，但**不剔除**，正是为了不丢这条诊断信息。
     """
-    return _pick_from(probe_all(force=force), need_edit=need_edit)
+    return _pick_from(probe_all(force=force), need_edit=need_edit,
+                      need_model=need_model)
 
 
 def any_ready() -> bool:
@@ -580,7 +612,11 @@ def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1
     endpoint = '/edit' if ref_image_b64 else '/generate'
     sub = t.post_json(endpoint, body, timeout=90)
     job_id = sub['job_id']
-    logger.info(f'🎬 常驻任务 {job_id} 已提交（{endpoint}，队列深度 {sub.get("queue_depth")}）')
+    # 把模型记进日志：出图与预期不符时，第一个要回答的问题就是「这张用的是哪个模型」。
+    # 不记的话只能靠时间戳去 /models 的历史里猜，而换模型是随时会发生的。
+    _m = body.get('model')
+    logger.info(f'🎬 常驻任务 {job_id} 已提交（{endpoint}'
+                f'{f"，模型 {_m}" if _m else ""}，队列深度 {sub.get("queue_depth")}）')
 
     # 自适应退避轮询：SSH 传输下每次轮询都是一次往返，固定 3s 太密
     interval, deadline, t0 = 1.5, time.time() + timeout, time.time()

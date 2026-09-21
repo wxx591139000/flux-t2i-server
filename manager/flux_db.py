@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     seed         INTEGER,          -- 随机种子（可空 = 服务端随机；生成后回填实际值以便复现）
     steps        INTEGER,          -- 采样步数（可空 = 服务端默认 25）
     negative_prompt TEXT,          -- 负向提示词（可空；FLUX.1-dev 蒸馏模型会忽略它，透传仅为链路完整）
+    model        TEXT,             -- 指定模型 id（如 FLUX.2-klein-4B）；可空 = 用 GPU 当前已加载的模型（2026-09-21）
     edit_mode    INTEGER NOT NULL DEFAULT 0,  -- 1 = 图生图（走 resident /edit，需带参考图）
     has_ref      INTEGER NOT NULL DEFAULT 0,  -- 1 = 该任务带了参考图（参考图本体只存 GPU 机，不入库）
     image_path   TEXT,
@@ -107,6 +108,11 @@ class FluxDB:
                 'seed':            'ALTER TABLE jobs ADD COLUMN seed INTEGER',
                 'steps':           'ALTER TABLE jobs ADD COLUMN steps INTEGER',
                 'negative_prompt': 'ALTER TABLE jobs ADD COLUMN negative_prompt TEXT',
+                # 模型选择（2026-09-21）：界面可指定用哪套权重。
+                # 必须持久化 —— worker 异步、重启恢复孤儿任务时只能读 DB；
+                # 只在 HTTP 层记着会导致「重启后换模型的任务退回默认模型」，
+                # 出图与预期不符且完全不可追溯。
+                'model':           'ALTER TABLE jobs ADD COLUMN model TEXT',
             }.items():
                 if col not in jcols:
                     self._conn.execute(ddl)
@@ -344,13 +350,13 @@ class FluxDB:
     # ── jobs ──
     def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None,
                    width=None, height=None, seed=None, steps=None, negative_prompt=None,
-                   edit_mode=0, has_ref=0):
+                   edit_mode=0, has_ref=0, model=None):
         self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, '
-                   'width, height, seed, steps, negative_prompt, edit_mode, has_ref, created_at) '
-                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   'width, height, seed, steps, negative_prompt, edit_mode, has_ref, model, created_at) '
+                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    (job_id, user_id, prompt, original_prompt, 'queued', priority,
                     width, height, seed, steps, negative_prompt,
-                    1 if edit_mode else 0, 1 if has_ref else 0, int(time.time())))
+                    1 if edit_mode else 0, 1 if has_ref else 0, model, int(time.time())))
 
     def job_update(self, job_id, **fields):
         sets = ', '.join(f'{k}=?' for k in fields)

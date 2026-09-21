@@ -169,7 +169,24 @@ def t_source_level():
     check('WAIT_MAX_SEC 已定义', 'WAIT_MAX_SEC' in src)
     check('waiting 判死用等待时长而非重试次数',
           'waited > WAIT_MAX_SEC' in src and 'retry >= MAX_RETRY' not in src)
-    check('edit 任务按能力选机', 'find_available_server(need_edit=is_edit)' in src)
+    # 改成 AST 断言「选机调用里带了哪些关键字」而不是匹配
+    # 'find_available_server(need_edit=is_edit)' 这段字面量。
+    # 为什么必须换（2026-09-21）：加模型过滤时只是把调用拆成两行、多传一个参数，
+    # 字面量匹配立刻假红 —— 这是「测试测的是写法而不是行为」的典型。
+    # 现在断言的是「两个过滤器都在」，这才是有意义的不变量：
+    #   need_edit  丢了 → dev 机接 edit 任务（报「模型不支持图生图」）
+    #   need_model 丢了 → 要 dev 的活派给只有 klein 的机器（GPU 侧白名单拒）
+    _calls = []
+    for _n in ast.walk(ast.parse(src)):
+        if (isinstance(_n, ast.Call)
+                and isinstance(_n.func, ast.Attribute)
+                and _n.func.attr == 'find_available_server'):
+            _calls.append({kw.arg for kw in _n.keywords})
+    _all_kw = set().union(*_calls) if _calls else set()
+    check('选机调用点名了缺省机群', bool(_calls), f'{len(_calls)} 处调用')
+    check('edit 任务按能力选机', 'need_edit' in _all_kw, f'关键字={sorted(_all_kw)}')
+    check('文生图按模型选机（模型选择器）', 'need_model' in _all_kw,
+          f'关键字={sorted(_all_kw)}')
     check('参考图落盘 _ref_dir', 'def _ref_dir(self, job_id: str)' in src)
     check('参考图磁盘兜底 _get_ref', 'def _get_ref(self, job_id: str)' in src)
     check('参考图终态清理 _drop_ref', 'def _drop_ref(self, job_id: str)' in src)

@@ -13,7 +13,8 @@ FLUX.1 常驻生成服务（GPU 端）—— 消除「每张图冷启动」的�
 本服务把模型加载一次常驻内存，之后每个请求只做「生成」，不做「加载」。
 
 【协议】HTTP + JSON，默认只绑 127.0.0.1（不新增公网暴露面）
-    GET  /health                 → {status, model_loaded, offload, queue_depth, current_job, gpu, ...}
+    GET  /health                 → {status, model_loaded, model_id, profile, offload, queue_depth, current_job, gpu, ...}
+    GET  /models                 → {models:[{id,name,class_name,ready,size_gb,profile}], current, dirs}
     POST /generate               → {job_id, status:"queued", queue_depth}
     GET  /status?job_id=<id>     → {job_id, status, image_path, error, elapsed, runtime, seed}
     GET  /image?job_id=<id>      → PNG 二进制（加 &b64=1 → JSON {b64}）
@@ -22,10 +23,15 @@ FLUX.1 常驻生成服务（GPU 端）—— 消除「每张图冷启动」的�
 
 POST /generate 请求体（除 prompt 外全部可选）：
     {"prompt": "...", "negative_prompt": "", "width": 768, "height": 1024,
-     "steps": 25, "seed": null, "guidance_scale": 3.5, "priority": 0}
+     "steps": 25, "seed": null, "guidance_scale": 3.5, "priority": 0,
+     "model": "FLUX.2-klein-4B"}
   · 缺省即沿用 gen_flux.py 原有的固定值（768×1024 / steps 25 / seed 42），
     所以只传 prompt 的老调用方行为不变。
   · seed 传 null 或省略 = 每张随机且返回实际 seed（可复现：拿返回的 seed 再传一次）。
+  · model（2026-09-21 新增）传**模型 id**（见 GET /models），不传 = 用当前已加载的模型。
+    传了就由单 worker 在该任务开跑前**排队换模型**（前面的任务跑完才换，不打断任何人）。
+    steps/guidance 的默认值与上限会按**目标模型**重算（klein 4步/1.0、dev 25步/3.5），
+    所以「换模型」不会带到错误的采样参数。
 
 【鉴权】设 FLUX_RESIDENT_TOKEN 后，所有请求需带 X-Auth-Token 头；不设则不校验
 （服务只绑 127.0.0.1，仅本机/SSH 可达）。
@@ -298,6 +304,15 @@ class FluxWorker(threading.Thread):
             rec = self.store.get(job_id)
             if not rec or rec['status'] != STATUS_QUEUED:
                 continue                                  # 排队期间被取消
+            # ── 换模型（2026-09-21 新增）──────────────────────────────────────
+            # 位置很关键：**在单 worker 循环里、真正开跑之前**。
+            # 因为 worker 是串行队列，这里天然就是「排队等」——
+            # 前面的任务跑完才轮到我，此时才换模型，不打断任何人。
+            # 若放到 HTTP 层去做，就会出现「用户 A 刚提交、用户 B 一选模型就把
+            # A 正在生成的那张图的模型换掉」→ 用错模型出图，且极难排查。
+            self._ensure_model(rec)
+            if self.store.get(job_id)['status'] != STATUS_QUEUED:
+                continue                                  # 换模型期间被取消
             while not self.holder['ready'] and not self.holder['error'] and not self._stop.is_set():
                 time.sleep(0.5)                           # 模型还在加载：等着，不丢任务
             if self.holder['error']:
@@ -310,6 +325,48 @@ class FluxWorker(threading.Thread):
                 self._generate(rec)
             finally:
                 self.current_job = None
+
+    def _ensure_model(self, rec: dict):
+        """任务要求了别的模型 → 就地把常驻模型换掉（阻塞到加载完成）。
+
+        不换的两种情况都要**明确放过**，否则会把能跑的任务卡死：
+          1. 任务没指定 model（`None`）→ 用当前模型，兼容所有老调用方
+          2. 指定的就是当前模型 → 零开销
+
+        ⚠️ **stub 模式也走这条路径**（2026-09-21 修正）。曾经在这里对 stub 直接
+        return —— 理由是「stub 没有真实模型可言」。但那让「换模型」这条唯一的
+        风险路径**在离线环境完全无法验证**：只有 GPU 才能试，而它又正是最容易错的地方
+        （profile 重算、队列换模型时序、失败处置）。stub 现在同样认 model_id 并重算画像，
+        于是 `tools/_e2e_models_tmp.py` 能零成本覆盖整条链路。
+        """
+        want = (rec.get('params') or {}).get('model_id')
+        if not want:
+            return
+        cur = self.holder.get('model_id') or ''
+        if want == cur:
+            return
+
+        models = scan_models()
+        path, err = resolve_model_dir(want, models)
+        if err:
+            # ⚠️ 不把任务标失败：模型清单可能只是暂时读不到（磁盘抖动/权限）。
+            #    记在 holder 上让 /health 可见，任务留给用户重试 —— 直接判死并退款
+            #    会把「选错模型」和「机器故障」混成一件事。
+            self.holder['error'] = f'切换模型失败：{err}'
+            print(f'[fluxd] ❌ 切换模型失败（任务 {rec["job_id"]}）：{err}', flush=True)
+            return
+        stub = self.holder.get('offload') == 'stub'
+        offload = 'stub' if stub else (self.holder.get('offload') or 'model')
+        print(f'[fluxd] 🔁 任务 {rec["job_id"]} 要求 {want}，'
+              f'当前 {cur or "(未加载)"} → 开始排队切换（offload={offload}）', flush=True)
+        self.holder['ready'] = False
+        # 复用本机原有的 offload / stub 策略：换模型不该顺带改显存策略
+        load_model_async(self.holder, str(path), offload, stub)
+        # 阻塞等它加载完（worker 串行队列本身就是「排队等」的载体）
+        while not self.holder['ready'] and not self._stop.is_set():
+            time.sleep(0.5)
+        if self.holder['ready']:
+            print(f'[fluxd] ✅ 已切到 {want}', flush=True)
 
     def _generate(self, rec: dict):
         job_id = rec['job_id']
@@ -526,16 +583,157 @@ def model_profile(cls_name: str):
     return MODEL_PROFILES.get(cls_name, FALLBACK_PROFILE)
 
 
+# ── 可选模型清单（2026-09-21 新增：界面选模型）──────────────────────────
+#
+# 【为什么不在客户端硬编码模型列表】
+#   「这台机器上有哪些模型」是**机器属性**，会随克隆/下载变化。写死在站点或 manager 里，
+#   换台机就得改代码 —— 正是 servers.json 那次事故的同一种病（~/.ssh/config 在仓库外、
+#   不在版本控制里 → 克隆实例后 manager 永远看不见那台机器）。
+#   所以清单由**服务端扫盘得出**，客户端只做展示与选择。
+#
+# 【扫描规则】
+#   FLUX_MODEL_DIRS（冒号分隔）下的一级子目录，且含 model_index.json（diffusers 格式）。
+#   没有 DOWNLOAD_DONE 的**也列出但标 ready=false** —— 半下载的模型要能看见，
+#   否则用户选了才发现跑不了，比直接不列更糟。
+DEFAULT_MODEL_DIRS = '/root/klein-models:/root/autodl-tmp/models'
+
+
+def _split_dirs(raw: str) -> list:
+    """切分模型目录列表。同时容忍冒号（Linux）与分号（Windows）分隔。
+
+    ⚠️ **不能直接 `raw.split(':')`**：Windows 盘符自带冒号，`C:/a:C:/b` 会被切成
+    `['C', '/a', 'C', '/b']` —— 目录全部失效，而且表现出来是「扫不到任何模型」，
+    看起来像磁盘/权限问题（本地联调实测踩过）。所以按冒号切完后要把
+    「单字母盘符 + 后面那一段」重新粘回去。
+    """
+    parts = [p.strip() for p in raw.replace(';', ':').split(':')]
+    out, i = [], 0
+    while i < len(parts):
+        cur = parts[i]
+        # 盘符特征：恰好 1 个字母，且它是本段最后一个字符（说明冒号被切掉了）
+        if len(cur) == 1 and cur.isalpha() and i + 1 < len(parts):
+            out.append(f'{cur}:{parts[i + 1]}')     # 粘回 "C:" + "/path"
+            i += 2
+            continue
+        if cur:
+            out.append(cur)
+        i += 1
+    return out
+
+
+def _model_dirs() -> list:
+    raw = os.environ.get('FLUX_MODEL_DIRS') or DEFAULT_MODEL_DIRS
+    return [Path(p) for p in _split_dirs(raw)]
+
+
+def scan_models() -> list:
+    """扫出所有可用模型。返回 [{id, path, name, class_name, ready, size_gb, profile}]。
+
+    `id` = 目录名（如 `FLUX.2-klein-4B`），它是**跨层稳定标识**：
+    写进 jobs.model → 透传到 /generate 的 model 参数 → 服务端按 id 反查路径。
+    用 basename 而不是全路径，是为了让站点不必知道服务器的目录布局。
+    """
+    out = []
+    for d in _model_dirs():
+        if not d.is_dir():
+            continue
+        for sub in sorted(d.iterdir()):
+            if not sub.is_dir():
+                continue
+            mi = sub / 'model_index.json'
+            if not mi.is_file():
+                continue                     # 不是 diffusers 目录（可能是缓存/分片目录）
+            cls_name = ''
+            try:
+                cls_name = (json.loads(mi.read_text(encoding='utf-8'))
+                            .get('_class_name') or '')
+            except Exception:                # noqa: BLE001 —— 坏 json 不该让整个清单塌掉
+                cls_name = ''
+            d_steps, m_steps, guid, note = model_profile(cls_name)
+            out.append({
+                'id': sub.name,
+                'path': str(sub),
+                'name': sub.name,
+                'class_name': cls_name,
+                'ready': (sub / 'DOWNLOAD_DONE').is_file(),
+                'size_gb': _du_gb(sub),
+                'profile': {'default_steps': d_steps, 'max_steps': m_steps,
+                            'guidance': guid, 'note': note},
+            })
+    return out
+
+
+def _du_gb(p: Path) -> float:
+    """目录体积（GB，1 位小数）。只 stat，不读内容 —— 32G 的模型读一遍要好几分钟。
+
+    失败返回 0（体积只是展示信息，不值得为它让整个清单失败）。
+    """
+    total = 0
+    try:
+        for f in p.rglob('*'):
+            if f.is_file():
+                total += f.stat().st_size
+    except Exception:                        # noqa: BLE001
+        return 0.0
+    return round(total / (1024 ** 3), 1)
+
+
+def resolve_model_dir(model_id: str, models: list = None):
+    """按 id 反查模型目录。返回 (path, err)。
+
+    ⚠️ 只接受**清单里存在**的 id，不接受任意路径 —— 否则 model 参数会变成
+    一个任意目录读取原语（传 `../../etc` 之类）。这是本期新增的外部输入，
+    必须按白名单收口。
+    """
+    if not model_id:
+        return None, None                    # 未指定 → 由调用方用当前模型
+    for m in (models if models is not None else scan_models()):
+        if m['id'] == model_id:
+            if not m['ready']:
+                return None, f'模型 {model_id} 尚未下载完成（缺 DOWNLOAD_DONE）'
+            return Path(m['path']), None
+    return None, f'未知模型 {model_id!r}（本机没有这个模型，GET /models 看可用清单）'
+
+
 def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
-    """后台加载模型，让 /health 在加载期间就能响应（status=loading）。"""
+    """后台加载模型，让 /health 在加载期间就能响应（status=loading）。
+
+    【2026-09-21 改造：支持换模型】加 `switch_to` 参数后，本函数在**已加载**时
+    会把新模型换上去（worker 侧串行调用，天然实现「排队等」）。
+
+    ⚠️ 换模型的正确姿势是 **整体替换 holder['pipe']**，而不是就地 __setattr__：
+      旧 pipe 必须先释放（del + 显式 gc）再加载新的，否则 32G 的 dev + 15G 的 klein
+      同时驻留显存 → OOM。所以下面加载成功后才做「旧值出让」，且强制 gc。
+    """
+    target = {'path': str(model_path), 'offload': offload, 'stub': stub}
+    holder['target'] = target               # 让 /health 能显示「正在切到哪个」
 
     def _load():
         try:
             if stub:
                 holder['pipe'] = StubPipeline()
                 holder['offload'] = 'stub'
+                holder['model_path'] = str(model_path)
+                holder['model_id'] = Path(model_path).name
+                # ⚠️ STUB 也要给 profile：否则 /health 的 profile 是空的，
+                #    离线端到端测「换模型 → 采样参数跟着变」时读不到值 ——
+                #    而这条路径正是**唯一能不上 GPU 验证模型切换**的手段。
+                #    按 model_index.json 的真实类名取画像（stub 也要忠实）。
+                cls_name = ''
+                try:
+                    mi = Path(model_path) / 'model_index.json'
+                    cls_name = (json.loads(mi.read_text(encoding='utf-8'))
+                                .get('_class_name') or '')
+                except Exception:            # noqa: BLE001
+                    pass
+                holder['class_name'] = cls_name
+                d_steps, m_steps, guid, note = model_profile(cls_name)
+                holder['profile'] = {'default_steps': d_steps, 'max_steps': m_steps,
+                                     'guidance': guid, 'note': note}
                 holder['ready'] = True
-                print('[fluxd] STUB 模式：未加载真实模型，输出为合成占位图', flush=True)
+                holder['error'] = ''
+                print(f'[fluxd] STUB 模式：未加载真实模型，输出为合成占位图'
+                      f'（model_id={holder["model_id"]}, 画像 {d_steps}步/g={guid}）', flush=True)
                 return
             import torch
             print(f'[fluxd] 加载模型 {model_path} (offload={offload}) ...', flush=True)
@@ -556,18 +754,41 @@ def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
                     pipe.enable_model_cpu_offload()
                 else:  # none / 其余 → 全程显存
                     pipe.to('cuda')
+
+            # ── 新模型就绪，此时才出让旧的（换模型路径的关键）──────────────
+            old = holder.get('pipe')
+            if old is not None and old is not pipe:
+                holder['pipe'] = None        # 先摘掉引用，避免新加载期间被误用
+                del old
+                try:
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:            # noqa: BLE001 —— 释放失败不该让加载失败
+                    pass
+
             holder['pipe'] = pipe
             holder['offload'] = offload
             holder['class_name'] = cls_name
+            holder['model_path'] = str(model_path)
+            holder['model_id'] = Path(model_path).name
             # 采样参数画像跟着模型走（见 MODEL_PROFILES 的事故说明）
             d_steps, m_steps, guid, note = model_profile(cls_name)
             holder['profile'] = {'default_steps': d_steps, 'max_steps': m_steps,
                                  'guidance': guid, 'note': note}
             holder['ready'] = True
+            holder['error'] = ''             # 换模型成功要清掉上一次的 error
             print(f'[fluxd] 模型常驻就绪 ✅ ({cls_name}, offload={offload}) | '
                   f'画像: steps 默认 {d_steps} 上限 {m_steps}, guidance {guid}', flush=True)
         except Exception as e:
             holder['error'] = f'{type(e).__name__}: {e}'
+            # ⚠️ 换模型失败时**必须保持 ready=False**：旧 pipe 已在上面被释放，
+            #    此时若还是 ready=True，worker 会拿一个 None 去推理 → 整批任务崩。
+            #    ready=False 会让 worker 停在等待循环里，用户看到的是「切模型失败」，
+            #    而不是一串莫名其妙的 TypeError。
+            holder['ready'] = False
+            holder['pipe'] = None
             print(f'[fluxd] 模型加载失败 ❌ {holder["error"]}', flush=True)
 
     threading.Thread(target=_load, daemon=True, name='flux-model-loader').start()
@@ -643,6 +864,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._health()
         if not self._auth_ok():
             return
+        if path == '/models':
+            return self._models()
         if path == '/status':
             return self._status()
         if path == '/image':
@@ -689,6 +912,13 @@ class Handler(BaseHTTPRequestHandler):
             'model_loaded': ready,
             'model_error': err,
             'class_name': self.holder.get('class_name') or '',
+            # 当前加载的是哪个模型（2026-09-21 新增）—— 界面选模型后要能验证「真的换上了」，
+            # 而不是只看「有一张图出来了」。
+            'model_id': self.holder.get('model_id') or '',
+            'model_path': self.holder.get('model_path') or '',
+            # 切换目标：非空且与 model_id 不同 = 正在切。界面据此显示「切换中…」
+            'switching_to': ((self.holder.get('target') or {}).get('path') or '').split('/')[-1]
+                            if (self.holder.get('target') or {}).get('path') else '',
             # 采样参数画像（2026-09-21 新增）—— 让「这个模型该用几步/多少 guidance」
             # 成为**可远程读到的事实**，而不是散落在代码和设备记忆里。
             'profile': self.holder.get('profile') or {},
@@ -700,6 +930,19 @@ class Handler(BaseHTTPRequestHandler):
             'uptime_sec': round(time.time() - self.started_at, 1),
         })
 
+    def _models(self):
+        """可用模型清单。供界面渲染选择器 + 校验 model 参数合法性。"""
+        try:
+            models = scan_models()
+        except Exception as e:                   # noqa: BLE001 —— 扫盘失败也要给结构化错误
+            return self._json(500, {'error': f'扫描模型目录失败: {e}'})
+        return self._json(200, {
+            'models': [{k: m[k] for k in ('id', 'name', 'class_name', 'ready',
+                                          'size_gb', 'profile')} for m in models],
+            'current': self.holder.get('model_id') or '',
+            'dirs': [str(d) for d in _model_dirs()],
+        })
+
     def _generate(self, body: dict, is_edit: bool = False):
         """提交生成任务。
 
@@ -709,31 +952,56 @@ class Handler(BaseHTTPRequestHandler):
           - `image_url` : 服务端可达的 http(s) URL（本机路径不建议，避免 SSRF 面）
         落盘到 out_dir/refs/ 后把**路径**放进 params —— 队列是异步的，
         不能把 PIL 对象或大 base64 长期留在内存里的 job 记录里。
+
+        `model`（2026-09-21 新增）：**模型 id**（如 `FLUX.2-klein-4B`），来自 GET /models。
+        不传 = 用当前已加载的模型（完全兼容老调用方）。传了就由 worker 在
+        该任务真正开跑前**排队切换**（见 FluxWorker._ensure_model）。
         """
         prompt = (body.get('prompt') or '').strip()
         if not prompt:
             return self._err(400, 'prompt 不能为空')
-        if self.holder.get('error'):
-            return self._err(503, f"模型不可用: {self.holder['error']}")
-        if not self.holder.get('ready'):
-            return self._err(503, '模型仍在加载，请稍后重试（GET /health 看 model_loaded）')
+
+        # ── 解析目标模型（先于其它校验：后面的 steps 上限要按**目标**模型算）──
+        want_model = (body.get('model') or '').strip()
+        model_id = None
+        if want_model:
+            try:
+                models = scan_models()
+            except Exception as e:               # noqa: BLE001
+                return self._err(500, f'无法读取模型清单: {e}')
+            path, err = resolve_model_dir(want_model, models)
+            if err:
+                return self._err(400, err)
+            model_id = want_model
+            prof = next((m['profile'] for m in models if m['id'] == model_id), {})
+        else:
+            prof = self.holder.get('profile') or {}
+
+        # ⚠️ 这里的 ready/error 校验只用「不换模型」时把门。
+        #    换模型时，当前 holder 可能就是**另一个**模型的状态（比如当前是 dev、
+        #    用户要 klein，而 dev 正加载失败）—— 拿它去拒绝一个本来能跑的任务是错的。
+        #    换模型路径下由 worker 的 _ensure_model 负责加载与失败处置。
+        if not model_id:
+            if self.holder.get('error'):
+                return self._err(503, f"模型不可用: {self.holder['error']}")
+            if not self.holder.get('ready'):
+                return self._err(503, '模型仍在加载，请稍后重试（GET /health 看 model_loaded）')
         try:
             width = _norm_dim(body.get('width'), DEFAULT_WIDTH)
             height = _norm_dim(body.get('height'), DEFAULT_HEIGHT)
-            prof = self.holder.get('profile') or {}
             steps = int(body.get('steps') or prof.get('default_steps') or DEFAULT_STEPS)
             max_steps = int(prof.get('max_steps') or MAX_STEPS)
         except BadRequest as e:
             return self._err(400, str(e))
-        # 上限跟着模型走：klein 蒸馏版给 8（官方 4 步，>8 反而劣化），dev 给 100。
+        # 上限跟着**目标模型**走：klein 蒸馏版给 8（官方 4 步，>8 反而劣化），dev 给 100。
         # 这里**仍允许显式超出建议值**（只卡硬上限），因为用户可能确实在试参数；
         # 但不再允许 100 步这种对蒸馏模型毫无意义、只烧 GPU 的请求。
         if not (1 <= steps <= max_steps):
+            who = model_id or self.holder.get('class_name') or '当前模型'
             return self._err(
                 400,
                 f'steps 需在 1~{max_steps} 之间，收到 {steps}'
-                + (f'（当前模型：{self.holder.get("class_name")}，'
-                   f'{(prof.get("note") or "")}）' if prof else ''))
+                + (f'（目标模型：{who}，{(prof.get("note") or "")}）' if prof else ''))
         raw_seed = body.get('seed')
         if raw_seed is not None and raw_seed != '':
             try:
@@ -742,6 +1010,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(400, f'seed 必须是整数或 null，收到 {raw_seed!r}')
         else:
             raw_seed = None
+        # guidance 默认值也必须按**目标模型**取：klein 要 1.0、dev 要 3.5。
+        # 若按当前模型取，换模型的第一个任务会用错 guidance（静默劣化，正是
+        # MODEL_PROFILES 那次事故的同一类问题）。
+        guid_default = float(prof.get('guidance') or DEFAULT_GUIDANCE)
         params = {
             'prompt': prompt,
             'negative_prompt': (body.get('negative_prompt') or '').strip(),
@@ -749,8 +1021,10 @@ class Handler(BaseHTTPRequestHandler):
             'height': height,
             'steps': steps,
             'seed': raw_seed,
-            'guidance_scale': float(body.get('guidance_scale') or DEFAULT_GUIDANCE),
+            'guidance_scale': float(body.get('guidance_scale') or guid_default),
         }
+        if model_id:
+            params['model_id'] = model_id           # worker 据此决定要不要换模型
         if is_edit:
             try:
                 ref_path = self._save_ref_image(body)
@@ -899,7 +1173,11 @@ def main():
 
     out_dir = Path(args.out)
     store = JobStore(out_dir=out_dir, status_dir=out_dir / 'status')
-    holder = {'pipe': None, 'ready': False, 'error': '', 'offload': ''}
+    # model_id/model_path/target/profile 在 load_model_async 里回填；
+    # 这里先给全默认值，让 /health 在模型加载期间也能读到稳定结构（不是 KeyError）。
+    holder = {'pipe': None, 'ready': False, 'error': '', 'offload': '',
+              'model_id': '', 'model_path': '', 'class_name': '',
+              'profile': {}, 'target': {}}
     worker = FluxWorker(store, holder)
     worker.start()
     load_model_async(holder, args.model, args.offload, args.stub)
@@ -910,6 +1188,14 @@ def main():
     print(f'[fluxd] 监听 http://{args.host}:{args.port}  ({mode})'
           f'{"  鉴权: 开" if token else "  鉴权: 关"}', flush=True)
     print(f'[fluxd] 输出目录 {out_dir}', flush=True)
+    # 启动时把可用模型打出来 —— 「这台机器上有哪些模型」是最常被问到的问题，
+    # 打印一次就省掉一次 ssh 去 ls 目录。
+    try:
+        found = [m for m in scan_models() if m['ready']]
+        print(f'[fluxd] 可用模型（{len(found)} 个已就绪）: '
+              f'{", ".join(m["id"] for m in found) or "(无)"}', flush=True)
+    except Exception as e:                       # noqa: BLE001
+        print(f'[fluxd] 扫描模型目录失败: {e}', flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

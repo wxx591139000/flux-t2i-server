@@ -237,6 +237,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._api_status(q)
             elif path == '/api/my':
                 self._api_my(token)
+            elif path == '/api/models':
+                self._api_models()
             elif path == '/api/admin/users':
                 self._api_admin_users()
             elif path == '/api/admin/codes':
@@ -316,10 +318,20 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         negative_prompt = data.get('negative_prompt') or None
+        # 模型选择（2026-09-21）：只做类型与长度收口，**合法性交给 GPU 侧白名单**。
+        #   manager 不持有模型清单 —— 那是机器属性（扫盘得出），复制一份必然漂移。
+        #   非法值会让任务明确 failed 并退款，用户看到原因，不会静默用错模型出图。
+        model = data.get('model')
+        if model is not None:
+            model = str(model).strip() or None
+            if model and len(model) > 128:
+                self._json({'error': 'model 参数过长（>128）'}, 400)
+                return
 
         self._resolve_user(token)
         result = self.scheduler.submit(token, prompt, priority,
-                                       width, height, seed, steps, negative_prompt)
+                                       width, height, seed, steps, negative_prompt,
+                                       model=model)
         self._json(result)
 
     def _api_edit(self, token, body):
@@ -361,12 +373,81 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         negative_prompt = data.get('negative_prompt') or None
+        model = data.get('model')
+        if model is not None:
+            model = str(model).strip() or None
+            if model and len(model) > 128:
+                self._json({'error': 'model 参数过长（>128）'}, 400)
+                return
 
         self._resolve_user(token)
         result = self.scheduler.submit(token, prompt, priority,
                                        width, height, seed, steps, negative_prompt,
-                                       ref_image=ref_image)
+                                       ref_image=ref_image, model=model)
         self._json(result)
+
+    def _api_models(self):
+        """透传 GPU 侧的可选模型清单（站点「选择模型」下拉的数据源）。
+
+        **本端点永不 5xx**：站点把它当成页面初始化的一个可选增强，一旦报错就会
+        把整个提交表单卡住。任何失败都降级成 `models: [] + reason`，让站点回落到
+        「不传 model」（= 用 GPU 当前已加载的模型）这条老路径。
+
+        为什么不在 manager 里缓存：清单来自 GPU 机的 model_index.json，
+        开机 / 换机 / 装新模型都会变，缓存只会让界面显示不存在或缺失的模型。
+        但**选机的 probe 本身有 TTL 缓存**（FLUX_PROBE_TTL，默认 20s），
+        所以这个端点的真实 SSH 开销通常是 0 —— 除非距上次选机已超过 TTL。
+
+        语义与 GPU 侧 /models 一致：`current` 是**当前已加载**的模型 id，
+        `switching_to` 是**正在排队切换**的目标（切换期间 current 仍是旧值）。
+        """
+        try:
+            from manager import flux_resident_client as frc
+        except Exception as e:                       # 导入期异常也不能让接口塌
+            self._json({'models': [], 'current': None, 'switching_to': None,
+                        'dirs': [], 'reason': f'客户端不可用：{e}'})
+            return
+
+        try:
+            server, p = frc.find_available_server()
+        except Exception as e:
+            self._json({'models': [], 'current': None, 'switching_to': None,
+                        'dirs': [], 'reason': f'选机失败：{e}'})
+            return
+
+        if not server:
+            self._json({'models': [], 'current': None, 'switching_to': None,
+                        'dirs': [],
+                        'reason': (p or {}).get('error') or '没有可用的 GPU 机器'})
+            return
+
+        # /models 走的是「127.0.0.1:{port}」那条健康链路：常驻没在跑时它会连不上，
+        # 这正是我们要的降级信号 —— 站点此时该退回「不传 model」。
+        try:
+            data = frc._transport(server).get_json('/models', timeout=15)
+        except Exception as e:
+            self._json({'models': [], 'current': None, 'switching_to': None,
+                        'dirs': [],
+                        'server': server.get('name'),
+                        'reason': f'{server.get("name")} 常驻未就绪：{str(e)[:160]}'})
+            return
+
+        models = data.get('models') or []
+        # 只给站点它真正需要的东西：id / name / 就绪 / 能否图生图都够了。
+        # **不外传 path**：那是 GPU 机的绝对路径，对前端毫无用处，
+        # 且属于内部拓扑信息。
+        slim = [{'id': m.get('id'), 'name': m.get('name') or m.get('id'),
+                 'ready': bool(m.get('ready')),
+                 'class_name': m.get('class_name'),
+                 'size_gb': m.get('size_gb')}
+                for m in models if m.get('id')]
+        self._json({
+            'models': slim,
+            'current': data.get('current'),
+            'switching_to': data.get('switching_to'),
+            'server': server.get('name'),
+            'dirs': data.get('dirs') or [],
+        })
 
     def _api_status(self, q):
         job_id = q.get('job_id', [''])[0]
