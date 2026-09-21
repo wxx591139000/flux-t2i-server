@@ -574,6 +574,30 @@ MODEL_PROFILES = {
 FALLBACK_PROFILE = (DEFAULT_STEPS, MAX_STEPS, DEFAULT_GUIDANCE,
                     '未知模型：使用保守默认值')
 
+# ── 图生图能力表（2026-09-21 新增）──────────────────────────────
+# 图生图要求 pipeline 的 __call__ 接受 `image` 参数。
+#   · Flux2KleinPipeline（klein 系列）接受  → 能跑图生图
+#   · FluxPipeline（FLUX.1-dev）**没有这个参数** → 跑了必然报「当前模型不支持图生图」
+#     （2026-09-20 实测：edit 任务落在 dev 机上 100% 失败）
+#
+# ★ 为什么这张表必须在**这里**（而不是让前端按模型名猜）：
+#   这是**模型的能力属性**，只有加载它的这一侧真正知道。前端若用
+#   `/klein/i.test(id)` 这类名字正则判断，将来加一个名字里不含 "klein"
+#   但支持编辑的模型就会误判（反之亦然），而且判断逻辑散落在两个仓库里。
+#   现在上游声明 → /api/models 透传 → 前端只消费 `supports_edit` 布尔值。
+MODEL_EDIT_CAPABLE = {
+    'Flux2KleinPipeline': True,
+    'FluxPipeline': False,
+}
+# 未识别的类名 → False（保守：说不支持，顶多让用户换个模型；
+# 说支持却跑不了，用户会白等一整轮才收到失败）
+FALLBACK_EDIT_CAPABLE = False
+
+
+def model_supports_edit(cls_name: str) -> bool:
+    """这个 pipeline 能不能跑图生图。按类名查表，未识别 → False（保守）。"""
+    return MODEL_EDIT_CAPABLE.get(cls_name or '', FALLBACK_EDIT_CAPABLE)
+
 
 def model_profile(cls_name: str):
     """按 pipeline 类名取采样参数画像，返回 (default_steps, max_steps, guidance, note)。
@@ -655,6 +679,9 @@ def scan_models() -> list:
                 'path': str(sub),
                 'name': sub.name,
                 'class_name': cls_name,
+                # ★ 图生图能力（2026-09-21 新增）：由**上游按 pipeline 类名声明**，
+                #   前端据此置灰/强制选模型，不要再用 `id` 里有没有 "klein" 去猜。
+                'supports_edit': model_supports_edit(cls_name),
                 'ready': (sub / 'DOWNLOAD_DONE').is_file(),
                 'size_gb': _du_gb(sub),
                 'profile': {'default_steps': d_steps, 'max_steps': m_steps,
@@ -937,8 +964,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:                   # noqa: BLE001 —— 扫盘失败也要给结构化错误
             return self._json(500, {'error': f'扫描模型目录失败: {e}'})
         return self._json(200, {
+            # ⚠️ 这里是**白名单**不是黑名单：只放行这些键，`path`（GPU 上的绝对路径）
+            #    绝不能出去（对外站点不该知道服务器目录布局）。
+            #    新增可外泄字段时**必须显式加进这个元组** —— 反过来（把 path pop 掉）
+            #    将来加字段就会漏出去。
             'models': [{k: m[k] for k in ('id', 'name', 'class_name', 'ready',
-                                          'size_gb', 'profile')} for m in models],
+                                          'size_gb', 'profile', 'supports_edit')}
+                       for m in models],
             'current': self.holder.get('model_id') or '',
             'dirs': [str(d) for d in _model_dirs()],
         })
@@ -974,8 +1006,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(400, err)
             model_id = want_model
             prof = next((m['profile'] for m in models if m['id'] == model_id), {})
+            tgt_edit = next((m['supports_edit'] for m in models
+                             if m['id'] == model_id), None)
         else:
             prof = self.holder.get('profile') or {}
+            # 「不传 model」= 用当前已加载的模型 → 它的能力要看**当前那个**。
+            # 用 id 回查清单而不是另存一份 holder 字段：能力表的唯一来源是类名，
+            # 多存一份就会漂移。查不到时给 None（= 不知道，不拦）。
+            cur_id = self.holder.get('model_id') or ''
+            tgt_edit = None
+            if cur_id:
+                try:
+                    tgt_edit = next((m['supports_edit'] for m in scan_models()
+                                     if m['id'] == cur_id), None)
+                except Exception:                # noqa: BLE001 —— 扫盘失败不该拦住任务
+                    tgt_edit = None
+
+        # ── ★ 图生图硬闸（2026-09-21 新增）──────────────────────────────
+        # 图生图要求 pipeline 的 __call__ 接受 `image`。FLUX.1-dev 的
+        # FluxPipeline **没有这个参数**，落在 dev 上必然失败（2026-09-20 实测）。
+        #
+        # 为什么要在**这里**再拦一道（前端已经置灰了非 klein 的模型）：
+        #   前端的约束可以被绕过 —— 老版本页面、直调 API、或前端将来改坏。
+        #   而这里的判据是**能力表**，不依赖调用方自觉。
+        #   报错必须明确说「换模型」，不能说成服务故障 —— 否则用户会一直重试。
+        if is_edit and tgt_edit is False:
+            return self._err(400, f'当前模型不支持图生图（{model_id or "当前已加载的模型"}）。'
+                                  f'请改用支持图生图的模型（klein 系列），或去掉参考图用文生图。')
 
         # ⚠️ 这里的 ready/error 校验只用「不换模型」时把门。
         #    换模型时，当前 holder 可能就是**另一个**模型的状态（比如当前是 dev、
