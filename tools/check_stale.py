@@ -41,11 +41,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # 这些文件一改就要求重启（web 进程在 import 时把代码读进内存，之后不会再读盘）。
 # 不列 server/ 下的常驻文件：那些跑在 GPU 机上，由看门狗管，不是本进程的事。
+#
+# ⚠️ 清单要覆盖**所有被 web 进程 import 的本地模块**，漏一个就会有假绿。
+#    2026-09-21 实测踩到：flux_server_manager.py 改了（加 CREATE_NO_WINDOW 消弹窗）
+#    但不在清单里 → 本脚本报「不需要重启」，而进程其实是旧的，
+#    于是改动静默不生效、弹窗照旧。凡是 manager/ 下被 import 的模块都该列进来。
 WATCH_FILES = [
     'manager/flux_web_service.py',
     'manager/flux_queue.py',
     'manager/flux_db.py',
     'manager/flux_quota.py',
+    'manager/flux_server_manager.py',      # 传输层/机群探活（run() 在这）
+    'manager/flux_resident_client.py',     # 常驻客户端（ensure_resident 在这）
 ]
 
 # 只有在"代码里有这个端点"时才探它 —— 否则扫到的 404 是正常语义，会误报旧进程。
@@ -185,9 +192,11 @@ def main():
             print(f'   直接证据：{", ".join(stale_by_route)} 在远端 404')
         if stale_by_time:
             print('   时间证据：进程启动早于最近一次代码改动')
-        print('\n   修复：双击 flux-t2i-server\\启动-01-FLUX文生图服务.bat')
-        print('   注意：脚本检测到 9620 已占用时可能跳过启动，需先停掉旧进程。')
-        print('   重启后再跑本脚本，应显示「进程是新的」。')
+        print('\n   修复（任选其一）：')
+        print('     · 双击 flux-t2i-server\\启动-01R-FLUX服务重启.bat   ← 推荐，自带验收')
+        print('     · 或： .\\start_service.ps1 -Target flux -Restart')
+        print('   ⚠️ 不要点「启动-01-FLUX文生图服务.bat」——它对已占端口只跳过，不会重启。')
+        print('   重启后再跑本脚本，应显示「进程是当前代码」。')
         return 1
     print('✅ 结论：进程是当前代码，不需要重启')
     return 0

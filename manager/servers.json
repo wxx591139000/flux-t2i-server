@@ -100,8 +100,7 @@
       "remote_model": "/root/klein-models/FLUX.2-klein-4B",
       "offload": "none",
       "supports_edit": true,
-      "enabled": false,
-      "note": "flux.2 klein 4B5（2026-09-21 建）。⚠️ 当前 enabled=false：**克隆尚未完成**，下面这条地址是「克隆前」那台源实例的，克隆出来的新实例地址通常会变。等用户给出克隆完成后的新 SSH 命令后：① 更新 host/port ② 改 enabled=true ③ 跑 watchdog\\authorize_key.py 装看门狗 key ④ 跑 manager\\acceptance_gpu.py --server flux6 过 11 项验收。⚠️ 注意本机在 **westb** 区（flux1/flux5 在 westc/westd），别按习惯填 westc。GPU=RTX 4080 SUPER 32760 MiB（与 flux5 同款）。角色同 flux5：klein 4B / offload=none / 能图生图 → 两台互为备份。2026-09-21 实测（源实例）：密钥 ~/.ssh/id_rsa_musetalk **免密直连通过，无需密码**，hostname=autodl-container-1b714b8fee-9113e52d"
+      "note": "flux.2 klein 4B5（2026-09-21 克隆完成并启用）。⚠️ 注意本机在 **westb** 区（flux1/flux5 在 westc/westd），别按习惯填 westc —— 克隆前后地址实测一致（westb:47445）。GPU=RTX 4080 SUPER 32760 MiB（与 flux5 同款）。角色同 flux5：klein 4B / offload=none / 能图生图 → 两台互为备份。2026-09-21 实测：密钥 ~/.ssh/id_rsa_musetalk **免密直连通过，无需密码**，hostname=autodl-container-1b714b8fee-9113e52d。验收：python manager\\acceptance_gpu.py --server flux6；看门狗补 key：python watchdog\\authorize_key.py"
     }
   ]
 }
