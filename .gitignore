@@ -24,3 +24,6 @@ server/prompts.json        # 业务提示词不入库，用 example 模板
 Thumbs.db
 # tests/manual 是一次性验证脚本目录：脚本入库，产物不入库
 tests/manual/_*
+
+# 本地备份目录（改动既有文件前建的 md5 基线快照，不入库）
+.backup-*/

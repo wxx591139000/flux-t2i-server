@@ -343,10 +343,15 @@ class FluxWorker(threading.Thread):
             # 让「模型不支持某参数」在日志里看得见，而不是靠人去猜。
             import inspect
             sig = set(inspect.signature(self.holder['pipe'].__call__).parameters)
+            # 采样参数按**模型画像**取默认值，不再用全局常量（2026-09-21 修复）——
+            # 蒸馏版 klein 必须 steps≈4 / guidance=1.0，用 dev 时代的 25/3.5 会静默劣化质量。
+            prof = self.holder.get('profile') or {}
+            p_steps = int(prof.get('default_steps') or DEFAULT_STEPS)
+            p_guid = float(prof.get('guidance') or DEFAULT_GUIDANCE)
             cand = {
                 'negative_prompt': p.get('negative_prompt') or '',
-                'num_inference_steps': int(p.get('steps') or DEFAULT_STEPS),
-                'guidance_scale': float(p.get('guidance_scale') or DEFAULT_GUIDANCE),
+                'num_inference_steps': int(p.get('steps') or p_steps),
+                'guidance_scale': float(p.get('guidance_scale') or p_guid),
                 'width': int(p.get('width') or DEFAULT_WIDTH),
                 'height': int(p.get('height') or DEFAULT_HEIGHT),
                 'generator': generator,
@@ -480,6 +485,47 @@ def _resolve_pipe_class(model_path: str):
     return cls, cls_name
 
 
+# ── 模型采样参数画像（2026-09-21 新增，此前是个**真实缺陷**）─────────────
+#
+# 事故：DEFAULT_STEPS=25 / DEFAULT_GUIDANCE=3.5 是 FLUX.1-dev 时代遗留的默认值，
+# 换到 klein 后**从未按模型校正**。而 klein 4B 是 **step-distilled + guidance-distilled**
+# 模型 —— 官方固定 4 步、guidance 锁 1.0（见 BFL 官方文档与 HF 模型卡）。
+#
+# 后果（两条，都是静默的）：
+#   1. **guidance 错 3.5 倍**：站点从不传 guidance_scale，于是恒用 3.5。
+#      蒸馏版把 CFG 烘进权重，推理时 guidance 必须为 1.0；给 3.5 属于超范围外推，
+#      有害无益。这是**从部署第一天起就一直在发生的**质量损失。
+#   2. **steps 空转**：蒸馏版 4 步就完成去噪，>8 步官方明确说质量**下降**。
+#      实测佐证（2026-09-20，同一 prompt/seed）：15 步 16s、35 步 164s ——
+#      耗时差主要来自队列拥挤而非步数，说明多出的步数在蒸馏模型上几乎不产生有效计算。
+#
+# 为什么不改 DEFAULT_STEPS 常量了事：那只是把 25 换成 4，**dev 机换回来就又错了**。
+# 参数画像必须是**模型属性**，跟着加载的模型走 —— 所以在这里按类名推断。
+#
+# ⚠️ 这张表是**声明**，不是实测：klein 蒸馏版 4 步/1.0 来自 BFL 官方文档
+#    （docs.bfl.ai/flux_2: "Inference steps 4 (step-distilled)"、"guidance 1.0"）。
+#    Base 变体的 50 步/4.0 同样来自官方。dev 的 25 步/3.5 是本站历史实测值。
+MODEL_PROFILES = {
+    # 类名 → (默认步数, 建议上限, 默认 guidance, 备注)
+    'Flux2KleinPipeline': (4, 8, 1.0,
+                           'klein 4B/9B **蒸馏版**：官方 4 步、guidance 锁 1.0；'
+                           '社区实测 >8 步质量下降'),
+    'FluxPipeline': (25, 100, 3.5,
+                     'FLUX.1-dev：guidance-distilled，步数越多越好（本站历史默认 25）'),
+}
+# 未识别的类名 → 退回保守画像（宁可慢，不要崩）
+FALLBACK_PROFILE = (DEFAULT_STEPS, MAX_STEPS, DEFAULT_GUIDANCE,
+                    '未知模型：使用保守默认值')
+
+
+def model_profile(cls_name: str):
+    """按 pipeline 类名取采样参数画像，返回 (default_steps, max_steps, guidance, note)。
+
+    识别不到时退回 FALLBACK_PROFILE —— 与旧行为完全一致，不会让新模型跑不起来。
+    """
+    return MODEL_PROFILES.get(cls_name, FALLBACK_PROFILE)
+
+
 def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
     """后台加载模型，让 /health 在加载期间就能响应（status=loading）。"""
 
@@ -513,8 +559,13 @@ def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
             holder['pipe'] = pipe
             holder['offload'] = offload
             holder['class_name'] = cls_name
+            # 采样参数画像跟着模型走（见 MODEL_PROFILES 的事故说明）
+            d_steps, m_steps, guid, note = model_profile(cls_name)
+            holder['profile'] = {'default_steps': d_steps, 'max_steps': m_steps,
+                                 'guidance': guid, 'note': note}
             holder['ready'] = True
-            print(f'[fluxd] 模型常驻就绪 ✅ ({cls_name}, offload={offload})', flush=True)
+            print(f'[fluxd] 模型常驻就绪 ✅ ({cls_name}, offload={offload}) | '
+                  f'画像: steps 默认 {d_steps} 上限 {m_steps}, guidance {guid}', flush=True)
         except Exception as e:
             holder['error'] = f'{type(e).__name__}: {e}'
             print(f'[fluxd] 模型加载失败 ❌ {holder["error"]}', flush=True)
@@ -637,6 +688,10 @@ class Handler(BaseHTTPRequestHandler):
             'status': 'error' if err else ('ok' if ready else 'loading'),
             'model_loaded': ready,
             'model_error': err,
+            'class_name': self.holder.get('class_name') or '',
+            # 采样参数画像（2026-09-21 新增）—— 让「这个模型该用几步/多少 guidance」
+            # 成为**可远程读到的事实**，而不是散落在代码和设备记忆里。
+            'profile': self.holder.get('profile') or {},
             'offload': self.holder.get('offload') or '',
             'queue_depth': self.worker.depth,
             'current_job': self.worker.current_job,
@@ -665,11 +720,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             width = _norm_dim(body.get('width'), DEFAULT_WIDTH)
             height = _norm_dim(body.get('height'), DEFAULT_HEIGHT)
-            steps = int(body.get('steps') or DEFAULT_STEPS)
+            prof = self.holder.get('profile') or {}
+            steps = int(body.get('steps') or prof.get('default_steps') or DEFAULT_STEPS)
+            max_steps = int(prof.get('max_steps') or MAX_STEPS)
         except BadRequest as e:
             return self._err(400, str(e))
-        if not (1 <= steps <= MAX_STEPS):
-            return self._err(400, f'steps 需在 1~{MAX_STEPS} 之间，收到 {steps}')
+        # 上限跟着模型走：klein 蒸馏版给 8（官方 4 步，>8 反而劣化），dev 给 100。
+        # 这里**仍允许显式超出建议值**（只卡硬上限），因为用户可能确实在试参数；
+        # 但不再允许 100 步这种对蒸馏模型毫无意义、只烧 GPU 的请求。
+        if not (1 <= steps <= max_steps):
+            return self._err(
+                400,
+                f'steps 需在 1~{max_steps} 之间，收到 {steps}'
+                + (f'（当前模型：{self.holder.get("class_name")}，'
+                   f'{(prof.get("note") or "")}）' if prof else ''))
         raw_seed = body.get('seed')
         if raw_seed is not None and raw_seed != '':
             try:

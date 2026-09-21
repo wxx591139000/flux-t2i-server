@@ -314,6 +314,49 @@ if _submit:
        if 'with self._submit_lock:' in src else False,
        '翻译段必须在锁之前')
 
+    # ── T11f~h：**英文直传**（2026-09-21 明确为契约）────────────────────
+    # 此前"英文不翻译"只是碰巧成立（因为 if has_chinese(...) 恰好为假），
+    # 没有任何断言守着。一旦有人把条件改成「无条件翻译」，所有英文提示词会被
+    # LLM 悄悄改写 —— 而改写是**静默**的：出图不对，日志里却只有一条正常的
+    # 「翻译完成」。这三条把这个行为钉死。
+    ok('T11f ★ 翻译被 has_chinese() 门控（英文不触发翻译）',
+       'has_chinese(' in src,
+       '翻译必须只对有中文的提示词生效')
+
+    # 关键：`original_prompt = prompt if has_chinese(prompt) else None`
+    # 这个形态保证英文时 original_prompt 为 None → 不进 if → 不翻译。
+    # 注意 if 的条件本身是 `if original_prompt:`（不是直接写 has_chinese），
+    # 所以这里测的是**赋值表达式里有没有用 has_chinese 做门控**，
+    # 以及那个被门控的变量有没有真的被用来守卫翻译调用。
+    gate_var = None
+    for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(n, ast.Assign) and 'has_chinese(' in ast.unparse(n.value):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    gate_var = t.id
+    ok('T11g1 ★ 存在 `X = ... if has_chinese(...) else ...` 门控赋值',
+       gate_var is not None, f'门控变量 = {gate_var}')
+
+    guarded = False
+    if gate_var:
+        for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+            if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == gate_var:
+                if 'translate_to_flux_prompt(' in ast.unparse(
+                        ast.Module(body=n.body, type_ignores=[])):
+                    guarded = True
+    ok('T11g ★ 翻译调用被该门控变量守卫（不是无条件调用）', guarded,
+       f'if {gate_var}: 里必须真的调用翻译')
+
+    # 英文直传时不应有任何改写 prompt 的操作：确认 else 分支不碰 translate
+    else_touches_translate = False
+    for n in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(n, ast.If) and n.orelse:
+            if 'translate_to_flux_prompt' in ast.unparse(
+                    ast.Module(body=n.orelse, type_ignores=[])):
+                else_touches_translate = True
+    ok('T11h ★ 任何 else 分支都不调用翻译（英文一个字符都不改）',
+       not else_touches_translate)
+
 print()
 print(f'== prompt_translator 回归门: {RESULTS.count(True)}/{len(RESULTS)} 通过 ==')
 sys.exit(0 if all(RESULTS) else 1)

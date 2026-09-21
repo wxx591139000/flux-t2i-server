@@ -145,10 +145,26 @@ class FluxQueueScheduler:
         if not prompt:
             return {'error': '提示词不能为空'}
 
-        # 0. 中文提示词 → FLUX 友好英文提示词（借鉴短剧 FLUX 方法论）
-        #    翻译失败**不降级为中文**：FLUX.1-dev 是双英文编码器（CLIP-L + T5-XXL），
-        #    中文直发出图会完全跑偏 —— 实测直发中文把「白色马克杯」画成了动漫少女。
-        #    所以失败就把任务拒掉并说明原因，让用户知道该重试/改用英文。
+        # 0. 提示词处理：**只有中文才走翻译层；英文原样直传，一个字符都不改**。
+        #
+        #    （2026-09-21 明确为契约，此前只是"碰巧成立"）
+        #    「英文直传」不是省钱省事的偷懒，而是**必须**的：
+        #      a) 用户/调用方写的英文提示词往往已经针对 FLUX 调过（含质量词、构图词），
+        #         再过一层 LLM 改写 = 把用户精心写的 prompt 换成一个"看起来差不多"的版本，
+        #         出图与预期不符却查不出原因；
+        #      b) 翻译是有损的：LLM 会"顺手"补充它认为合理的元素（把 mug 译成
+        #         "coffee mug on wooden table"），而用户只说了杯；
+        #      c) 直传才能保证**可复现**：同一 prompt+seed 必须出同一张图，
+        #         经过 LLM 改写就不可能稳定（翻译结果会漂移，见 _dedup_key 的 bug B）。
+        #
+        #    中文为什么要翻译：klein 的 Qwen3 编码器 / dev 的 CLIP-L+T5-XXL 都是
+        #    以英文语料为主训练的，中文直发出图会跑偏（实测：直发中文把「白色马克杯」
+        #    画成了动漫少女）。翻译失败**不降级为中文**，而是拒绝任务并说明原因 ——
+        #    静默降级会让用户拿到一张完全无关的图，比直接失败更糟。
+        #
+        #    ⚠️ 改动这里的任何逻辑前先想清楚：**这条 if 就是"英文直传"的唯一保证**。
+        #       把它去掉（无条件翻译）会让所有英文提示词被 LLM 悄悄改写。
+        #       tests/test_model_profile.py 与 test_prompt_translator.py 有断言钉住。
         original_prompt = prompt if has_chinese(prompt) else None
         if original_prompt:
             try:
@@ -158,6 +174,9 @@ class FluxQueueScheduler:
                 return {'error': '中文提示词翻译失败（翻译服务繁忙），请稍后重试，或改用英文提示词'}
             if prompt != original_prompt:
                 logger.info(f'🌐 中文已转换: {original_prompt[:30]} → {prompt[:50]}...')
+        else:
+            # 英文直传：显式记一笔，便于排查时确认"这次确实没经过翻译层"
+            logger.debug('🌐 英文提示词直传（未经过翻译层）')
 
         # 1~3 全部收进同一把锁：去重检查、配额、队列上限、入队、计费、登记
         #    必须是一个原子动作。web 层是多线程的，拆开会留出竞态窗口 ——
