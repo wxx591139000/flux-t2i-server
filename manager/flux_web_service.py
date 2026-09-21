@@ -28,6 +28,20 @@ _load_env()  # 加载 manager/.env（WEB_ADMIN_TOKEN 等）
 
 logger = logging.getLogger('manager.flux_web_service')
 
+
+def _row_value(row, col, default=None):
+    """从 sqlite3.Row **安全取列**（列不存在返回 default，而非抛 IndexError）。
+
+    与 flux_queue._row_value 是同一份逻辑，**故意各留一份**：web 层 import 调度器会
+    引入反向依赖（flux_queue 已 import 本模块的兄弟），为一个 5 行工具冒循环导入风险
+    不值得。触发场景：老库没跑到 ALTER TABLE 迁移（缺 deleted_at 列）时直接索引即炸，
+    而 web 层一炸就是整页 500（2026-09-21）。
+    """
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return default
+
 WEB_ADMIN_TOKEN = os.environ.get('WEB_ADMIN_TOKEN', '')
 SERVICE_NAME = 'FLUX 文生图'
 OWNER_UNLIMITED_HINT = 'owner'
@@ -250,6 +264,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._api_submit(token, body)
             elif path == '/api/edit':
                 self._api_edit(token, body)
+            elif path == '/api/delete':
+                self._api_delete(token, body)
             elif path == '/api/activate':
                 self._api_activate(body, token)
             elif path == '/api/bind':
@@ -375,6 +391,11 @@ class _Handler(BaseHTTPRequestHandler):
         if job['user_id'] != token:
             self._send(403, '无权访问')
             return
+        # 已删任务的图片必须立刻不可达：否则「删了但直链还能下载」，
+        # 用户会认为删除没生效（图片字节也确实还在被服务）。
+        if _row_value(job, 'deleted_at') is not None:
+            self._send(404, '图片已被删除')
+            return
         img = Path(job['image_path'])
         if not img.exists():
             self._send(404, '图片文件缺失')
@@ -386,6 +407,105 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Disposition', f'inline; filename="{job_id}.png"')
         self.end_headers()
         self.wfile.write(data)
+
+    def _api_delete(self, token, body):
+        """彻底删除某个任务（记录 + 图片文件）。
+
+        **权限**：只能删自己的。SQL 层用 `user_id=?` 钉死（见 db.job_mark_deleted），
+        所以越权在数据层就不可能发生；这里的 403 只是为了给出人话报错。
+
+        **删除是"彻底"的**，分两种情形：
+          · 已完成/已失败（终态）→ 立即删图片文件 + 打墓碑，用户视角立刻消失。
+          · 排队中/生成中（在途）  → 打墓碑 + 从待跑队列剔除；**图片交给 worker 收尾**。
+            为什么不当场删：任务可能已经派给 GPU 在跑了，现在删文件它跑完还会再写一张；
+            而且 worker 完成后需要知道"这活用户不要了"，才能丢弃产物。
+            worker 侧靠 jobs_abandoned() / job_get() 看到墓碑后自行清理。
+
+        **不退配额**：用完即消耗。若删除退额度，用户可"删了重传"无限刷，套餐形同虚设
+        （已失败任务本来就退过款，不受影响）。
+
+        返回里带 `purged` 字段，告诉调用方这次是"立即清干净了"还是"交给后台收尾"。
+        """
+        data = json.loads(body or '{}')
+        job_id = (data.get('job_id') or '').strip()
+        if not job_id:
+            self._json({'error': '缺少 job_id'})
+            return
+        job = self.db.job_get(job_id)
+        if not job:
+            self._json({'error': '任务不存在'})
+            return
+        if job['user_id'] != token:
+            # 措辞刻意与"不存在"一致：不泄漏"这个 id 确实存在、只是不是你的"
+            self._json({'error': '任务不存在或无权删除'}, 403)
+            return
+        if _row_value(job, 'deleted_at') is not None:
+            self._json({'ok': True, 'job_id': job_id, 'purged': True, 'note': '任务此前已删除'})
+            return
+
+        status = job['status']
+        inflight = status in ('queued', 'generating')
+
+        # ① 先打墓碑 —— 这一步成功才算"删除受理"。
+        #    顺序很重要：先打墓碑再清文件，任何时刻中断都不会出现"文件没了但任务还在"的
+        #    半死状态（那种状态下用户看到任务却永远打不开图，比不删更糟）。
+        if not self.db.job_mark_deleted(job_id, token):
+            self._json({'error': '删除失败，请重试'}, 500)
+            return
+
+        purged = False
+        if not inflight:
+            # ② 终态任务：图片文件立即物理删除
+            purged = self._purge_job_image(job_id)
+
+        # ③ 在途任务：从调度器内存里剔掉（队列/等待池/去重键），别让它再被捞起来
+        if inflight:
+            try:
+                self.scheduler.drop_job(job_id, job)
+            except Exception as e:                                # noqa: BLE001
+                # 剔除失败不能回滚删除 —— 墓碑已经打了，worker 会兜住（跑完自查发现已删则丢弃）
+                logger.warning(f'删除任务 {job_id} 时从调度器剔除失败（worker 会兜住）: {e}')
+
+        logger.info(f'🗑️  用户删除任务 {job_id}（原状态 {status}，'
+                    f'{"图片已清理" if purged else "在途，交 worker 收尾"}）')
+        self._json({'ok': True, 'job_id': job_id, 'purged': purged,
+                    'was_inflight': inflight,
+                    'note': '已删除' if purged else '已删除，生成中的任务会在结束后自动清理'})
+
+    def _purge_job_image(self, job_id: str) -> bool:
+        """删除该任务产出的图片文件（含图生图的参考图目录）。返回是否有文件被删。
+
+        ⚠️ **绝不做目录级 rm -rf**：image_path 来自数据库，历史数据里可能是任意路径。
+        只允许删除"确实存在、且是普通文件/我们自己的产物目录"的目标，且逐个操作，
+        宁可少删也不要因为一条脏数据误删整个目录（2026-09-21）。
+        """
+        removed = False
+        try:
+            job = self.db.job_get(job_id)
+            if not job:
+                return False
+            # 产物 PNG：只删文件本身
+            p = _row_value(job, 'image_path')
+            if p:
+                f = Path(p)
+                if f.is_file():
+                    f.unlink()
+                    removed = True
+                    logger.info(f'🗑️  已删除图片文件 {f}')
+            # 该任务的输出目录 web_out/<job_id>/（若有），仅当它确实是我们约定的产物目录
+            for d in (Path('web_out') / job_id,):
+                if d.is_dir() and d.name == job_id:
+                    for child in d.iterdir():
+                        if child.is_file():
+                            child.unlink()
+                            removed = True
+                    try:
+                        d.rmdir()          # 只删空目录；非空说明还有别的东西，留着
+                    except OSError:
+                        pass
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning(f'清理任务 {job_id} 图片时出错（墓碑已打，图片可能残留）: {e}')
+        return removed
 
     def _api_activate(self, body, token: str = ''):
         """激活激活码（新建账户 / 并入已有账户）。
@@ -650,9 +770,11 @@ def _render_jobs(jobs, token=''):
         rows.append(f'<tr><td>{j["job_id"]}</td><td>{status}</td>'
                     f'<td>{full}</td>'
                     f'<td>{img}</td><td>{err}</td>'
-                    f'<td>{j["created_at"]}</td></tr>')
+                    f'<td>{j["created_at"]}</td>'
+                    f'<td><button type="button" class="delbtn" '
+                    f'onclick="delJob(\'{j["job_id"]}\', this)">删除</button></td></tr>')
     if not rows:
-        return '<tr><td colspan="6" style="text-align:center;color:#888">暂无任务</td></tr>'
+        return '<tr><td colspan="7" style="text-align:center;color:#888">暂无任务</td></tr>'
     return ''.join(rows)
 
 
@@ -669,6 +791,9 @@ button:hover{{background:#3a63d6}} input{{border:1px solid #ddd;border-radius:8p
 table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:8px;border-bottom:1px solid #eee;text-align:left}}
 .status{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px}}
 .msg{{margin-top:10px;font-size:13px}} .ok{{color:#16a34a}} .err{{color:#dc2626}}
+.delbtn{{background:#fff;color:#dc2626;border:1px solid #f0b4b4;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}}
+.delbtn:hover{{background:#fef2f2}}
+.delbtn[disabled]{{opacity:.45;cursor:default}}
 </style></head><body>
 <h1>{service}</h1>
 <div class="card meta">你的Token: <code>{token}</code> · 套餐: <b>{plan}</b> · 用量: {usage}<br>
@@ -688,7 +813,7 @@ table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:8px;b
 <small style="color:#888">新客户输入激活码创建账户；换设备时输入已激活的码可并入同一账户，共享套餐与用量</small></div>
 
 <div class="card"><h2>我的任务</h2><table>
-<tr><th>任务ID</th><th>状态</th><th>提示词</th><th>图片</th><th>错误</th><th>时间</th></tr>
+<tr><th>任务ID</th><th>状态</th><th>提示词</th><th>图片</th><th>错误</th><th>时间</th><th>操作</th></tr>
 {jobs}</table></div>
 
 <script>
@@ -709,6 +834,23 @@ function activate(){{
 }}
 function amsg(t,cls){{var m=document.getElementById('amsg');m.innerHTML='<span class="'+cls+'">'+t+'</span>'}}
 function msg(t,cls){{var m=document.getElementById('msg');m.innerHTML='<span class="'+cls+'">'+t+'</span>'}}
+// 彻底删除任务（记录 + 图片）。二次确认是必须的：此操作不可恢复，
+// 且配额不退（用完即消耗），用户可能以为删了就能退回次数。
+function delJob(id,btn){{
+  if(!confirm('确定彻底删除任务 '+id+' 吗？\\n\\n· 记录与图片都会被删除，不可恢复\\n· 已消耗的额度不会退回'))return;
+  btn.disabled=true;btn.textContent='删除中';
+  fetch('/api/delete',{{method:'POST',body:JSON.stringify({{job_id:id}})}})
+    .then(r=>r.json()).then(d=>{{
+      if(d.ok){{
+        var tr=btn.closest('tr'); if(tr)tr.style.opacity='.35';
+        btn.textContent='已删除';
+        setTimeout(()=>location.reload(),600);
+      }}else{{
+        btn.disabled=false;btn.textContent='删除';
+        alert(d.error||'删除失败');
+      }}
+    }}).catch(e=>{{btn.disabled=false;btn.textContent='删除';alert('删除失败: '+e)}})
+}}
 fetch('/api/my').then(r=>r.json()).then(d=>{{
   var el=document.getElementById('acct');
   if(d.bound){{el.innerHTML='账户: <code>'+d.account_id+'</code> · 共享套餐: <b>'+d.plan+'</b> · '+d.usage}}else{{el.innerHTML='未绑定账户，可用独立套餐'}}
@@ -722,13 +864,30 @@ body{{font-family:system-ui,sans-serif;max-width:1000px;margin:0 auto;padding:20
 .card{{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
 table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:8px;border-bottom:1px solid #eee;text-align:left}}
 img{{border-radius:8px}} a{{color:#4a76f7}}
+.delbtn{{background:#fff;color:#dc2626;border:1px solid #f0b4b4;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}}
+.delbtn:hover{{background:#fef2f2}} .delbtn[disabled]{{opacity:.45;cursor:default}}
 </style></head><body>
 <div class="card"><h1>{service} · 我的任务</h1>
 <div class="meta">Token: <code>{token}</code> · 套餐: <b>{plan}</b> · 用量: {usage}</div>
 <a href="/">← 返回生成页</a></div>
 <div class="card"><table>
-<tr><th>任务ID</th><th>状态</th><th>提示词</th><th>图片</th><th>错误</th><th>时间</th></tr>
-{jobs}</table></div></body></html>"""
+<tr><th>任务ID</th><th>状态</th><th>提示词</th><th>图片</th><th>错误</th><th>时间</th><th>操作</th></tr>
+{jobs}</table></div>
+<script>
+// 彻底删除任务（记录 + 图片）。二次确认是必须的：不可恢复，且配额不退。
+function delJob(id,btn){{
+  if(!confirm('确定彻底删除任务 '+id+' 吗？\\n\\n· 记录与图片都会被删除，不可恢复\\n· 已消耗的额度不会退回'))return;
+  btn.disabled=true;btn.textContent='删除中';
+  fetch('/api/delete',{{method:'POST',body:JSON.stringify({{job_id:id}})}})
+    .then(r=>r.json()).then(d=>{{
+      if(d.ok){{
+        var tr=btn.closest('tr'); if(tr)tr.style.opacity='.35';
+        btn.textContent='已删除';
+        setTimeout(()=>location.reload(),600);
+      }}else{{btn.disabled=false;btn.textContent='删除';alert(d.error||'删除失败')}}
+    }}).catch(e=>{{btn.disabled=false;btn.textContent='删除';alert('删除失败: '+e)}})
+}}
+</script></body></html>"""
 
 _HTML_ADMIN = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">

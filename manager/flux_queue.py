@@ -75,6 +75,22 @@ def _strip_data_uri(b64: str) -> str:
     return s
 
 
+def _row_value(row, col, default=None):
+    """从 sqlite3.Row **安全取列**：列不存在时返回 default，而不是抛 IndexError。
+
+    为什么需要它（2026-09-21 实测踩到）：
+      `sqlite3.Row` 与 dict 不同 —— 取一个**不存在的列**会抛 `IndexError: No item with
+      that key`，而不是返回 None。而 `_process` 跑在 worker 线程里，任何未捕获异常
+      都会**打死 worker**（之后所有任务永远卡在 queued，网站一直转圈）。
+      典型触发场景：老库没跑到 ALTER TABLE 迁移（缺 deleted_at 列）时，直接索引即炸。
+    所以凡是"较新加入的列"，都走这个函数读。
+    """
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return default
+
+
 def _dedup_key(user_id, prompt, seed=None, width=None, height=None,
                original_prompt=None, edit_mode=0) -> str:
     """去重键的**唯一**构造入口（2026-09-17 修，两个 bug 一起治）。
@@ -286,6 +302,57 @@ class FluxQueueScheduler:
         except Exception:                            # noqa: BLE001
             pass
 
+    def drop_job(self, job_id: str, job: dict = None):
+        """用户删除任务时把它从调度器内存里剔掉（2026-09-21）。
+
+        清三处，缺一处都会留下"幽灵任务"：
+          1. `_waiting`   —— 不清的话机器恢复后会被重新入队，白跑一遍
+          2. `_inflight`  —— 去重键。不清的话用户删掉后**再也提交不了同样参数**，
+                             报"重复提交"却找不到那个任务（用户视角像 bug）
+          3. `_pq`        —— PriorityQueue 不支持按值删除，只能整体重建后回填。
+                             ⚠️ 必须在锁内做，且**取出后要放回**没被删的那些，
+                             否则会静默丢掉其他用户排队的任务。
+
+        `job` 传进来是为了算去重键（键依赖 prompt/seed/尺寸/edit_mode）。
+        拿不到 job 就退化为只清 _waiting（宁可漏清去重键，也不要误删别人的队列项）。
+
+        ⚠️ 锁的选择：用 `_submit_lock`（与 submit 同一把）。
+        `_pq` / `_inflight` 都由它保护，这里若自造一把锁就会与 submit 并发 → 竞态。
+        顺序上先释放 _submit_lock 再碰 _ref_lock（`_drop_ref`），**绝不嵌套**
+        —— `_ref_lock` 有自死锁前科，嵌套必炸。
+        """
+        with self._submit_lock:
+            self._waiting.discard(job_id)
+
+            if job:
+                try:
+                    key = _dedup_key(job.get('user_id'), job.get('prompt'), job.get('seed'),
+                                     job.get('width'), job.get('height'),
+                                     original_prompt=job.get('original_prompt'),
+                                     edit_mode=job.get('edit_mode'))
+                    self._inflight.discard(key)
+                except Exception as e:                 # noqa: BLE001
+                    logger.warning(f'drop_job {job_id} 计算去重键失败（去重键可能残留）: {e}')
+
+            # 重建优先队列，剔除目标 job_id
+            kept = []
+            while True:
+                try:
+                    kept.append(self._pq.get_nowait())
+                except queue.Empty:
+                    break
+            dropped = 0
+            for item in kept:
+                if item[2] == job_id:
+                    dropped += 1
+                    continue
+                self._pq.put(item)
+            if dropped:
+                logger.info(f'🗑️  drop_job {job_id}: 已从待跑队列移除 {dropped} 项')
+
+        # 参考图（图生图）也一并释放：用户在内存里的那张没了意义
+        self._drop_ref(job_id)
+
     # ── worker ──
     def start(self):
         self._recover_stale_waiting()   # 启动时恢复上次遗留的 waiting 任务
@@ -339,6 +406,20 @@ class FluxQueueScheduler:
         # job_get() 返回的是 sqlite3.Row —— 它支持 [] 索引但**没有 .get()**。
         # 统一转成 dict 再用 .get()：既兼容 Row，缺列时也不会抛 IndexError。
         job = dict(job)
+
+        # ── 用户已删？worker 是异步的，用户可能在排队期间就把任务删了（2026-09-21）──
+        # 这里必须**再查一次**：入队时剔除（db.jobs_queued 排除墓碑）与"此刻"之间存在窗口，
+        # 且 worker 可能刚从优先队列拿到一个已被删除的 job_id。
+        # 直接丢弃 = 不烧 GPU、不留产物，这是最省的一档。
+        if job.get('deleted_at') is not None:
+            logger.info(f'🗑️  {job_id} 已被用户删除，跳过生成')
+            try:
+                self.db.job_hard_delete(job_id)     # 墓碑已无用，物理清掉
+            except Exception as e:                  # noqa: BLE001
+                logger.warning(f'清理已删任务 {job_id} 失败: {e}')
+            self._drop_ref(job_id)
+            return
+
         user_id = job['user_id']
         # 必须与入队时同一把钥匙，否则 discard() 永远清不掉（详见 _dedup_key 的 bug 说明）
         key = _dedup_key(user_id, job.get('prompt'), job.get('seed'),
@@ -348,6 +429,28 @@ class FluxQueueScheduler:
         try:
             self.db.job_update(job_id, status='generating')
             ok, err = self._generate(job)
+
+            # ── 生成期间用户删了？（"任何状态都能删"的收尾）──
+            # 任务已派给 GPU、撤不回来，只能跑完后丢弃产物：
+            #   · 成功 → 把刚写出的图删掉，任务完结（不留"已删但图还在"）
+            #   · 失败 → 不退款（生成确实消耗了 GPU；且退款会与"删了重刷"混淆）
+            # 无论哪条，都要**物理删除墓碑行**：在途任务至此终结，墓碑的使命完成了。
+            #
+            # ⚠️ 用 columns 判断而不是直接 `fresh['deleted_at']`：
+            #    sqlite3.Row 取不存在的列会抛 IndexError（不是返回 None），
+            #    而 _process 的异常会**打死 worker 线程**。若哪天迁移没跑到
+            #    （老库没 deleted_at 列），直接索引就是线上事故。
+            fresh = self.db.job_get(job_id)
+            if fresh is not None and _row_value(fresh, 'deleted_at') is not None:
+                logger.info(f'🗑️  {job_id} 生成期间被用户删除，丢弃产物并收尾')
+                self._drop_ref(job_id)
+                self._purge_output(job_id)
+                try:
+                    self.db.job_hard_delete(job_id)
+                except Exception as e:              # noqa: BLE001
+                    logger.warning(f'清理已删任务 {job_id} 失败: {e}')
+                return
+
             if ok:
                 self.db.job_update(job_id, status='done', completed_at=int(time.time()))
                 self._drop_ref(job_id)
@@ -367,8 +470,38 @@ class FluxQueueScheduler:
                     self._refund_quota(job, '业务失败')
         finally:
             # finally 而非写在末尾：_generate 抛异常时也必须释放去重键，
-            # 否则这组参数会被永久占用 —— 同用户再也提交不了同样内容。
+            # 否则这组参数会被永久占用 —— 同用户再也提交不了相同内容。
             self._inflight.discard(key)
+
+    def _purge_output(self, job_id: str):
+        """丢弃某个任务的产出图片（worker 侧收尾用）。
+
+        与 web 层 `_purge_job_image` 同目的，但**故意不复用**：web 层那份在
+        ThreadingHTTPServer 的请求线程里跑，这份在 worker 线程里跑；两份都只做
+        "删这一个任务的产物"，不共享任何状态，重复 20 行换来两条链路互不牵连
+        （worker 是生死线，不能因为 web 侧一个改动就崩）。
+        """
+        try:
+            row = self.db.job_get(job_id)
+            if not row:
+                return
+            p = _row_value(row, 'image_path')
+            if p:
+                f = Path(p)
+                if f.is_file():
+                    f.unlink()
+                    logger.info(f'🗑️  已丢弃产物 {f}')
+            d = Path('web_out') / job_id
+            if d.is_dir() and d.name == job_id:
+                for child in d.iterdir():
+                    if child.is_file():
+                        child.unlink()
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+        except Exception as e:                        # noqa: BLE001
+            logger.warning(f'丢弃任务 {job_id} 产物失败（图片可能残留）: {e}')
 
     def _refund_quota(self, job, reason: str):
         """终态失败时退还配额（幂等，靠 jobs.refunded_at 防重复退）。
