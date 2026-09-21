@@ -2,6 +2,49 @@
 
 > 持续更新。格式：`[日期] 问题 → 原因 → 解决`
 
+## 子进程弹窗 / 无控制台进程（2026-09-21 第三轮）
+
+### 1. ★ 「一直有 2 个 bash.exe 不时弹窗」—— 无控制台的服务拉子进程会**新建可见控制台**
+
+- **症状**：用户报「一直有 2 个 bash.exe 不时弹窗」。**没有报错、功能正常**，
+  只是每隔一会儿蹦出一两个黑窗自己消失。
+- **误导性**：第一反应是去查「谁在调 bash」。而**全局搜索只能搜到 `hooks\run-hook.cmd`**
+  （superpowers 插件的 SessionStart 钩子）—— 看上去完美契合"不时弹窗"，
+  于是很容易就下结论了。**但那是错的**：该插件并不在 `enabledPlugins` 里（是禁用状态），
+  `hooks.json` 也只注册了 `SessionStart`（会话开始才触发一次），**解释不了"一直"**。
+- **正确的取证方式（别推理，去观测进程树）**：连续采样 `Get-CimInstance Win32_Process`，
+  抓 `bash.exe` 的 **ParentProcessId**。实测：
+  ```
+  round 3 : bash count=4  [PID=314588 PPID=157804 11:09:13] ...
+                                     ↑ PPID=157804 就是 flux_service.py
+  ```
+  **父进程正是自己拉起的 flux_service** —— 一眼定性。
+- **根因两层**：
+  1. `manager/flux_server_manager.py` 的 `run()` 用
+     `subprocess.run([bash, '-lc', cmd], ...)`，**没有 `creationflags`**；
+  2. `flux_service.py` 是**无控制台**的（.bat 用 `-WindowStyle Hidden`、
+     工具里用 `DETACHED_PROCESS` 拉）。Windows 在「无控制台的父进程 + 有控制台子系统
+     的子进程」时会**新建一个可见控制台** → 弹窗。
+- **为什么是"2 个"、为什么"不时"**：`_dispatch` 的 `interval=120s`，每轮对每台
+  可达机做探活（`ssh` 一次 = 一个 bash），一轮里常有 1~2 次调用 → **每约 2 分钟弹 1~2 个**。
+- **修法**：
+  ```python
+  CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+  SUBPROC_FLAGS = CREATE_NO_WINDOW          # 所有子进程统一用它
+  subprocess.run([...], creationflags=SUBPROC_FLAGS)
+  ```
+  `0x08000000` 仅 Windows 有效；`os.name != 'nt'` 时为 0（等于不加），
+  所以同一份代码在 Linux 侧（watchdog / resident）无副作用。
+- **闸门**：`tests/test_transport_env.py` D 组（3 项）——
+  **用 AST 遍历文件里所有 `subprocess.*` 调用**，任何一处漏 `creationflags` 就报红；
+  另有一条变异断言（把 `creationflags=` 删掉必须报红）。
+  ⚠️ 为什么用 AST 而不是 `grep`：新写一处 subprocess 就会重新开始弹窗，
+  而「偶尔弹个黑窗」**没人会当成 bug 报上来** —— 必须机器兜住。
+- **通用教训**：**「无控制台的父进程」是个会放大的环境属性**。
+  在服务里 spawn 任何控制台程序（bash/python/ffmpeg/nvidia-smi…）都要显式加
+  `CREATE_NO_WINDOW`，否则在「双击 .bat 起的服务」上就会弹窗，
+  而在「从终端里起的」上不会 —— 典型的**只在生产暴露**的问题。
+
 ## 启动脚本 / 进程生命周期（2026-09-21 第二轮，**本轮最贵的一次**）
 
 > 这一轮的坑全部围绕"**我怎么知道我的修复真的生效了**"。

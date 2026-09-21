@@ -39,6 +39,25 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# ── 隐藏子进程控制台窗口（Windows）────────────────────────────────────
+# ⚠️ 为什么必须有它（2026-09-21 实测，用户报"一直有 2 个 bash.exe 不时弹窗"）：
+#   `run()` 用 subprocess.run([bash, '-lc', cmd]) 执行 ssh/scp，**没有 creationflags**。
+#   本项目正常的启动方式是「无控制台」的：
+#     · flux_service.py 由 .bat 用 -WindowStyle Hidden 拉起（无控制台）
+#     · 我这边用 DETACHED_PROCESS 拉起（无控制台）
+#   此时 Windows 给子进程**新建一个可见控制台**——于是每轮探活都弹一个黑窗。
+#   `_dispatch` 的 interval=120s，所以表现为「不时弹窗」，且通常一次两个
+#   （同一轮里 ssh 探活 + 别的 ssh/scp 各一个）。
+#   实测证据：`Get-CimInstance Win32_Process` 抓到
+#     bash.exe PID=314588 PPID=157804 (=flux_service.py) Created=11:09:13
+#   即 bash 的父进程就是无控制台的 flux_service。
+#   加 CREATE_NO_WINDOW 后不弹窗，**功能完全不变**（ssh/scp 照常）。
+#   注：该常量仅 Windows 有效；Linux 上 os.name!='nt' 时为 0（等于不加）。
+CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
+# 所有「不需要窗口」的子进程统一用它。有人新增 subprocess 调用时请照抄。
+SUBPROC_FLAGS = CREATE_NO_WINDOW
+
 # 确保项目根在 sys.path，才能 import manager.*
 BASE_DIR = Path(__file__).parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -442,7 +461,8 @@ def run(cmd, timeout=30, stdin_data=None):
     try:
         r = subprocess.run([bash, '-lc', cmd], capture_output=True, text=True,
                            encoding='utf-8', errors='replace', timeout=timeout,
-                           input=stdin_data if stdin_data is not None else '')
+                           input=stdin_data if stdin_data is not None else '',
+                           creationflags=SUBPROC_FLAGS)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or '').strip()
             return False, err[:400] or f'退出码 {r.returncode}'

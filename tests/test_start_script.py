@@ -130,6 +130,30 @@ def main():
     check('变异：把环境修复换成删项后，[2] 的断言必须报红',
           'SetEnvironmentVariable' not in mutated2)
 
+    # ---------- [6] 伞项目启动脚本（用户实际点的那个） ----------
+    # ⚠️ 为什么也要管：用户报障时点的是 image-platform\启动-生图平台.bat，
+    #    而它委派的 start_platform.ps1 **原本也是「端口被占就跳过、且不透传 -Restart」** ——
+    #    即同一个坑在上一层重演了一遍。只修上游而不修伞层 = 用户照样重启不了。
+    print('\n[6] 伞项目 start_platform.ps1（必须先停再起，且把 -Restart 透传下去）')
+    plat = BASE.parent / 'image-platform' / 'start_platform.ps1'
+    if not plat.exists():
+        print(f'  ⏭  跳过：{plat} 不存在（伞项目不在本工作区）')
+    else:
+        psrc = plat.read_text(encoding='utf-8-sig')
+        pbody = code_only(psrc)
+        check('声明了 [switch]$Restart（用户才有重启入口）',
+              re.search(r'\[switch\]\s*\$Restart', pbody) is not None)
+        check('存在 Stop-PortOwner（自己也要能停端口）',
+              re.search(r'function\s+Stop-PortOwner', pbody) is not None)
+        check('★ 把 -Restart 透传给上游 start_service.ps1（不透传 = 白重启）',
+              re.search(r"start_service\.ps1'\)\s*-Target\s+flux\s+-Restart", pbody) is not None,
+              '应形如：& (Join-Path $FluxProj \'start_service.ps1\') -Target flux -Restart')
+        check('端口被占且未给 -Restart 时要提示"不会加载新代码"',
+              '不会' in psrc and '新代码' in psrc)
+        check('站点段也支持 -Restart', pbody.count('Stop-PortOwner') >= 2)
+        check('伞层 .bat 也要有重启版（用户按名字就能找到）',
+              (BASE.parent / 'image-platform' / '启动-生图平台-重启.bat').exists())
+
     print('\n' + '=' * 66)
     print(f'启动脚本回归门：{passed} 项通过，{failed} 项失败')
     print('=' * 66)

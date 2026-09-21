@@ -75,7 +75,7 @@
       "remote_model": "/root/klein-models/FLUX.2-klein-4B",
       "offload": "none",
       "supports_edit": true,
-      "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。**现存唯一能跑图生图的机器**：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1 上会直接报「当前模型不支持图生图」。supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）。2026-09-20 确认：实例**未被释放**（当时只释放了 flux.2 klein 4B / 4B2），已重新启用；开机后若端口变了改这里即可，不用动代码｜⚠️ flux4 已被 flux5 取代，停用留痕，不再探活",
+      "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。曾是可跑图生图的机器之一：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1 上会直接报「当前模型不支持图生图」。supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）。｜⚠️ 已退役并由 flux5 接替（见 flux5 条目），停用留痕，不参与探活",
       "enabled": false
     },
     {
@@ -89,6 +89,19 @@
       "offload": "none",
       "supports_edit": true,
       "note": "flux.2 klein 4B4，2026-09-20 从 flux.2 klein 4B3 克隆，RTX 4080 SUPER 32G｜模型预设 klein：klein 4B 约 15 GiB，32G 卡可 offload=none；pipeline 接受 image → 能图生图"
+    },
+    {
+      "name": "flux6",
+      "host": "connect.westb.seetacloud.com",
+      "port": 47445,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/klein-models/FLUX.2-klein-4B",
+      "offload": "none",
+      "supports_edit": true,
+      "enabled": false,
+      "note": "flux.2 klein 4B5（2026-09-21 建）。⚠️ 当前 enabled=false：**克隆尚未完成**，下面这条地址是「克隆前」那台源实例的，克隆出来的新实例地址通常会变。等用户给出克隆完成后的新 SSH 命令后：① 更新 host/port ② 改 enabled=true ③ 跑 watchdog\\authorize_key.py 装看门狗 key ④ 跑 manager\\acceptance_gpu.py --server flux6 过 11 项验收。⚠️ 注意本机在 **westb** 区（flux1/flux5 在 westc/westd），别按习惯填 westc。GPU=RTX 4080 SUPER 32760 MiB（与 flux5 同款）。角色同 flux5：klein 4B / offload=none / 能图生图 → 两台互为备份。2026-09-21 实测（源实例）：密钥 ~/.ssh/id_rsa_musetalk **免密直连通过，无需密码**，hostname=autodl-container-1b714b8fee-9113e52d"
     }
   ]
 }

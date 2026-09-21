@@ -306,6 +306,88 @@ print('PASS|', '无内联 payload；fsm.run 已接 stdin')
 '''
 
 
+# ── D 组：子进程不得弹控制台窗口（2026-09-21 用户报"一直有 2 个 bash.exe 不时弹窗"）──
+#
+# 现象与根因：flux_service.py 是**无控制台**进程（.bat 用 -WindowStyle Hidden，
+# 我这边用 DETACHED_PROCESS 拉）。此时 Windows 给它的子进程**新建一个可见控制台**。
+# fsm.run() 用 subprocess.run([bash, '-lc', cmd]) 且**没有 creationflags**，
+# 而 _dispatch 的 interval=120s → 每轮探活弹一个黑窗，表现为"不时弹窗"。
+# 实测证据：Get-CimInstance 抓到 bash.exe 的 PPID == flux_service 的 PID。
+#
+# ⚠️ 这条断言必须钉在**所有** subprocess 调用上，不只是 run()：
+#   新写一处 subprocess 就会重新开始弹窗，而"偶尔弹个黑窗"没人会当成 bug 报上来。
+
+@case('D1', '存在 CREATE_NO_WINDOW 常量且仅 Windows 生效（Linux 上为 0）')
+def _d1():
+    return r'''
+from manager import flux_server_manager as fsm
+assert hasattr(fsm, 'CREATE_NO_WINDOW'), '缺少 CREATE_NO_WINDOW 常量'
+if os.name == 'nt':
+    assert fsm.CREATE_NO_WINDOW == 0x08000000, \
+        f'CREATE_NO_WINDOW 值不对: {fsm.CREATE_NO_WINDOW:#x}（应为 0x8000000）'
+else:
+    assert fsm.CREATE_NO_WINDOW == 0, '非 Windows 平台应为 0（该常量无意义）'
+assert hasattr(fsm, 'SUBPROC_FLAGS'), '缺少统一的 SUBPROC_FLAGS'
+assert fsm.SUBPROC_FLAGS == fsm.CREATE_NO_WINDOW, 'SUBPROC_FLAGS 与常量不一致'
+print('PASS|', f'CREATE_NO_WINDOW={fsm.CREATE_NO_WINDOW:#x} SUBPROC_FLAGS={fsm.SUBPROC_FLAGS:#x}')
+'''
+
+
+@case('D2', 'run() 真的把 creationflags 传给了 subprocess（不是只定义常量不用）')
+def _d2():
+    return r'''
+import ast
+from pathlib import Path
+
+src = Path(BASE, 'manager', 'flux_server_manager.py').read_text(encoding='utf-8')
+tree = ast.parse(src)
+
+# 找到所有 subprocess.run(...) 调用
+calls = [n for n in ast.walk(tree)
+         if isinstance(n, ast.Call)
+         and isinstance(n.func, ast.Attribute)
+         and n.func.attr in ('run', 'Popen', 'call', 'check_output', 'check_call')
+         and isinstance(n.func.value, ast.Name)
+         and n.func.value.id == 'subprocess']
+assert calls, '文件里没有任何 subprocess 调用？断言定位失败，请更新本用例'
+
+missing = []
+for c in calls:
+    kw = {k.arg for k in c.keywords}
+    if 'creationflags' not in kw:
+        missing.append(getattr(c, 'lineno', '?'))
+assert not missing, (
+    f'有 {len(missing)} 处 subprocess 调用没传 creationflags（会在无控制台进程里弹窗）：'
+    f' 行 {missing}。请加 creationflags=SUBPROC_FLAGS'
+)
+print('PASS|', f'{len(calls)} 处 subprocess 调用全部带 creationflags')
+'''
+
+
+@case('D3', '变异断言：拿掉 creationflags 必须报红（证明 D2 真的有约束力）')
+def _d3():
+    return r'''
+import ast
+from pathlib import Path
+
+src = Path(BASE, 'manager', 'flux_server_manager.py').read_text(encoding='utf-8')
+# 模拟"下一个人新写 subprocess 时忘了加" —— 删掉 creationflags 关键字再跑同一套检查
+mutated = src.replace('creationflags=SUBPROC_FLAGS', '')
+assert mutated != src, '变异没生效：源码里找不到 creationflags=SUBPROC_FLAGS（常量名改过了？）'
+
+tree = ast.parse(mutated)
+calls = [n for n in ast.walk(tree)
+         if isinstance(n, ast.Call)
+         and isinstance(n.func, ast.Attribute)
+         and n.func.attr in ('run', 'Popen', 'call', 'check_output', 'check_call')
+         and isinstance(n.func.value, ast.Name)
+         and n.func.value.id == 'subprocess']
+bad = [getattr(c, 'lineno', '?') for c in calls if 'creationflags' not in {k.arg for k in c.keywords}]
+assert bad, '变异版竟然还全带 creationflags —— 说明 D2 的检查逻辑写空了'
+print('PASS|', f'变异版正确报红（{len(bad)} 处缺失，行 {bad}）')
+'''
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding='utf-8')
