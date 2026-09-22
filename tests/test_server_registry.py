@@ -158,9 +158,33 @@ def t_edit_capability():
     s3, p3 = frc._pick_from([_cand('only-dev', False, reachable=True, gpu_ok=True,
                                    model_ok=True, resident=True, model_loaded=True)],
                             need_edit=True)
-    check('无 capable 机器时不过滤（向后兼容，不崩）', s3 is not None and s3['name'] == 'only-dev')
+    # ⚠️ 2026-09-22：契约**刻意变更**，断言跟着改（不是把门削弱）。
+    #  旧行为：「无 capable 机器时不过滤」→ 把 edit 任务派给 dev 机 → GPU 侧
+    #          必然报「当前模型不支持图生图」→ 用户白等一整轮。
+    #          当时的理由是「supports_edit 只是提示位，别在这里误判成没机器」。
+    #  新行为：能力表已是**权威**（resident 按类名现算），一台机明确不支持 edit
+    #          就是跑不了 → 返回 (None, probe)，让上游报准确原因，别白等。
+    #  这才与 need_model 的「谁都没有这个模型 → 返回 None」口径一致
+    #  （同一个文件里两处同性质判断，口径必须一致，否则最难查）。
+    #  ★ 同时**必须保住**旧断言里真正的不变量：**不崩**。
+    #    2026-09-22 实测崩过 —— 过滤后 cands 被置空，末尾 `cands[0][1]` IndexError。
+    check('★ 无 capable 机器时返回 None（不硬派给跑不了的机器）',
+          s3 is None, s3['name'] if s3 else 'None')
+    check('★ 返回 None 时仍带回 probe（调用方能显示「在线但能力不满足」）',
+          isinstance(p3, dict) and p3.get('name') == 'only-dev',
+          str(p3.get('name') if isinstance(p3, dict) else p3))
     s4, _ = frc._pick_from([], need_edit=True)
     check('空候选返回 None', s4 is None)
+    # 判定不了时必须**保持不过滤**（旧行为），否则「探针拿不到能力」这种
+    # 正常情况会被误判成「没有机器」→ 整条链路瘫掉。
+    s5, _ = frc._pick_from([({'name': 'noinfo', 'supports_edit': None},
+                             {'name': 'noinfo', 'reachable': True, 'gpu_ok': True,
+                              'model_ok': True, 'resident': True,
+                              'model_loaded': True, 'error': ''})],
+                           need_edit=True)
+    check('★ 能力无从判定时不误杀（保持不过滤）',
+          s5 is not None and s5['name'] == 'noinfo',
+          s5['name'] if s5 else 'None')
 
 
 def t_source_level():

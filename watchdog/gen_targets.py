@@ -43,6 +43,18 @@ def build_lines(registry_path=None) -> tuple:
         if s.get('enabled') is False:
             skipped.append((name, 'enabled=false（已释放/停用）'))
             continue
+        # 2026-09-22 新增：watchdog=false = 「机器可用，但**暂不交给看门狗托管**」。
+        # 为什么要与 enabled 分开（两者语义正交，合并会表达不清）：
+        #   enabled=false  = 机器没了（已释放），连探活都不该参与。
+        #   watchdog=false = 机器在、manager 可以直连用它，但看门狗**别去管**
+        #                    —— 典型场景是「新机还在准备期」：环境没装完 /
+        #                    start_resident.sh 还没适配该机的独立环境。
+        #   此时若让看门狗托管，它会按**通用**方式拉起常驻（用 flux 环境、默认
+        #   模型），必然失败并每分钟刷日志，把真正的故障日志淹掉。
+        #   备好之后把该字段改成 true（或删掉）即可纳入，无需改代码。
+        if s.get('watchdog') is False:
+            skipped.append((name, 'watchdog=false（机器可用但暂不交给看门狗托管）'))
+            continue
         lines.append(':'.join([
             str(s['host']),
             str(s.get('port') or 22),

@@ -293,6 +293,16 @@ def probe(server: dict, force: bool = False) -> dict:
              'reachable': False, 'gpu_ok': True, 'gpu': '(直连模式不查)',
              'model_ok': True, 'resident': False, 'model_loaded': False,
              'status': '', 'health': None, 'error': ''}
+        # ★ 2026-09-22：直连模式也必须带上能力字段。
+        #   否则 need_caps/need_edit 过滤读不到 caps → 退化成读注册表
+        #   supports_edit → 而 SERVER_DEFAULT 可能是**不支持该能力**的那台
+        #   （实测：默认机是 flux1/dev，edit 任务被整台滤掉 → 返回 None →
+        #    manager 静默走成 /generate → 5 项离线验收超时）。
+        #   直连模式的诚实语义是「能力未知 → 退注册表」，但既然 /health 就给了
+        #   capabilities，白拿不用是自找的失真。
+        d.setdefault('caps', {})
+        d.setdefault('capabilities_by_model', {})
+        d.setdefault('models', [])
         try:
             h = _transport(server).get_json('/health', timeout=HEALTH_TIMEOUT)
         except TransportError as e:
@@ -303,6 +313,15 @@ def probe(server: dict, force: bool = False) -> dict:
         d['model_loaded'] = bool(h.get('model_loaded'))
         if h.get('model_error'):
             d['error'] = h['model_error']
+        if isinstance(h.get('capabilities'), dict) and h['capabilities']:
+            d['caps'] = h['capabilities']
+        # stub / 直连模式下 /health 就报当前模型 → 至少让 models 知道有它，
+        # 否则 need_model 过滤在直连模式下永远「无清单」而静默不过滤。
+        mid = h.get('model_id') or ''
+        if mid:
+            d['models'] = [mid]
+            if d['caps']:
+                d['capabilities_by_model'] = {mid: d['caps']}
         return d
     return fsm.probe_full(server, force=force)
 
@@ -320,7 +339,7 @@ def probe_all(force: bool = False) -> list:
 
 
 def _pick_from(cands: list, need_edit: bool = False,
-               need_model: str = None) -> tuple:
+               need_model: str = None, need_caps: dict = None) -> tuple:
     """从 [(server, probe)] 里按分级规则挑一台。返回 (server|None, probe|None)。
 
     抽出来是为了让 CLI 的 `servers` 视图和生产选机走**同一套**判断 ——
@@ -329,11 +348,27 @@ def _pick_from(cands: list, need_edit: bool = False,
     分级（同 find_available_server 的文档）：
       1 常驻在跑+模型已加载 → 2 可达+有卡+模型就绪 → 3 可达+有卡 → 4 可达(含无卡)
 
-    need_edit=True → **先按能力过滤**：只留注册表里 supports_edit 的机器。
+    need_edit=True / need_caps={...} → **先按能力过滤**。
     为什么必须有这道闸（2026-09-20）：图生图要 pipeline 的 __call__ 接受 `image`，
     而 FLUX.1-dev 的 FluxPipeline 没有这个参数，edit 任务在 dev 机上必然报
-    「当前模型不支持图生图」。全平台只有装了 klein 的机器能跑编辑。
-    字段缺失时不过滤（向后兼容老部署）。
+    「当前模型不支持图生图」。全平台只有装了 klein/Qwen 的机器能跑编辑。
+
+    ★ 2026-09-22 新增 need_caps（need_edit 保留为它的便捷写法）：
+      单布尔位「支不支持图生图」已经不够用 —— Qwen 带来 multi_ref（多图）、
+      mask_param（独立掩码入参）、transparent（透明）等**正交**能力。若每一项都加一个布尔
+      参数，调用方要陆续加 6 个 kwarg、内部要 6 段平行过滤，必然漏。
+      改成传一个能力字典，过滤逻辑只有一段：
+        need_caps={'edit': True, 'multi_ref': True} → 只留两者都满足的机器。
+      数据来源 = 探针从 GPU 机 `/models` 拿到的 `capabilities`（**权威**，
+      因为它是 resident 按 model_index.json 的 _class_name 现算的），
+      而不是注册表里手写的 `supports_edit`（那是给人看的冗余提示）。
+
+      ⚠️ 兼容与降级（关键）：
+        · 探针没返回 capabilities（旧版 resident / 直连模式）→ 退回到
+          注册表 `supports_edit` 布尔位兜底；连它也没有 → **不过滤**。
+        · 「谁都不满足」时**不硬挑**，返回 (None, ...)，把准确原因抛给上游。
+          硬挑的后果是「提交成功 → 排队 → GPU 报错」，用户白等一整轮
+          （2026-09-21 实测踩过，见下面 need_model 那段同样处理）。
 
     need_model=<id>（2026-09-21 新增）→ **先按「本机有没有这个模型文件」过滤**。
     这是「界面选模型」能真正生效的关键：dev 只在 flux1 上，klein 在 flux5/flux6 上，
@@ -346,12 +381,28 @@ def _pick_from(cands: list, need_edit: bool = False,
     """
     if not cands:
         return None, None
+
+    # need_edit 是 need_caps 的便捷写法，合并成一份能力要求（别写两段过滤）
+    caps_req = dict(need_caps or {})
     if need_edit:
-        capable = [(s, p) for s, p in cands if s.get('supports_edit', True)]
-        if capable:
-            cands = capable
+        caps_req.setdefault('edit', True)
+    if caps_req:
+        filtered = _filter_by_caps(cands, caps_req)
+        if filtered is None:
+            pass                          # 判断不了 → 保持不过滤（下游白名单兜底）
+        elif not filtered:
+            # ★ 判断了、且**确实一台都不满足** → 直接返回 None，不硬挑。
+            #   与 need_model 的「谁都没有这个模型」同一处理：硬挑的后果是
+            #   「提交成功 → 排队 → GPU 报错」，用户白等一整轮。
+            #   ⚠️ 这里必须**返回**而不是「把 cands 置空再往下走」——
+            #   置空会让下面所有分级 pick 都失败，最后 `cands[0][1]` 直接
+            #   IndexError 崩掉（2026-09-22 实测就崩在这）。返回时带上原始
+            #   首台的 probe，让调用方仍能显示「机器在线但能力不满足」。
+            first = cands[0][1] if cands else None
+            logger.warning(f'🔴 没有任何候选机满足能力要求 {caps_req}')
+            return None, first
         else:
-            logger.warning('🟡 没有任何机器声明 supports_edit，本次不按能力过滤')
+            cands = filtered
 
     if need_model:
         probed = [p for _s, p in cands if p.get('models')]
@@ -401,11 +452,72 @@ def _pick_from(cands: list, need_edit: bool = False,
     return None, cands[0][1]
 
 
+def _filter_by_caps(cands: list, caps_req: dict) -> list:
+    """按能力要求过滤候选机。返回过滤后的列表；**无法判定时返回 None**（=不过滤）。
+
+    判定顺序（从权威到兜底）：
+      1. 探针的 `caps`（resident /health 或 /models 报的 capabilities）—— 权威。
+         每台机可能报多个模型的能力（capabilities_by_model），取**目标模型**的；
+         取不到就用该机当前已加载模型的能力（`caps`）。
+      2. 都没有 → 退到注册表 `supports_edit` 布尔位（只够回答 edit 一项）。
+      3. 连布尔位也没有（老部署）→ 返回 None，让调用方维持旧行为，别在这里误判。
+
+    ⚠️ 为什么 None 与 空列表 必须区分（与 active 三态同一道理）：
+        None  = 「我判断不了」→ 上游**保持不过滤**，宁可让 GPU 侧白名单去拒。
+        []    = 「我判断了，确实一台都没有」→ 上游应报「没有可用机器」。
+        把两者混成一个 `if filtered:` 会让「确实没有」静默退回全量，
+        于是用户的请求又被派给跑不了的机器 —— 正是这道闸要防的事。
+    """
+    def _caps_of(p: dict, model_id: str = None) -> dict:
+        by_model = p.get('capabilities_by_model') or {}
+        if model_id and model_id in by_model:
+            return by_model[model_id] or {}
+        return p.get('caps') or {}
+
+    judged = []                      # [(server, probe, caps)]，caps 可能为 {}（无信息）
+    for s, p in cands:
+        c = _caps_of(p, model_id=None)
+        if c:
+            judged.append((s, p, c, 'resident'))
+        else:
+            # 兜底一：注册表的 supports_edit 布尔位（能答 edit 一项）
+            se = s.get('supports_edit')
+            if se is None:
+                judged.append((s, p, {}, 'unknown'))
+            else:
+                judged.append((s, p, {'edit': bool(se)}, 'registry'))
+
+    if all(j[3] == 'unknown' for j in judged):
+        logger.warning('🟡 探针与注册表都没有能力信息，本次不按能力过滤')
+        return None
+
+    def _ok(caps: dict, src: str) -> bool:
+        for k, want in caps_req.items():
+            if k not in caps:
+                # 该能力无从判定 → 保守放行（让 GPU 侧白名单做最终判断），
+                # **不能**当成「不支持」剔掉，否则缺一项字段就等于整台机不可用。
+                continue
+            if bool(caps[k]) is not bool(want):
+                return False
+        return True
+
+    out = [(s, p) for s, p, c, src in judged if _ok(c, src)]
+    if not out:
+        # 只在这里记「各机能力」的细节（外层报「空集」结论）——
+        # 两处都报会让同一件事刷两行，排查时反而要多读一遍。
+        logger.warning(f'🔴 能力过滤后无候选：要求 {caps_req}，'
+                       f'各机能力 {[(p.get("name"), c) for _s, p, c, _x in judged]}')
+    return out
+
+
 def find_available_server(force: bool = False, need_edit: bool = False,
-                          need_model: str = None) -> tuple:
+                          need_model: str = None, need_caps: dict = None) -> tuple:
     """挑一台「当前最该用」的服务器。返回 (server, probe)；全不可用返回 (None, probe)。
 
-    need_edit=True：只在支持图生图（supports_edit）的机器里挑，见 _pick_from。
+    need_edit=True：只在支持图生图的机器里挑（= need_caps={'edit': True} 的便捷写法）。
+    need_caps={...}：按细粒度能力过滤，如 {'edit': True, 'multi_ref': True}。
+                     Qwen 带来 multi_ref/mask_param/transparent 等正交能力后，
+                     单布尔位不够用（见 _pick_from 的说明）。
     need_model=<id>：只在装了这个模型的机器里挑（界面选模型用），见 _pick_from。
 
     分级选择（这是「换了机器 / 克隆到新机后自动接上」的核心）：
@@ -421,7 +533,7 @@ def find_available_server(force: bool = False, need_edit: bool = False,
     这里把无卡机器降到最低优先级，但**不剔除**，正是为了不丢这条诊断信息。
     """
     return _pick_from(probe_all(force=force), need_edit=need_edit,
-                      need_model=need_model)
+                      need_model=need_model, need_caps=need_caps)
 
 
 def any_ready() -> bool:

@@ -16,6 +16,7 @@
   python tests/test_edit_offline.py
 """
 import base64
+import ast
 import json
 import os
 import subprocess
@@ -157,12 +158,42 @@ def main():
         # ── ③ 参数名按签名动态判定 ──
         @case('E3 stub 只声明 image → 动态判参与真实模型一致（非硬编码）')
         def _e3():
+            # ⚠️ 2026-09-22：从「查字面串」升级为「查语义结构」。
+            #    旧断言查 `img_param = next(` 这个字面串 —— 那是钉实现写法，
+            #    重构一次就误报一次；而误报多了人就会去改门，真 bug 就混过去了。
+            #    新契约下判参逻辑是：
+            #      ① 优先用能力表的 ref_param（数据驱动，新增模型零改代码）
+            #      ② 回退到按签名扫描候选名（不硬编码单一参数名）
+            #    这两条**都必须存在**：只有 ① 的话，能力表写错就报「不支持图生图」；
+            #    只有 ② 的话，Qwen 的 mask/multi_ref 这些非 ref 能力就没处声明。
             src = SERVER.read_text(encoding='utf-8')
-            assert "('image', 'images', 'image_latents')" in src, '判参候选列表不见了'
-            assert 'img_param = next(' in src, '没有按签名动态挑选参数名'
-            # stub 签名里必须有 image（否则 E1 不可能通过）
-            assert 'image=None' in src, 'StubPipeline 没有 image 参数'
-            return '候选 image/images/image_latents，落在 image'
+            tree = ast.parse(src)
+            # ⚠️ 本文件里有**两个** `_generate`（worker 跑推理 / HTTP 入口校验），
+            #    两个源码片段里都会出现 ref_paths 这个词 → 按名字挑会挑错。
+            #    能唯一标识「判参逻辑那一段」的是 `caps.get('ref_param')`：
+            #    只有 worker 里那个真去挑参数名。所以按它定位。
+            picked = None
+            for n in ast.walk(tree):
+                if isinstance(n, ast.FunctionDef) and n.name == '_generate':
+                    seg = ast.get_source_segment(src, n) or ''
+                    if "caps.get('ref_param')" in seg:
+                        picked = seg
+            assert picked is not None, \
+                '没找到优先用能力表 ref_param 的 _generate（应数据驱动，不该只靠扫签名）'
+            assert "for n in ('image', 'images', 'image_latents')" in picked \
+                or "'image_latents'" in picked, \
+                '没有按签名动态挑选参数名的回退路径'
+            # 参考图参数名必须来自签名校验，而不是直接硬写 image=
+            assert 'img_param not in sig' in picked, \
+                '选了参数名却没校验它真在签名里（会静默 TypeError）'
+            # stub 的默认签名里也必须有 image —— 否则 E1/E4 不可能通过。
+            # ⚠️ 这里不 import 服务模块（它有模块级副作用，本门是靠 subprocess 起的）。
+            #    改为 AST 扫 `_install_default_stub_signature()`：它保证模块导入时
+            #    就把默认签名挂上。若这行被删，「--stub 不带 --model」的默认态
+            #    会静默退回 `(**kwargs)` —— 那正是 2026-09-22 第二次踩的坑。
+            assert '_install_default_stub_signature()' in src, \
+                '默认 stub 签名没有在模块导入时挂载（默认态会退回 **kwargs）'
+            return '能力表 ref_param 优先 + 签名候选回退，落在 image'
 
         # ── ④ 输出受参考图影响 ──
         @case('E4 参考图真的生效（换图→输出变；同图→输出稳定）')

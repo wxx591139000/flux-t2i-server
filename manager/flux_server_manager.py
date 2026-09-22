@@ -465,20 +465,36 @@ SERVER_DEFAULT = _resolve_default(FLUX_SERVERS)
 def known_models() -> list:
     """平台已知的 (模型 id, 远端路径) 清单，**去重**后返回。2026-09-21 新增。
 
-    数据来源 = 注册表里各机的 remote_model（取 basename 当 id）。为什么不写死：
-    加模型/换路径的唯一动作仍然只是改 servers.json —— 不在代码里再维护一份
-    「有哪些模型」的清单，否则就是又一处「改一处要同步三处」的人肉负担。
+    数据来源 = 注册表里各机的 remote_model **+ extra_models[]**（取 basename 当 id）。
+    为什么不写死：加模型/换路径的唯一动作仍然只是改 servers.json ——
+    不在代码里再维护一份「有哪些模型」的清单，否则就是又一处
+    「改一处要同步三处」的人肉负担。
+
+    ★ 2026-09-22 新增 extra_models：一台机上可能装了**不止一个**模型
+      （flux6 上 dev 与 klein 并存；Qwen 机将来也可能同时放 klein + Qwen）。
+      以前只用 remote_model，那台机上的第二个模型**对平台完全不可见** ——
+      probe 不会问它、/health 不显示它、选机也不会考虑它。
+      语义：remote_model = 该机**默认**模型（不变的旧字段，兼容所有老逻辑）；
+            extra_models = 该机**额外**还装了哪些（字符串数组，路径或 basename 均可）。
+      路径写法：给绝对路径 → 原样用；给 basename → 按机器的 remote_base 同盘推断
+            （实际都写成绝对路径，最省事也最不易错）。
 
     顺序 = 注册表里首次出现的顺序（dict 保序），让 MODEL_OK 的语义仍然是
     「默认机的那一个」。去重是为了不让 probe_full 对同一路径重复发 test -f。
     """
     seen, out = set(), []
-    for s in FLUX_SERVERS:
-        p = (s.get('remote_model') or '').rstrip('/')
+
+    def _add(raw):
+        p = (raw or '').rstrip('/')
         if not p or p in seen:
-            continue
+            return
         seen.add(p)
         out.append((p.rsplit('/', 1)[-1], p))
+
+    for s in FLUX_SERVERS:
+        _add(s.get('remote_model'))
+        for extra in (s.get('extra_models') or []):
+            _add(extra)
     if out:
         return out
     # 兜底：注册表为空时仍让 probe 有东西可问（不该发生，但别让它崩在选机路径上）
@@ -801,11 +817,24 @@ def probe_full(server=None, force: bool = False) -> dict:
               f"nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1; "
               f"test -f {s['remote_model']}/DOWNLOAD_DONE && echo MODEL_OK || echo MODEL_MISSING; "
               f"{remote_files}"
-              f"curl -s -m 5 http://127.0.0.1:{port}/health || echo HEALTH_FAIL")
+              f"curl -s -m 5 http://127.0.0.1:{port}/health || echo HEALTH_FAIL; "
+              # ★ 2026-09-22：把 /models 也问掉（同一次 SSH，零额外往返）。
+              #   为什么必须问：能力过滤（need_caps）的**权威数据源**是 resident
+              #   按 model_index.json 的 _class_name 现算的 capabilities ——
+              #   而不是注册表里手写的 supports_edit 布尔位（那只是给人看的冗余，
+              #   而且答不了 multi_ref/mask_param/transparent 这些 Qwen 带来的新维度）。
+              #   单布尔位不够用时若不问这个，就只能靠注册表手写 → 又是「改一处
+              #   要同步多处」的人肉负担，且必然漂移。
+              f"echo MODELS_BEGIN; "
+              f"curl -s -m 5 http://127.0.0.1:{port}/models || echo MODELS_FAIL; "
+              f"echo MODELS_END")
     d = {'name': s.get('name'), 'alias': alias, 'reachable': False,
          'gpu_ok': False, 'gpu': '', 'model_ok': False,
          'resident': False, 'model_loaded': False, 'status': '',
-         'health': None, 'error': '', 'models': []}
+         'health': None, 'error': '', 'models': [],
+         # caps：**当前已加载**模型的能力（来自 /health，最快路径）
+         # capabilities_by_model：{模型 id: 能力}（来自 /models，用于「按模型选机」）
+         'caps': {}, 'capabilities_by_model': {}}
     ok, out = run(f'ssh -o ConnectTimeout=8 -o BatchMode=yes {ssh_target(s)} '
                   f'{shlex.quote(remote)}', 20)
     if not ok:
@@ -824,12 +853,26 @@ def probe_full(server=None, force: bool = False) -> dict:
             d['error'] = (out or '')[:160] or 'SSH 无输出'
         else:
             d['reachable'] = True
-            marks = {'REACH', 'MODEL_OK', 'MODEL_MISSING', 'HEALTH_FAIL'}
+            marks = {'REACH', 'MODEL_OK', 'MODEL_MISSING', 'HEALTH_FAIL',
+                     'MODELS_BEGIN', 'MODELS_END', 'MODELS_FAIL'}
             # 扫描**全部**行，不能一碰到 GPU 名就 break ——
             # GPU 名固定在第 2 行，HAVE: 行排在它后面（见 remote 命令的拼接顺序），
             # break 会让 models 恒为空 → 模型过滤静默失效。
             # 2026-09-21 实测踩到：探针输出 gpu 正常、models=[]，全程无报错。
+            # ★ 2026-09-22：/models 的 JSON 可能被 curl 折行 → 不能按行 JSON 解析，
+            #   必须按 MODELS_BEGIN/MODELS_END 标记**整段收集**再 json.loads。
+            in_models = False
+            models_buf = []
             for ln in lines[1:]:                  # 跳过 REACH 行
+                if ln == 'MODELS_BEGIN':
+                    in_models = True
+                    continue
+                if ln in ('MODELS_END', 'MODELS_FAIL'):
+                    in_models = False
+                    continue
+                if in_models:
+                    models_buf.append(ln)
+                    continue
                 if ln in marks or ln.startswith('{'):
                     continue
                 if ln.startswith('HAVE:'):
@@ -852,7 +895,26 @@ def probe_full(server=None, force: bool = False) -> dict:
                 d['model_loaded'] = bool(h.get('model_loaded'))
                 if h.get('model_error'):
                     d['error'] = h['model_error']
+                # /health 直接给当前模型的能力（新增字段，旧 resident 没有 → 空 dict）
+                if isinstance(h.get('capabilities'), dict):
+                    d['caps'] = h['capabilities']
                 break
+            # ── 解析 /models 段：拿到「每个模型各自的能力」 ──
+            if models_buf:
+                try:
+                    mj = json.loads(''.join(models_buf))
+                    d['capabilities_by_model'] = {
+                        m['id']: (m.get('capabilities') or {})
+                        for m in (mj.get('models') or []) if m.get('id')}
+                    # 顺带用 /models 补齐 models 清单（HAVE: 依赖 DOWNLOAD_DONE
+                    # 文件判定，而 /models 是按目录扫的；两者互为交叉校验）。
+                    for m in (mj.get('models') or []):
+                        if m.get('ready') and m.get('id') and m['id'] not in d['models']:
+                            d['models'].append(m['id'])
+                except Exception as e:            # noqa: BLE001
+                    # 不静默：能力拿不到会导致 need_caps 退化成注册表兜底，
+                    # 这是「结果不同」级别的差异，必须留痕。
+                    d['error'] = d['error'] or f'/models 解析失败: {e}'
     if _PROBE_TTL > 0:
         with _probe_cache_lock:
             _probe_cache[alias] = (time.time(), d)

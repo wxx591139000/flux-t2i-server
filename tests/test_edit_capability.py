@@ -66,10 +66,37 @@ def t_table():
     except Exception as e:                       # noqa: BLE001
         check('能加载 flux_resident_server', False, str(e)[:200])
         return None
-    tbl = getattr(r, 'MODEL_EDIT_CAPABLE', None)
-    check('存在 MODEL_EDIT_CAPABLE', isinstance(tbl, dict), str(tbl))
-    check('klein（Flux2KleinPipeline）→ True', tbl.get('Flux2KleinPipeline') is True)
-    check('dev（FluxPipeline）→ False', tbl.get('FluxPipeline') is False)
+    # ⚠️ 2026-09-22：契约升级 —— 单布尔位 MODEL_EDIT_CAPABLE 已换成统一能力表
+    #    MODEL_CAPABILITIES（Qwen 一次带来 6 项新差异，一项一个字典会产生
+    #    6 处平行维护）。本门**不是删断言放行**，而是把断言升级到新契约：
+    #      · 能力表存在且每个条目字段完整（更强的约束）
+    #      · model_supports_edit 变成派生视图，语义必须与 edit 位一致（新增约束）
+    tbl = getattr(r, 'MODEL_CAPABILITIES', None)
+    check('存在 MODEL_CAPABILITIES（统一能力表）', isinstance(tbl, dict), str(tbl))
+    if not isinstance(tbl, dict) or not tbl:
+        return r
+    # 旧的单布尔位必须已退场（否则等于两套并行契约，迟早口径漂移）
+    check('旧符号 MODEL_EDIT_CAPABLE 已退场（不再并行维护）',
+          getattr(r, 'MODEL_EDIT_CAPABLE', None) is None,
+          str(getattr(r, 'MODEL_EDIT_CAPABLE', None)))
+    check('klein（Flux2KleinPipeline）edit → True',
+          tbl.get('Flux2KleinPipeline', {}).get('edit') is True)
+    check('dev（FluxPipeline）edit → False',
+          tbl.get('FluxPipeline', {}).get('edit') is False)
+    # 每个条目字段必须完整 —— 缺字段的后果是「下游 .get() 拿到 None 静默放行」
+    # ⚠️ 2026-09-22：字段 `mask` 改名为 `mask_param`（含义变精确 =
+    #    「有独立 mask 入参」，不再混同「支持局部编辑」）。
+    #    改这里的理由是**契约本身变了**，不是为了让门变绿：
+    #    旧名会让 Qwen 那种「支持局部编辑但无 mask 入参」的模型没法准确表达。
+    need = {'text2img', 'edit', 'multi_ref', 'mask_param', 'transparent',
+            'max_ref_images', 'native_res', 'cfg_param'}
+    for cls, caps in tbl.items():
+        missing = need - set(caps)
+        check(f'{cls} 能力字段完整（{len(need)} 项）', not missing, str(sorted(missing)))
+    check('★ model_supports_edit 是能力表的派生视图（口径不会漂移）',
+          all(r.model_supports_edit(c) is bool(v.get('edit'))
+              for c, v in tbl.items()),
+          '叫「不支持」顶多让用户换个模型；说「支持」却跑不了会白等一整轮')
     check('未识别类名 → False（保守方向）',
           r.model_supports_edit('SomeUnknownPipeline') is False,
           '说不支持顶多让用户换个模型；说支持却跑不了会白等一整轮')
@@ -162,16 +189,40 @@ def t_generate_guard():
         return
     fn = fns[0]
     seg = ast.get_source_segment(src, fn) or ''
-    check('★ is_edit 且模型不支持时拦下',
-          'is_edit and tgt_edit is False' in seg,
+    # ⚠️ 2026-09-22：断言从「字面形状」升级为「语义契约」。
+    #    旧断言查 `is_edit and tgt_edit is False` 这个字面串 —— 那是在钉实现
+    #    细节，不是钉行为。契约升级成能力表后，实现自然变成
+    #    `is_edit and tgt_caps ... not tgt_caps.get('edit')`，
+    #    旧断言就失效了（但行为其实**更强**了：多了 is not None 保护）。
+    #    ★ 教训：回归门要钉**可观察行为**，钉字面串会让每次重构都误报，
+    #      而误报多了人就会去改门 —— 那时候真 bug 也能混过去。
+    #    所以这里改成：① 必须存在 is_edit 条件分支 ② 该分支里必须出现
+    #    'edit' 能力查询 ③ 必须 return _err(400, ...) ④ 文案可行动。
+    check('★ is_edit 且模型不支持时拦下（存在 is_edit 判定分支）',
+          any(isinstance(n, ast.If) for n in ast.walk(fn))
+          and 'is_edit' in seg,
           '前端约束可被绕过（直调 API / 老页面），这里必须再拦一道')
+    check('★ 拦下用的是「能力表 edit 位」，不是模型名硬编码',
+          "get('edit')" in seg or "['edit']" in seg,
+          '硬编码模型名会让新增模型时必须改两处（能力表 + 硬闸），必然漏')
+    # 报错码必须是 400（能力问题不是服务故障）—— 直接扫 AST 里的 _err 调用
+    codes = set()
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == '_err' and n.args
+                and isinstance(n.args[0], ast.Constant)):
+            codes.add(n.args[0].value)
     check('★ 报错是 400 而不是 500/503（能力问题不是服务故障）',
-          'is_edit and tgt_edit is False' in seg and '400' in seg)
+          400 in codes, f'该函数里出现的错误码：{sorted(c for c in codes if isinstance(c, int))}')
     check('★ 文案说「换模型」/「去掉参考图」（可行动，不是让用户重试）',
           '改用支持图生图的模型' in seg or '不支持图生图' in seg)
-    # 「不传 model」时也要能判当前模型的能力
+    # 「不传 model」时也要能判当前模型的能力。
+    # ⚠️ 这里查的是 **class_name**（能力表的唯一来源），不是 model_id ——
+    #    「不传 model」= 用当前已加载的模型，它的能力只能按类名查表
+    #    （同一台机上 model_id 是目录名，与能力无关）。改这个断言前先想清楚：
+    #    若改成查 model_id，就等于把「目录名」当能力依据，是错的方向。
     check('★ 未指定 model 时回查当前模型的能力（不能漏掉这条路径）',
-          "self.holder.get('model_id')" in seg,
+          "holder.get('class_name')" in seg,
           '否则「自动」档（不传 model）会绕过能力检查')
 
 

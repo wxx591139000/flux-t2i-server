@@ -33,7 +33,26 @@
     "  「开机的这一台」—— 关机机器**完全不参与探活**，省掉每轮白等的 SSH 超时。",
     "  读不到 VPS 状态（VPS 挂了/网络不通）→ manager **降级成全量扫描**，宁可慢也要能出图。",
     "  语义分工：enabled=false 是「这台永久停用（已释放）」的人工开关，",
-    "           active 是「VPS 探测到这台此刻活着」的自动事实。两者正交，都满足才进候选。"
+    "           active 是「VPS 探测到这台此刻活着」的自动事实。两者正交，都满足才进候选。",
+    "",
+    "★ 2026-09-22 新增三个字段（异构模型支持）：",
+    "  extra_models    字符串数组。该机**额外**还装了哪些模型（路径或 basename）。",
+    "                  为什么需要：以前一台机只能声明一个 remote_model，第二个模型对平台",
+    "                  **完全不可见**（probe 不问、/health 不显示、选机不考虑）。Qwen 机上",
+    "                  可能同时放 klein + Qwen，就必须声明两个。",
+    "  commercial_ok   bool。该机模型的**许可**是否允许对外经营。",
+    "                  klein 4B = Apache 2.0 → true；FLUX.1-dev 与 Qwen-Image-2.1 = 非商用 → false。",
+    "                  这是**硬约束不是质量偏好**：B 链是面向客户的生图服务，用非商用模型接单有法律风险。",
+    "  license         人类可读的许可名，便于评审时一眼看到依据。",
+    "",
+    "⚠️ supports_edit 的定位变化（2026-09-22）：",
+    "  它仍是**给人看的冗余提示**，但**不再是能力的权威来源**。",
+    "  权威来源 = GPU 机 resident 按 model_index.json 的 _class_name 现算的 capabilities，",
+    "  manager 从 /health.capabilities 与 /models[].capabilities 读（见 probe_full）。",
+    "  保留 supports_edit 只有一个用途：**探针拿不到能力时兜底**（旧版 resident / 直连模式）。",
+    "  为什么不删：删了之后旧部署会「无任何能力信息」→ 能力过滤静默失效，比冗余更危险。",
+    "  ⚠️ 答不了 multi_ref/mask/transparent 这些 Qwen 带来的新维度 —— 那正是要升级成",
+    "     能力表的原因（单布尔位表达不了正交能力）。"
   ],
   "watchdog": {
     "_readme": "VPS 看门狗的位置与状态文件路径。改了 VPS 只改这里一处。",
@@ -52,7 +71,9 @@
       "remote_model": "/root/autodl-tmp/models/FLUX.1-dev",
       "offload": "model",
       "supports_edit": false,
-      "note": "原始 FLUX 服务器。32G 卡（RTX 4080 SUPER 32760 MiB），offload 必须 model。FLUX.1-dev 的 FluxPipeline 没有 image 参数 → **跑不了图生图/编辑**（edit 任务交给 flux4）。2026-09-20 现状：与 flux4 是**仅存的两台**实例，flux2/flux3 已释放"
+      "note": "原始 FLUX 服务器。32G 卡（RTX 4080 SUPER 32760 MiB），offload 必须 model。FLUX.1-dev 的 FluxPipeline 没有 image 参数 → **跑不了图生图/编辑**（edit 任务交给 flux4）。2026-09-20 现状：与 flux4 是**仅存的两台**实例，flux2/flux3 已释放",
+      "extra_models": [],
+      "commercial_ok": false
     },
     {
       "name": "flux2",
@@ -65,7 +86,9 @@
       "offload": "model",
       "supports_edit": false,
       "note": "2026-09 新克隆，接 flux 任务中心。32G 卡。同 flux1：只支持文生图，不支持图生图。⚠️ 2026-09-20 用户已释放实例，地址作废 —— 保留做留痕，不参与探活",
-      "enabled": false
+      "enabled": false,
+      "extra_models": [],
+      "commercial_ok": false
     },
     {
       "name": "flux3",
@@ -78,7 +101,9 @@
       "offload": "model",
       "supports_edit": false,
       "note": "2026-09-16 从 flux2 克隆（当日 flux1/flux2 无卡）。32G 卡。同 flux1：只支持文生图，不支持图生图。⚠️ 2026-09-20 用户已释放实例，地址作废 —— 保留做留痕，不参与探活",
-      "enabled": false
+      "enabled": false,
+      "extra_models": [],
+      "commercial_ok": false
     },
     {
       "name": "flux4",
@@ -91,7 +116,9 @@
       "offload": "none",
       "supports_edit": true,
       "note": "2026-09-19 克隆的 klein 实例（flux.2 klein 4B3，westc:26081）。曾是可跑图生图的机器之一：FLUX.1-dev 的 FluxPipeline 没有 image 参数，edit 任务在 flux1 上会直接报「当前模型不支持图生图」。supports_edit=true + offload=none（klein 4B 约 15 GiB，32G 卡够）。｜⚠️ 已退役并由 flux5 接替（见 flux5 条目），停用留痕，不参与探活",
-      "enabled": false
+      "enabled": false,
+      "extra_models": [],
+      "commercial_ok": true
     },
     {
       "name": "flux5",
@@ -103,7 +130,9 @@
       "remote_model": "/root/klein-models/FLUX.2-klein-4B",
       "offload": "none",
       "supports_edit": true,
-      "note": "flux.2 klein 4B4，2026-09-20 从 flux.2 klein 4B3 克隆，RTX 4080 SUPER 32G｜模型预设 klein：klein 4B 约 15 GiB，32G 卡可 offload=none；pipeline 接受 image → 能图生图"
+      "note": "flux.2 klein 4B4，2026-09-20 从 flux.2 klein 4B3 克隆，RTX 4080 SUPER 32G｜模型预设 klein：klein 4B 约 15 GiB，32G 卡可 offload=none；pipeline 接受 image → 能图生图",
+      "extra_models": [],
+      "commercial_ok": true
     },
     {
       "name": "flux6",
@@ -115,7 +144,27 @@
       "remote_model": "/root/klein-models/FLUX.2-klein-4B",
       "offload": "none",
       "supports_edit": true,
-      "note": "flux.2 klein 4B5（2026-09-21 克隆完成并启用）。⚠️ 注意本机在 **westb** 区（flux1/flux5 在 westc/westd），别按习惯填 westc —— 克隆前后地址实测一致（westb:47445）。GPU=RTX 4080 SUPER 32760 MiB（与 flux5 同款）。角色同 flux5：klein 4B / offload=none / 能图生图 → 两台互为备份。2026-09-21 实测：密钥 ~/.ssh/id_rsa_musetalk **免密直连通过，无需密码**，hostname=autodl-container-1b714b8fee-9113e52d。验收：python manager\\acceptance_gpu.py --server flux6；看门狗补 key：python watchdog\\authorize_key.py"
+      "note": "flux.2 klein 4B5（2026-09-21 克隆完成并启用）。⚠️ 注意本机在 **westb** 区（flux1/flux5 在 westc/westd），别按习惯填 westc —— 克隆前后地址实测一致（westb:47445）。GPU=RTX 4080 SUPER 32760 MiB（与 flux5 同款）。角色同 flux5：klein 4B / offload=none / 能图生图 → 两台互为备份。2026-09-21 实测：密钥 ~/.ssh/id_rsa_musetalk **免密直连通过，无需密码**，hostname=autodl-container-1b714b8fee-9113e52d。验收：python manager\\acceptance_gpu.py --server flux6；看门狗补 key：python watchdog\\authorize_key.py",
+      "extra_models": [],
+      "commercial_ok": true
+    },
+    {
+      "name": "flux7",
+      "host": "connect.weste.seetacloud.com",
+      "port": 13889,
+      "user": "root",
+      "identity_file": "~/.ssh/id_rsa_musetalk",
+      "remote_base": "/root/autodl-tmp/flux-t2i",
+      "remote_model": "/root/autodl-tmp/qwen-models/Qwen-Image-2.1",
+      "extra_models": [],
+      "offload": "none",
+      "supports_edit": true,
+      "commercial_ok": false,
+      "license": "Qwen Research License（非商用；商用需单独授权）",
+      "note": "Qwen-Image-2.1 7B1（2026-09-22 新开，由 klein 实例克隆）。⚠️ 许可=Qwen Research License **非商用** → 仅限自用/内部验证，**不可**用于对外经营的 B 链订单。｜显存：bf16 约 30-35GB（7B 主干 14.2GB + Qwen3-VL 8B text_encoder ~16GB + RGBA VAE），32G 卡**吃紧**且**不能与 klein 同机**（两者同时驻留必 OOM）→ offload 按实测调。｜环境：必须独立 conda 环境 qwen（diffusers 需 ≥0.37 dev，含 QwenImage21Pipeline）；⚠️ 不能复用 flux 环境（那会把 klein 用的 diffusers 0.39.0 降级 → 破坏 klein）。｜能力：text2img + edit(多图最多10张) + 透明(RGBA)，原生 2K；⚠️ **无独立 mask 入参**（局部编辑走语义级：把圈选/涂抹合成进参考图）；CFG 参数名是 true_cfg_scale（不是 guidance_scale）；⚠️ 负向提示词需 CFG>1 才生效。｜权重路径在**数据盘** /root/autodl-tmp（系统盘只有 30G，装不下 33G 权重）。｜本条目的 host/port 是**无卡期**地址，切带卡后需更新。",
+      "enabled": true,
+      "watchdog": false,
+      "watchdog_note": "暂不交给看门狗托管（2026-09-22）：本机是无卡期的新实例，Qwen 依赖装在独立的 /root/autodl-tmp/envs/qwen 环境里，而通用 start_resident.sh 写死了 flux 环境 → 看门狗托管必然拉起失败并每轮刷日志。★ 改回条件：① 环境装完且能加载模型 ② start_resident.sh 支持按模型选环境 ③ 切带卡实测通过。满足后把 watchdog 改成 true（或删掉该字段）。"
     }
   ]
 }
