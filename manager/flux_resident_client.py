@@ -382,6 +382,46 @@ def _pick_from(cands: list, need_edit: bool = False,
     if not cands:
         return None, None
 
+    # ★ 许可闸（2026-09-22 新增）：model 许可**不允许对外经营**的机器直接出局。
+    #
+    # 为什么必须在这里、而且必须在能力过滤之前：
+    #   `commercial_ok` 此前**只写在 servers.json、只被一道门断言**，
+    #   **运行时没有任何一处读它** —— 也就是说这个字段一直是「声明」而非「约束」。
+    #   后果：Qwen（Qwen Research License，非商用）一旦开机就在候选池里，
+    #   对外访客（朋友 / B 链客户）的任务可能被派到 flux7 上跑，
+    #   而 flux7 的许可明确不允许这样做。这是**法律风险，不是质量偏好**。
+    #
+    # 判据取 server 字典的 commercial_ok（注册表声明）：
+    #   · False  → 出局（明确不许商用）
+    #   · True   → 保留
+    #   · 缺字段 → 保留（**向后兼容**：老部署没这个字段，剔除会让全部机器消失）
+    #
+    # ⚠️ 为什么直连模式要跳过这道闸（2026-09-22 实测踩到，代价是一道门变红）：
+    #   直连模式（FLUX_RESIDENT_BASE 有值）下 `probe_all` 返回的候选机是
+    #   `fsm.SERVER_DEFAULT` —— 它**只是连接参数的载体**（base/token），
+    #   并不代表"这就是 flux1 那台机器"。但 `SERVER_DEFAULT` 是从注册表第一台
+    #   解析出来的，**带着 flux1 的 `commercial_ok: false` 标签**。
+    #   于是本地部署 / 已开隧道 / 离线测试（假 resident）场景下，
+    #   唯一那台"机器"会被误判成非商用 → 全部任务返回"无可用机器" → 超时。
+    #   实测症状：`test_manager_edit_offline.py` 6 项红，日志刷
+    #   「许可闸：所有候选机的模型均不允许对外经营」。
+    #   语义上：**直连模式用户已显式指定了后端**，许可合规由他自己负责
+    #   （他知道自己连的是哪台）—— 平台不该替他猜，更不该拿别处的标签拦他。
+    if not need_model and not DIRECT_BASE:
+        allowed = [c for c in cands
+                   if c[0].get('commercial_ok') is not False]
+        if allowed and len(allowed) != len(cands):
+            # 用 id() 判断而不是 `c not in allowed`：dict 的 == 比较是**值比较**，
+            # 两台机器配置相同时会被误判成「在 allowed 里」→ 漏报排除项。
+            kept = {id(c) for c in allowed}
+            dropped = [c[0].get('name') for c in cands if id(c) not in kept]
+            logger.info(f'🔒 许可闸：排除非商用机器 {dropped}（对外自动选机不得用）')
+            cands = allowed
+        elif not allowed:
+            # 全都不许商用 —— 不硬挑，交给调用方报准确原因
+            logger.warning('🔴 许可闸：所有候选机的模型均不允许对外经营')
+            return None, (cands[0][1] if cands else None)
+
     # need_edit 是 need_caps 的便捷写法，合并成一份能力要求（别写两段过滤）
     caps_req = dict(need_caps or {})
     if need_edit:
