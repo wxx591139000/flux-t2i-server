@@ -293,7 +293,8 @@ flux7 尚**未验证过显存**（bf16 约 30-35GB vs 32G 卡，**最大未知�
 
 6. `9620 /health` **仍不透传 `profile` / `capabilities`**（只有 GPU 侧 `/health` 带）。
 7. `docs/HANDOFF-2026-09-21.md` 需补 Qwen 相关变更；
-   新交接提示词已引用 `HANDOFF-2026-09-22.md`，**该文件尚未创建**。
+   新交接提示词引用的 `HANDOFF-2026-09-22.md` **已创建**（2026-09-22 16:35，
+   含对外访问架构改动 + 许可闸 + Qwen 现状）。
 8. `manager/servers.json` 里 flux2/flux3/flux4 条目仍留痕（`enabled: false`）。
    ⚠️ 别再误标 flux4 停用 —— 被释放的是 flux.2 klein 4B / 4B2。
 
