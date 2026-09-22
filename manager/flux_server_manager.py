@@ -214,12 +214,31 @@ def scp_upload_cmd(server: dict, local_path, remote_dir: str) -> str:
 
 
 def ssh_config_aliases() -> list:
-    """从 ~/.ssh/config 读出所有 Host 别名（跳过含通配符的模板项）。"""
+    """从 ~/.ssh/config 读出所有 Host 别名（跳过含通配符的模板项）。
+
+    ★ 为什么整个函数体都在 try 里（2026-09-22 实测事故）：
+      原实现把 `cfg.exists()` 放在 try **外面** —— 读文件的逻辑有防护，
+      唯独这次 stat 没有。而 `Path.exists()` 内部就是 `os.stat()`，
+      **权限受限时会抛 PermissionError 而不是返回 False**。
+
+      实测症状：9620 启动时在模块级
+      `FLUX_SERVERS = _load_servers()` → `discover_servers()` → 本函数
+      的 `cfg.exists()` 处抛 `PermissionError: [WinError 5] 拒绝访问`，
+      **整个服务起不来**（错误栈指向 .ssh/config，看着像 SSH 配置坏了，
+      真因是"读不到配置文件"这件事不该是致命的）。
+
+      本函数的语义是「**尽力**发现额外机器」，不是「必须读到」。
+      读不到 → 返回 []，退回显式注册表（servers.json）—— 那才是权威来源。
+      **候选机的可用性绝不能依赖一个可选配置文件的可读性。**
+
+      一般化教训：**「读配置」类函数的每一处文件系统调用都要在同一层防护里**；
+      只包住 `read_text()` 而漏掉 `exists()` 是最常见的半截防护。
+    """
     cfg = Path(os.path.expanduser('~')) / '.ssh' / 'config'
-    if not cfg.exists():
-        return []
     out = []
     try:
+        if not cfg.exists():
+            return []
         for line in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
@@ -232,7 +251,8 @@ def ssh_config_aliases() -> list:
     except Exception as e:
         # 用局部取 logger：本函数在模块级（FLUX_SERVERS = _load_servers()）就会被调用，
         # 那时模块的 log 还没定义，直接引用会 NameError
-        logging.getLogger('flux_manager').warning(f'解析 ~/.ssh/config 失败: {e}')
+        logging.getLogger('flux_manager').warning(
+            f'读取 ~/.ssh/config 失败（降级为只用显式注册表）: {type(e).__name__}: {e}')
     return out
 
 

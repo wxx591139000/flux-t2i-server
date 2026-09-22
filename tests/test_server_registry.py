@@ -14,7 +14,7 @@
   4) 编辑任务的参考图只在内存 → manager 一重启 / FIFO 淘汰，编辑任务必失败。
      → 修法：同时落盘 web_out/<job_id>/ref.png，用时磁盘兜底。
 
-本门守住七条不变量（全离线：不连 SSH、不要 GPU、不碰数据库）
+本门守住八条不变量（全离线：不连 SSH、不要 GPU、不碰数据库）
   1. 注册表能被解析，enabled=false 的记录被跳过（释放的机器不再白等 SSH 超时）
   2. 直连条目解析出 -p/-i（ssh）与 -P/-i（scp）；无 host 的条目回退 alias
   3. 生效候选机 = 注册表 + 代码内默认机的并集，不重复
@@ -22,6 +22,8 @@
   5. 没有任何机器声明 supports_edit 时不崩、不过滤（向后兼容老部署）
   6. flux_queue 里 waiting 按等待时长判死，且 edit 任务按能力选机（源码级）
   7. 参考图双写：_put_ref 落盘 / _get_ref 磁盘兜底 / _drop_ref 终态清理（源码级）
+  8. ~/.ssh/config 不可读（权限受限/不存在）时**降级返回空**，
+     discover_servers 不崩、仍用显式注册表兜底（2026-09-22 加）
 
 用法: python tests/test_server_registry.py    # 全绿 exit 0，有红 exit 1
 """
@@ -45,6 +47,35 @@ RESULTS = []
 def check(name, cond, detail=''):
     RESULTS.append((name, bool(cond), detail))
     print(f'  {"✅" if cond else "❌"} {name}{("  → " + detail) if detail else ""}')
+
+
+def _strip_comments(src: str) -> str:
+    """剥掉注释与字符串字面量 + 抹平所有空白，返回**可直接做子串查找**的代码骨架。
+
+    ★ 两个必须踩过的坑（2026-09-22 本门自身各踩一次）：
+
+    1. **必须在剥离后的骨架上定位**，不能对全文 find：
+       docstring/注释里**正当地**会提到被断言的关键词（例如解释某个 bug 时
+       写出 `cfg.exists()`），全文 find 会命中那处文本 → **假红**。
+
+    2. **必须 `''.join()` 而不是 `'\\n'.join()`**：
+       tokenize 把每个 token 都单独列出来，`'\\n'.join()` 会在**每个 token 之间**
+       插换行 —— `def ssh_config_aliases` 变成 `def\\nssh_config_aliases\\n(...`
+       → 子串查找**必然落空** → 又一种假红（第一次修完仍是 try@-1 exists@-1）。
+       正确做法：`''.join()` 拼回连续文本，再用正则把空白一并抹平。
+
+    与项目已定的「字面串断言要归一化/钉可观察行为」同源：
+    **断言的目标是代码，不是文本排布。**
+    """
+    import io
+    import re
+    import tokenize
+    keep = []
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        keep.append(tok.string)
+    return re.sub(r'\s+', '', ''.join(keep))
 
 
 def t_registry_enabled():
@@ -254,6 +285,70 @@ def t_mutation():
           good == 'klein-machine' and bad == 'dev-machine', f'正常={good} 变异={bad}')
 
 
+def t_ssh_config_resilience():
+    """~/.ssh/config 读不到时必须**降级**，不能把整个服务带崩。
+
+    ★ 为什么加这一组（2026-09-22 实测事故）：
+      9620 启动时崩在模块级 `FLUX_SERVERS = _load_servers()` →
+      `discover_servers()` → `ssh_config_aliases()` → `cfg.exists()`，
+      抛 `PermissionError: [WinError 5] 拒绝访问`。
+      错误栈指向 `~/.ssh/config`，**看着像 SSH 配置坏了**；
+      真因是「读不到一个可选配置文件」被当成了致命错误。
+
+      原实现的防护只做了一半：`read_text()` 有 try 包住，
+      但 `cfg.exists()` 在 try **外面**（而 `Path.exists()` 内部就是 `os.stat()`，
+      **权限受限时抛异常而不是返回 False**）。
+
+      语义：本函数是「**尽力**发现额外机器」，读不到就该返回 [] 并退回
+      显式注册表（servers.json 才是权威来源）。
+      **候选机可用性绝不能依赖一个可选配置文件的可读性。**
+    """
+    print('\n[6] ~/.ssh/config 不可读时必须降级（不能崩）')
+    import pathlib
+    import unittest.mock as mock
+
+    real_exists = pathlib.Path.exists
+
+    def boom(self):
+        # 只模拟 .ssh/config 这一条路径的 stat 失败，其它路径照常
+        if str(self).replace('\\', '/').endswith('.ssh/config'):
+            raise PermissionError(13, 'Access denied (simulated)')
+        return real_exists(self)
+
+    with mock.patch.object(pathlib.Path, 'exists', boom):
+        try:
+            got = fsm.ssh_config_aliases()
+            check('ssh_config_aliases 权限受限时不抛异常', True, f'返回 {got}')
+            check('降级返回空列表（而非半截结果）', got == [], str(got))
+        except PermissionError as e:
+            check('ssh_config_aliases 权限受限时不抛异常', False,
+                  f'抛了 PermissionError: {e}')
+
+        # 更关键的一条：模块级加载路径也不能崩
+        try:
+            servers = fsm.discover_servers()
+            check('discover_servers 权限受限时不崩', True, f'{len(servers)} 台')
+            check('降级后仍能用显式注册表兜底', len(servers) > 0,
+                  f'{len(servers)} 台（全是注册表条目）')
+        except PermissionError as e:
+            check('discover_servers 权限受限时不崩', False,
+                  f'抛了 PermissionError —— 9620 会整个起不来: {e}')
+
+    # 源码级：确认防御没有又被挪到 try 外面（防"整理代码"时回归）
+    #
+    # ⚠️ _strip_comments 返回的是**已抹平空白**的骨架，所以下面的针也必须
+    #    写成无空格形式（`cfg.exists()` → `cfg.exists()`；`try:` → `try:`）。
+    src = open(os.path.join(BASE, 'manager', 'flux_server_manager.py'),
+               encoding='utf-8').read()
+    code = _strip_comments(src)
+    i_def = code.find('defssh_config_aliases')
+    i_try = code.find('try:', i_def)
+    i_exists = code.find('cfg.exists()', i_def)
+    check('cfg.exists() 在 try 块内（不是半截防护）',
+          i_def > 0 and -1 < i_try < i_exists,
+          f'def@{i_def} try@{i_try} exists@{i_exists}（exists 必须 > try）')
+
+
 def main():
     print('=' * 60)
     print('服务器注册表 / 选机 / 等待策略 回归门')
@@ -263,6 +358,7 @@ def main():
     t_edit_capability()
     t_source_level()
     t_mutation()
+    t_ssh_config_resilience()
     bad = [n for n, ok, _ in RESULTS if not ok]
     print('\n' + '=' * 60)
     print(f'共 {len(RESULTS)} 项，通过 {len(RESULTS) - len(bad)}，失败 {len(bad)}')
