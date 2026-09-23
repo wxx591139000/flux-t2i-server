@@ -71,6 +71,27 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at INTEGER,
     activated_at INTEGER
 );
+-- ── 飞书机器人「图图」（2026-09-23 P0）────────────────────────────────────
+-- 为什么要入库而不是放内存：飞书**会重放事件**，重放一次就是重复出图 + 重复扣额度；
+-- 而在途任务只放内存时，9620 一重启（每次改代码都要重启）这些任务的结果就**永远回不来**。
+-- 这两件事都是"用户看不到的损失"，必须落库。
+CREATE TABLE IF NOT EXISTS feishu_dedup (
+    event_key  TEXT PRIMARY KEY,   -- 'evt:{event_id}' / 'msg:{message_id}' / 'filekey:{file_key}'
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS feishu_tracks (
+    job_id     TEXT PRIMARY KEY,
+    chat_id    TEXT,               -- 单聊为空；群聊为群 id（P2 用）
+    sender_id  TEXT NOT NULL,      -- 飞书 open_id = A 链 user_id
+    is_group   INTEGER NOT NULL DEFAULT 0,
+    prompt     TEXT,               -- 冗余一份便于回执/排查
+    phase      TEXT NOT NULL DEFAULT 'queued',  -- queued/generating/waiting/done/failed
+    notified   TEXT,               -- JSON：已发过的节点，防重启后重复通知
+    created_at INTEGER,
+    updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_tracks_phase ON feishu_tracks(phase);
+CREATE INDEX IF NOT EXISTS idx_feishu_tracks_sender ON feishu_tracks(sender_id);
 """
 
 
@@ -502,6 +523,86 @@ class FluxDB:
                 (user_id, ym, n))
             self._conn.commit()
             return True
+
+
+    # ── 飞书机器人「图图」：事件去重（2026-09-23 P0）──
+    def feishu_seen(self, event_key: str) -> bool:
+        """登记一个事件键；**首次见到返回 False，重复见到返回 True**。
+
+        ⚠️ 必须用 `INSERT OR IGNORE` + `rowcount` 的**原子写法**，不能写成
+        「先 SELECT 查有没有、再 INSERT」—— 那样两条重放事件并发进来时
+        **两边都会查到"没有"，双双放行**，去重形同虚设（这类"看起来有去重"的
+        假防护比没有去重更糟：它会让人以为已经安全了）。
+        """
+        if not event_key:
+            # 拿不到任何 id 时**不做去重**，但要显式暴露出来（调用方负责记日志），
+            # 否则会变成"静默不去重"。
+            return False
+        cur = self._exec(
+            'INSERT OR IGNORE INTO feishu_dedup(event_key, created_at) VALUES(?,?)',
+            (str(event_key), int(time.time())))
+        return cur.rowcount == 0
+
+    def feishu_dedup_gc(self, keep_seconds: int = 7 * 86400) -> int:
+        """清理过期去重记录（默认留 7 天）。表只增不减会拖慢主键查重。"""
+        cur = self._exec('DELETE FROM feishu_dedup WHERE created_at < ?',
+                         (int(time.time()) - int(keep_seconds),))
+        return cur.rowcount
+
+    # ── 飞书机器人「图图」：在途任务跟踪（2026-09-23 P0）──
+    def feishu_track_add(self, job_id: str, sender_id: str, chat_id: str = '',
+                         is_group: int = 0, prompt: str = '', phase: str = 'queued'):
+        now = int(time.time())
+        self._exec(
+            'INSERT OR REPLACE INTO feishu_tracks'
+            '(job_id,chat_id,sender_id,is_group,prompt,phase,notified,created_at,updated_at)'
+            ' VALUES(?,?,?,?,?,?,?,?,?)',
+            (str(job_id), str(chat_id or ''), str(sender_id), int(is_group),
+             (prompt or '')[:200], str(phase), '{}', now, now))
+
+    def feishu_track_get(self, job_id: str):
+        return self._one('SELECT * FROM feishu_tracks WHERE job_id=?', (job_id,))
+
+    def feishu_track_set(self, job_id: str, phase: str = None, notified: str = None):
+        """局部更新（只改传入的字段）。notified 是 JSON 字符串。"""
+        now = int(time.time())
+        if phase is not None and notified is not None:
+            self._exec('UPDATE feishu_tracks SET phase=?, notified=?, updated_at=? WHERE job_id=?',
+                       (str(phase), notified, now, str(job_id)))
+        elif phase is not None:
+            self._exec('UPDATE feishu_tracks SET phase=?, updated_at=? WHERE job_id=?',
+                       (str(phase), now, str(job_id)))
+        elif notified is not None:
+            self._exec('UPDATE feishu_tracks SET notified=?, updated_at=? WHERE job_id=?',
+                       (notified, now, str(job_id)))
+
+    def feishu_tracks_pending(self, limit: int = 50):
+        """未到终态的在途任务 —— **9620 重启后据此恢复回传**（这是 P0 的核心）。
+
+        带 limit：一次别拉太多，避免某次积压把轮询线程拖住（卡住的轮询 = 所有用户
+        都收不到图，比慢一点严重得多）。
+        """
+        return self._all(
+            "SELECT * FROM feishu_tracks WHERE phase NOT IN ('done','failed') "
+            "ORDER BY created_at ASC LIMIT ?", (int(limit),))
+
+    def feishu_tracks_inflight(self, sender_id: str = None, limit: int = 500) -> int:
+        """在途任务数。传 sender_id = 该用户的在途数（**落库口径，重启后依然准**）。"""
+        if sender_id:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM feishu_tracks "
+                "WHERE sender_id=? AND phase NOT IN ('done','failed')", (str(sender_id),))
+        else:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM feishu_tracks WHERE phase NOT IN ('done','failed')")
+        return int(row['n']) if row else 0
+
+    def feishu_track_gc(self, keep_seconds: int = 30 * 86400) -> int:
+        """只清**已到终态**且很久以前的记录（在途的绝不动）。"""
+        cur = self._exec(
+            "DELETE FROM feishu_tracks WHERE phase IN ('done','failed') AND updated_at < ?",
+            (int(time.time()) - int(keep_seconds),))
+        return cur.rowcount
 
 
 def threading_lock():
