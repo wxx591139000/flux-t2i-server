@@ -431,3 +431,53 @@
 - 小红书侧原始记录：`ObsidW/审查/山西旅游-FLUX部署生成方案.md` 第 8 节
 - 转录 bot 机制参考：`/root/autodl-active`（服务器会话恢复）
 - 对外服务架构：`docs/WEB_SERVICE.md`；使用指南：`docs/USER_GUIDE.md`
+
+---
+
+## [2026-09-23] 「活体检查」冒充「身份/新鲜度检查」→ 假绿灯（公网仍指向旧上游）
+
+**问题**：一键启动脚本报告"对外环境已就绪"，但 `https://flux.zhuanlu.xyz` 打开是旧页面。
+**原因（两处独立的假绿灯）**：
+1. 隧道那步用 `[bool](Get-Process cloudflared)` 当"已重启" —— **旧进程正好满足它**；
+   而终止那行配了 `-ErrorAction SilentlyContinue`，把失败吞掉了
+2. 验收那步用 `HTTP 200` 当"已切到 3000" —— **旧上游 9620 同样返回 200**
+**实测证据**：cloudflared 停在 09-20 启动的进程，`config.yml` 是 09-22 改的；
+`cf_err.log` 里跑着的进程实际用的是 `ingressRule=1 originService=http://localhost:9620`
+**解决**：验收判据改为「**身份/新鲜度**」而不是「活体」——
+① 隧道：新进程启动时间必须 ≥ `config.yml` 的 mtime；② 公网：`<title>` 必须等于目标站点本机的 `<title>`，
+并**显式识别"等于旧上游"这一情形**；③ 终止进程必须**轮询确认真的退出**（"发过命令"≠"已退出"）
+**一般化**：验收前自问「**我什么都不做时，这个判据会不会也通过？**」会通过 → 它不是验收，是装饰。
+（另见本文件「[09-23] 数组 splatting」条：这条假绿灯之所以长期没被发现，是因为编排器卡死在中途）
+
+## [2026-09-23] `Start-Process` 带日志重定向在本机**必抛**「重复的键 https_proxy」
+
+**问题**：隧道重启永远失败，报错原文
+`值中的关键字:"https_proxy"。重复的键:"HTTPS_PROXY"`（即"已添加了具有相同键的项"）。
+**原因**：本机环境**同时存在** `https_proxy` 与 `HTTPS_PROXY`（`no_proxy`/`NO_PROXY` 同理）；
+.NET 处理环境块用**大小写不敏感的字典**，枚举到第二个就抛。而 `Start-Process` 只要带
+`-RedirectStandardOutput/-RedirectStandardError` 就会枚举环境 → 必抛。
+**连带后果**：只能退回「不带重定向 + 弹一个控制台窗口」启动，
+**那个窗口一关，被启动的服务就跟着死** —— 实测 3000 反复"起来了又没了"。
+**解决**：任何会 `Start-Process` 的脚本**开头先跑 `Repair-DuplicateEnv`**（删掉大写那份）。
+它原先只写在 `flux-t2i-server/start_service.ps1` 里；本次复制到
+`image-platform/deploy_site_prod.ps1` 与 `image-platform/restart_tunnel.ps1`。
+**同时**：对外长驻服务一律**带重定向**启动（无窗口 + 日志落盘），不要用 `-WindowStyle Minimized` 无重定向。
+
+## [2026-09-23] 数组 splatting 调子脚本 → `[switch]` 参数**一个都绑不上**（编排器卡死在 `pause`）
+
+**问题**：一键启动脚本跑到第 3 步后**窗口就不动了**，第 4 步身份验收与汇总表**永远不执行**。
+**实测绑定行为**（与 `deploy_site_prod.ps1` 同形状的 probe）：
+
+| 调用写法 | 实测结果 |
+|---|---|
+| `& script.ps1 @('-Restart','-NoPause')` | `BuildOnly=False \| Restart=False \| NoPause=False \| SkipBuild=False` |
+| `& script.ps1 -Restart -NoPause` | `Restart=True \| NoPause=True` |
+
+**原因**：数组 splatting 把字符串**当普通位置参数**传，`[switch]` 形参一个都没绑上。
+**后果（静默，不报错）**：
+1. `-NoPause` 失效 → 子脚本里的 `pause` 真执行 → **编排器卡死**（该脚本有 6 处 `pause`）
+2. `-Restart` 同样失效 → **"强制重启"从未执行**，端口被占时旧进程继续服务（又一个假绿灯）
+**为什么自动化环境看不见**：管道 stdin 下 `pause`/`Read-Host` 立即 EOF 返回，脚本照常跑完；
+**只有真实控制台会卡住**。这类缺陷不能靠"跑一遍看看"发现。
+**解决**：调用外部脚本**一律显式具名参数**，禁止 `& (Join-Path ...) @数组`；
+并加**源码级不变量检查**钉住这个写法。参数是否真绑上，要用 probe 实测。

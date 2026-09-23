@@ -97,3 +97,16 @@
 - **GPU 单卡严格串行**：队列 worker 单线程，多用户需排队（~85s/张）(v1.1)
 - **配额入队即扣**：每月图片数按 token 计，owner 无限 (v1.1)
 - **密钥/凭证绝不入库**：`.env`、token、日志、运行时 data 均在 `.gitignore` (v1.1)
+
+---
+
+## 增量（2026-09-23）：新增对外能力与边界
+
+- **对外入口**：`flux.zhuanlu.xyz`（客户站点，B链 3000）/ `flux-admin.zhuanlu.xyz`（**商户后台**，A链 9620）
+  / `xhs.zhuanlu.xyz`（小红书工具 8800）
+- **商户后台鉴权**：`WEB_ADMIN_TOKEN`（`manager/.env`），请求头 `X-Admin-Token` 或 `Authorization: Bearer`；
+  **空值 = 拒绝一切**。2026-09-23 已从文档里的旧默认值轮换为 20 位强口令（口令不入仓库）
+- **边界（明确写下）**：9620 公开暴露后，同一域名下的 `/api/*`（提交任务、`/api/download/<id>?token=` 等）
+  也一并可达 —— **Token 是唯一门槛**。更强的做法是在 Cloudflare 侧加 Access 或 IP 白名单（未做）
+- **飞书侧**：飞书 `open_id` 直接作为 A 链 `user_id`；owner 无限量；飞书身份与网页 token 是两套 ID，
+  按决策 2 用 `/bind <激活码>` 收敛为一套额度

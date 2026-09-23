@@ -277,3 +277,28 @@ worker: pop → SSH生成 → 拉图 web_out/<jobid>/ → done；服务器down �
 - **下载镜像**：`HF_ENDPOINT=https://hf-mirror.com`；pip：`mirrors.aliyun.com`
 - **本地**：Windows，看门狗定时跑，结果拉回 `output/`
 - **对外服务**（v1.1）：本地 Windows 跑 `flux_service.py`（端口9620），公网挂本地 `xhs-tunnel`；遵守双隧道约定不抢道
+
+---
+
+## 增量（2026-09-23）：对外入口与飞书机器人
+
+### 对外域名（cloudflared 隧道 `xhs-tunnel`，配置 `~/.cloudflared/config.yml`）
+
+| 域名 | 指向 | 用途 | 保护 |
+|---|---|---|---|
+| `flux.zhuanlu.xyz` | `localhost:3000` | image-gen-site 生产站点（客户用） | 无（公开） |
+| `flux-admin.zhuanlu.xyz` | `localhost:9620` | **A 链商户后台（owner 用）** | `WEB_ADMIN_TOKEN`（20 位强口令） |
+| `xhs.zhuanlu.xyz` | `localhost:8800` | 小红书笔记发布工具 | — |
+
+- ⚠️ `config.yml` 的 **ingress 顺序敏感**，`http_status:404` 兜底必须**最后**
+- ⚠️ 改完 `config.yml` **必须重启 cloudflared** 才生效（否则跑的是内存里的旧 ingress）
+- 本机入口 `http://127.0.0.1:9620/admin` 仍然可用（不经过隧道）
+
+### 飞书机器人「图图」
+
+- 位置：`manager/feishu_bot.py`（类 `FeishuBot`），**随 9620 在 A 链进程内启动**
+  （`manager/flux_service.py:58-59`）
+- 接收：WebSocket 长连接（`im.message.receive_v1`）；发送原语在 `manager/feishu_notify.py`
+- 现状能力：单聊 + 纯文本 + 一句话直出 + 回图；**群聊/图片/文件被硬过滤**
+- 目标形态与分阶段计划：见 `docs/图图-飞书完整互动-设计方案.md`
+- 架构约束：**随本机启停**（决策 1 选 A）；渠道层/编排层按"只依赖 HTTP"设计，便于将来迁 VPS

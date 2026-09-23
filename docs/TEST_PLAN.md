@@ -99,3 +99,27 @@
 - ⚠️ 分片大小是硬编码，若 HF 仓库文件变更需手动更新（脚本已注释来源）
 - ⚠️ 小红书产线文件队列（`flux_server_manager` 的 run()）修复后未再实测（v1.1 改动复用同一 SSH 函数）
 - ⚠️ 公网下载用 urllib/python 有 TLS EOO 怪癖，curl 正常（非服务问题）
+
+---
+
+## 增量（2026-09-23）：本轮验证记录
+
+### A 链全量门禁
+
+- `py -3.11 tests/run_all.py` → **18/18 道门通过，总耗时 48.8s**（无长期红的门）
+
+### 新增/加强的验证
+
+| 验证对象 | 方式 | 结果 |
+|---|---|---|
+| `ssh_config_aliases()` 读不到配置不崩 | `test_server_registry.py` 第 [6] 组：mock `Path.exists` 抛 `PermissionError` | 45/45 全绿；变异测试拆掉防护 → 3 项变红 |
+| 公网是否真的指向 3000 | **Playwright 真浏览器**抓三方 `<title>` 比对 | `公网 == 3000 → True`；截图字节数一致 |
+| 商户后台口令是否轮换生效 | 直接打 `/api/admin/users`（带/不带 token）+ Playwright 注入 localStorage 登录 | 新口令 200（进入面板）/ 旧口令 403 / 无口令 403 |
+| 隧道 ingress 是否正确 | `cloudflared tunnel ingress validate` + `ingress rule <url>` | validate=OK；三条规则全部匹配正确 |
+
+### 测试缺口（诚实记录）
+
+- **`pause`/`Read-Host` 类交互阻塞无法在管道环境下自动化验证** —— 它只在真实控制台发作。
+  对策：不靠测试，改为①禁用数组 splatting（源码级不变量检查）②进度文件/结论文件留痕
+- 飞书机器人侧**目前没有任何自动化测试**（现有 `feishu_bot.py` 无对应用例）；
+  设计文档 P1 已要求状态机与去重先补回归测试再上功能

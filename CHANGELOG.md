@@ -1,5 +1,50 @@
 # CHANGELOG
 
+## [v2.9.0] - 2026-09-23
+
+**对外可用性根因修复 + 商户后台开公网 + 飞书「图图」设计方案。**
+
+长期存在「朋友打开公网看到旧页面」的问题，这天查到了根 —— 而且是**三个独立缺陷叠加**，
+每一个单独看都"像是好的"：
+
+1. **隧道从未真正重启（服务侧）**：`cloudflared` 是长驻进程，启动时把 ingress 读进内存后不再读盘。
+   实测进程停在 09-20 启的实例，而 `config.yml` 是 09-22 改的 → 公网一直走旧 ingress。
+   修法新增 `image-platform/restart_tunnel.ps1`：按 PID 终止 + **轮询确认真退出** + **新鲜度断言**
+   （新进程启动时间必须 ≥ `config.yml` 的 mtime）+ 环境自愈。
+
+2. **`Start-Process` 带日志重定向必抛**（见 PITFALLS 同日条）：本机同时存在 `https_proxy` 与
+   `HTTPS_PROXY`，.NET 环境块用大小写不敏感字典 → 枚举即抛「重复的键」。
+   连带后果是只能退回"带控制台窗口"启动 → **窗口一关服务就死**（实测 3000 反复起来又没）。
+   修法：会 `Start-Process` 的脚本开头先跑 `Repair-DuplicateEnv`，对外服务一律带重定向启动。
+
+3. **编排层卡死在中途**（见 PITFALLS 同日条）：`& script.ps1 @('-Restart','-NoPause')` 这种
+   数组 splatting 让 `[switch]` 参数**一个都绑不上** → `-NoPause` 失效 → 子脚本里的 `pause`
+   把编排器卡住 → 隧道那一步**从未执行**，且 `-Restart` 也失效（"强制重启"从未发生）。
+   修法：改显式具名参数 + 加源码级不变量检查。
+
+**验收判据整体换成「身份/新鲜度」而不是「活体」**：隧道看"新进程 vs 配置 mtime"，
+公网看"`<title>` 是否等于 3000 且不等于旧上游 9620"。Playwright 真浏览器实测通过
+（公网 title == 3000 title）。
+
+### 新增
+
+- `docs/图图-飞书完整互动-设计方案.md` —— 飞书机器人「图图」的完整互动设计方案
+  （与 `transcribe-bot` 的小白做差距分析；P0-P6 分阶段 + 可机器判定的验收标准）
+- 商户后台独立公网域名 `flux-admin.zhuanlu.xyz` → `localhost:9620`
+- `image-platform/重启隧道.bat`（单独应用隧道配置改动用）
+
+### 安全
+
+- **`WEB_ADMIN_TOKEN` 轮换**：从文档里随处可见的旧默认值 `flux-admin-2026`
+  换成 20 位强口令（字母+数字，`secrets` 生成）。实测旧口令 `GET /api/admin/users` 已返回 403。
+  轮换原因：该旧值写在 README / SOP / archive 等多份文档里，等于已公开。
+
+### 修复
+
+- `ssh_config_aliases()` 半截防护：`cfg.exists()` 原在 try **外面**，而 `Path.exists()` 内部是
+  `os.stat()`，**权限受限时抛异常而非返回 False** → 冒泡到模块级导致 9620 整体起不来。
+  修法：整个函数体进 try，降级为 warning（commit `94ee0a9`）。
+
 ## [v2.8.1] - 2026-09-17
 
 **去重键根治：连点不再出重复图，`_inflight` 不再只增不减。**
