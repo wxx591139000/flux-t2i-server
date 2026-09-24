@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS feishu_tracks (
     sender_id  TEXT NOT NULL,      -- 飞书 open_id = A 链 user_id
     is_group   INTEGER NOT NULL DEFAULT 0,
     prompt     TEXT,               -- 冗余一份便于回执/排查
-    phase      TEXT NOT NULL DEFAULT 'queued',  -- queued/generating/waiting/done/failed
+    phase      TEXT NOT NULL DEFAULT 'queued',  -- queued/generating/waiting/done/failed/cancelled
     notified   TEXT,               -- JSON：已发过的节点，防重启后重复通知
     created_at INTEGER,
     updated_at INTEGER
@@ -400,6 +400,25 @@ class FluxDB:
         return self._all('SELECT * FROM jobs WHERE user_id=? AND deleted_at IS NULL '
                          'ORDER BY created_at DESC LIMIT ?', (user_id, limit))
 
+    def jobs_inflight_by_user(self, user_id: str, limit=50):
+        """该用户**仍在途**的任务（供机器人「我的任务 / 取消 N」列表用）。
+
+        「在途」= `queued`(排队) / `generating`(GPU 在跑) / `waiting`(等机器恢复)。
+        三个都要收，理由各不同：
+          · queued     —— 最典型的可取消状态，剔出队列即可，不烧 GPU
+          · waiting    —— **最需要能取消的一个**：机器没在线时任务会一直挂着，
+                          用户想撤回却无从下手（且内存等待池会留幽灵项，见 flux_queue）
+          · generating —— 撤不回来（GPU 已在跑），但可以打墓碑让 worker
+                          跑完丢弃产物 —— 比"不让取消"对用户更友好
+
+        **排除墓碑**（`deleted_at IS NULL`）：已删的不能再出现在列表里，
+        否则用户看到它、再"取消"一次，会得到一个自相矛盾的失败提示。
+        """
+        return self._all(
+            "SELECT * FROM jobs WHERE user_id=? AND deleted_at IS NULL "
+            "AND status IN ('queued','generating','waiting') "
+            "ORDER BY created_at DESC LIMIT ?", (user_id, limit))
+
     def jobs_queued(self):
         # 排除墓碑：用户已删的任务不该再占用 GPU。
         # 注意 generating 的墓碑**仍会出现**（见下方说明）——它们已经派给 GPU 了，撤不回来。
@@ -581,9 +600,12 @@ class FluxDB:
 
         带 limit：一次别拉太多，避免某次积压把轮询线程拖住（卡住的轮询 = 所有用户
         都收不到图，比慢一点严重得多）。
+
+        ★ `cancelled` 也是终态（2026-09-24）：用户取消/删除任务后，轮询线程必须
+          停止盯它，否则每 5 秒空转一次、永不收敛（就是 P0-1 那种"永不收敛"的病）。
         """
         return self._all(
-            "SELECT * FROM feishu_tracks WHERE phase NOT IN ('done','failed') "
+            "SELECT * FROM feishu_tracks WHERE phase NOT IN ('done','failed','cancelled') "
             "ORDER BY created_at ASC LIMIT ?", (int(limit),))
 
     def feishu_tracks_inflight(self, sender_id: str = None, limit: int = 500) -> int:

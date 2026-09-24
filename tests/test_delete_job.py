@@ -14,7 +14,7 @@
   ③ 队列 / 去重键的竞态无人兜。
   所以删除 = 打 `deleted_at` 墓碑 + 清图片，让 worker 跑完后能自查并收尾。
 
-本门守住 8 条不变量（全离线：不连 SSH、不要 GPU、不启动 HTTP 服务）
+本门守住 9 条不变量（全离线：不连 SSH、不要 GPU、不启动 HTTP 服务）
   1. 只能删自己的 —— 别人的 job_id 删不动，且不泄漏「这个 id 存在」
   2. 删除后用户查询再也看不到（job_by_user / job_get_alive 都排除墓碑）
   3. 用户看不到的任务也不该再占 GPU（jobs_queued / jobs_waiting 排除墓碑）
@@ -23,6 +23,9 @@
   6. 已删任务的图片直链立即失效（否则用户认为删除没生效）
   7. worker 拿到已删任务时**不烧 GPU**，直接丢弃
   8. worker 在生成期间遇到删除 → 丢弃产物 + 物理清理墓碑行（否则墓碑堆积）
+  9. **已删的 waiting 不许复活**（2026-09-24 加）—— 内存等待池的恢复路径必须
+     自己再判一次墓碑，否则它会重新入队，并在 4 小时超时分支上**给已删任务退款**
+     （= 把第 4 条明确要防的「删了重传刷额度」开了口子）
 
 用法: python tests/test_delete_job.py      # 全绿 exit 0，有红 exit 1
 """
@@ -391,12 +394,103 @@ def test_drop_job_kills_queue_and_dedup():
        len(s._inflight) < n_before or n_before == 0, f'{n_before} → {len(s._inflight)}')
 
 
+def test_waiting_deleted_not_resurrected():
+    """T11 ★ 已删的 waiting 任务不许在"机器恢复"时复活（2026-09-24 新增）。
+
+    背景（真实缺陷，与飞书图图 P1「取消任务」同时查出来的）：
+      `/api/delete` 判在途用的是 `inflight = status in ('queued','generating')`
+      —— **waiting 不在其中** → 删除 waiting 任务时**不会**调 `drop_job()`，
+      于是调度器内存等待池 `self._waiting` 留下一项幽灵。
+
+      而后 `_recover_waiting_tasks()` 从内存池 pop 出来**直接重新入队**，
+      原先没有任何墓碑检查。后果有两层：
+        · 轻：任务被重新入队跑一轮（`_process` 开头还有墓碑检查会拦住 → 不烧 GPU）
+        · **重**：本函数里 `waited > WAIT_MAX_SEC`（4 小时）那条分支会
+          `job_update(status='failed')` + **`_refund_quota()`** —— 给一个**已被用户
+          删除**的任务退款。这正好把 `job_mark_deleted` docstring 里明确要防的
+          「删了重传无限刷」开了个口子（`_api_delete` 与 db 层的 T6 都在守这条，
+          这里却漏了）。
+    """
+    print('\n── ★ 已删的 waiting 不许复活（含"删了重传刷额度"路径）──')
+    db = StubDB()
+    s = new_sched(db)
+
+    # 造两个 waiting 任务：一个正常、一个已被用户删（墓碑）
+    for jid in ('wAlive', 'wDead'):
+        db.insert(jid, 'u1', status='waiting', error='[SERVER_DOWN] ssh refused [RETRY:1]')
+    ok('T11 前置：墓碑已生效', db.job_mark_deleted('wDead', 'u1') is True)
+
+    # 模拟内存等待池里的**残留**（真实场景：旧版 /api/delete 不调 drop_job）
+    s._waiting.add('wAlive')
+    s._waiting.add('wDead')
+
+    refunds = []
+    s._refund_quota = lambda job, reason: refunds.append(((job or {}).get('job_id'), reason))
+
+    s._recover_waiting_tasks()
+
+    queued = []
+    while not s._pq.empty():
+        queued.append(s._pq.get_nowait()[2])
+
+    # ★★ 阳性对照：没有它，下面几条会因为"函数压根没跑"而假绿
+    ok('T11b 阳性对照：正常 waiting 任务**确实**被重新入队（证明本函数真的执行了）',
+       'wAlive' in queued, f'实际入队 {queued}')
+
+    ok('T11c ★★ 已删（墓碑）的 waiting 任务**没有**被复活',
+       'wDead' not in queued, f'实际入队 {queued}')
+    wd = db.job_get('wDead')
+    ok('T11d 已删任务的状态未被改写（仍是 waiting，没被改成 queued/failed）',
+       wd is not None and wd['status'] == 'waiting',
+       f"实际 {wd['status'] if wd else '(行没了)'}")
+    ok('T11e ★★ 未给已删任务退款（否则等于开了「删了重传刷额度」的口子）',
+       all(j != 'wDead' for j, _ in refunds), f'实际退款 {refunds}')
+    ok('T11f 等待池已清空（不残留幽灵项）', len(s._waiting) == 0, f'剩 {s._waiting}')
+
+    # ── 超时判死分支：**退款后果真正发生的地方** ──
+    # 上面那组 waited≈0，走的是"重新入队"分支，经 `_process` 的墓碑检查拦住，不烧 GPU。
+    # 但 `waited > WAIT_MAX_SEC`（默认 4 小时）这条分支会直接
+    # `job_update(status='failed')` + `_refund_quota()` —— **给已删任务退款**，
+    # 那才是"删了重传刷额度"的口子。必须单独覆盖，否则本门会漏掉最严重的后果。
+    db2 = StubDB()
+    s2 = new_sched(db2)
+    old_ts = int(time.time()) - fq.WAIT_MAX_SEC - 600
+    for jid in ('sAlive', 'sDead'):
+        db2.insert(jid, 'u1', status='waiting', error='[SERVER_DOWN] ssh refused [RETRY:1]')
+        db2.job_update(jid, created_at=old_ts)     # 造"等了 4 小时+"的场景
+    db2.job_mark_deleted('sDead', 'u1')
+    s2._waiting.update(['sAlive', 'sDead'])
+
+    refunds2 = []
+    s2._refund_quota = lambda job, reason: refunds2.append(((job or {}).get('job_id'), reason))
+    s2._recover_waiting_tasks()
+
+    ok('T11i 阳性对照：超时的**正常** waiting 任务确实被判死并退款',
+       any(j == 'sAlive' for j, _ in refunds2), f'实际退款 {refunds2}')
+    ok('T11j ★★ 超时的**已删** waiting 任务**未**退款'
+       '（这正是「删了重传刷额度」的口子）',
+       all(j != 'sDead' for j, _ in refunds2), f'实际退款 {refunds2}')
+    sd = db2.job_get('sDead')
+    ok('T11k 已删任务未被判死（状态没被改成 failed）',
+       sd is not None and sd['status'] == 'waiting',
+       f"实际 {sd['status'] if sd else '(行没了)'}")
+
+    # ── 源码级：防止有人把这道闸"优化"掉 ──
+    body = _fn_src(open(QUEUE_SRC, encoding='utf-8').read(), '_recover_waiting_tasks')
+    ok('T11g 源码级：_recover_waiting_tasks 里有墓碑过滤',
+       'deleted_at' in body, '函数体里找不到 deleted_at')
+    i_del, i_enq = body.find('deleted_at'), body.find("'queued'")
+    ok('T11h 墓碑过滤在「重新入队」之前（顺序反了等于没防）',
+       i_del != -1 and i_enq != -1 and i_del < i_enq, f'deleted_at@{i_del} vs queued@{i_enq}')
+
+
 def main():
     test_db_layer()
     test_db_src_guards()
     test_worker_skips_deleted()
     test_worker_discards_output_when_deleted_during_generation()
     test_drop_job_kills_queue_and_dedup()
+    test_waiting_deleted_not_resurrected()
 
     print()
     passed = sum(1 for r in RESULTS if r)

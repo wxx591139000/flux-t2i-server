@@ -718,6 +718,29 @@ class FluxQueueScheduler:
                 if not job:
                     continue
                 job = dict(job)          # ⚠️ Row 没有 .get()，先转 dict（坑 1）
+
+                # ── 墓碑过滤（2026-09-24 加的第三道闸）──────────────────────────
+                # 用户删掉的 waiting 任务**必须在这里丢弃**，否则它会复活。
+                #
+                # 为什么会有幽灵项：`/api/delete` 判 `inflight = status in
+                # ('queued','generating')`，**waiting 不在其中** → 不调 `drop_job()`
+                # → `self._waiting` 里那一项没被清掉（`drop_job` 的 docstring
+                # 恰好点名了这个后果："不清的话机器恢复后会被重新入队，白跑一遍"）。
+                #
+                # 后果不是"白跑 GPU"（`_process` 开头还有一道墓碑检查会拦住），
+                # 而是**更糟的一种**：本函数下面的 `waited > WAIT_MAX_SEC` 分支会
+                # `job_update(status='failed')` + **`_refund_quota()`** ——
+                # 给一个已被用户删除的任务退款，等于把 `job_mark_deleted` 明确要防的
+                # 「删了重传无限刷」漏洞开了个口子（4 小时窗口 + 机器恢复才触发，隐蔽）。
+                #
+                # 第三道闸的必要性：`drop_job()` 是调用方**应当**做的事（第一道闸，
+                # 已修），但内存池可能因异常、旧代码、将来的新调用方而残留，
+                # 所以恢复入口必须自己再判一次 —— 与 worker 侧 `_process` 的
+                # 双查同一个思路（那里也注释了"入队时剔除与此刻之间存在窗口"）。
+                if job.get('deleted_at') is not None:
+                    logger.info(f'🗑️  {job_id} 已被用户删除，从等待池丢弃（不复活、不退款）')
+                    continue
+
                 retry = self._count_retry(job['error'] or '')
                 waited = int(time.time()) - int(job.get('created_at') or time.time())
                 if waited > WAIT_MAX_SEC:

@@ -525,7 +525,17 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         status = job['status']
-        inflight = status in ('queued', 'generating')
+        # ★ 2026-09-24：把「要不要从调度器内存剔除」与「要不要立即清图片文件」
+        #   拆成两个判据 —— 原来只有一个 `inflight`，而 **`waiting` 不在其中**，
+        #   于是删除 waiting 任务时**不会**调 `drop_job()`，内存等待池 `_waiting`
+        #   留下一项幽灵 → 机器恢复时被 `_recover_waiting_tasks()` 重新入队。
+        #   后果不是"白跑 GPU"（`_process` 开头还有墓碑检查拦着），而是那条
+        #   路径上的 `waited > WAIT_MAX_SEC` 分支会给**已删任务退款** ——
+        #   正好把 `job_mark_deleted` 明确要防的「删了重传无限刷」开了口子。
+        #   `drop_job` 要清的三处（`_waiting`/`_inflight`/`_pq`）恰好同时覆盖
+        #   queued 与 waiting，所以「需剔除」的范围比「有产物要清」更大，两者必须分开。
+        inflight = status in ('queued', 'generating')            # 已派给 GPU 或排在前头
+        pooled = status in ('queued', 'generating', 'waiting')   # 调度器内存里可能有它
 
         # ① 先打墓碑 —— 这一步成功才算"删除受理"。
         #    顺序很重要：先打墓碑再清文件，任何时刻中断都不会出现"文件没了但任务还在"的
@@ -539,8 +549,9 @@ class _Handler(BaseHTTPRequestHandler):
             # ② 终态任务：图片文件立即物理删除
             purged = self._purge_job_image(job_id)
 
-        # ③ 在途任务：从调度器内存里剔掉（队列/等待池/去重键），别让它再被捞起来
-        if inflight:
+        # ③ 还在调度器内存里的任务：剔掉（队列 / 等待池 / 去重键），别让它再被捞起来
+        #    判据用 `pooled` 而非 `inflight` —— waiting 必须一起剔（见上面拆判据的注释）
+        if pooled:
             try:
                 self.scheduler.drop_job(job_id, job)
             except Exception as e:                                # noqa: BLE001

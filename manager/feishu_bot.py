@@ -42,6 +42,7 @@ WebSocket 监听 P2P 私聊消息 → 提取提示词 → 提交 FLUX 队列 →
 ════════════════════════════════════════════════════════════════════════════
 """
 import os
+import re
 import sys
 import json
 import time
@@ -64,6 +65,94 @@ MAX_INFLIGHT_PER_USER = 1  # 每用户在途上限
 TRACK_BATCH = 50           # 单轮最多处理多少条在途（防止积压把轮询线程拖住）
 DEDUP_KEEP_DAYS = 7        # 去重记录保留天数
 MAX_QUEUE = 200            # 待处理消息队列上限（满了明确回绝，不无声丢弃）
+LIST_LIMIT = 20            # 「我的任务」最多列几条
+SEQ_MAX_LEN = 3            # 序号最多几位（超过这个长度的纯数字按任务短码解释）
+
+# ── 命令面（2026-09-24 P1，对齐小白的中文裸命令用法）──────────────────────
+# ★ 这里是命令的**唯一事实源**。新增命令必须登记进 `_match_command`，
+#   否则它会被当提示词提交 → **真的扣额度并出一张毫不相干的图**。
+#   （小白的同款坑：命令前缀没登记会被状态机吞掉，见其 commands.py 注释。）
+#
+# 状态 → 图标/中文名（列表与回执共用）
+STATUS_LABELS = {
+    'queued':     ('⏳', '排队中'),
+    'generating': ('🎨', '生成中'),
+    'waiting':    ('🔴', '等机器恢复'),
+    'done':       ('✅', '已完成'),
+    'failed':     ('❌', '已失败'),
+}
+
+
+HELP_TEXT = (
+    '📸 图图 · 生图助手\n'
+    '\n'
+    '🖼 出图\n'
+    '• 直接发一句话即可，例如：一只橘猫坐在窗台上，阳光洒落\n'
+    '• 出好后我把图片直接发给你（中文提示词会先自动翻译成英文）\n'
+    '\n'
+    '📋 任务\n'
+    '• 发「我的任务」或裸发「取消」→ 列出你在途的任务（带序号）\n'
+    '• 发「取消 01」→ 取消列表里第 1 个\n'
+    '• 发「取消 3ada124e」→ 按任务号取消（任务号见列表括号内）\n'
+    '\n'
+    '⚠️ 说明\n'
+    '• 取消不退还额度（与网页端 flux.zhuanlu.xyz 一致）\n'
+    '• 「生成中」的任务撤不回来，但我会让后台跑完后丢弃产物\n'
+    '• 「等机器恢复」的任务也能取消，机器上线后不会再跑它'
+)
+
+
+def _strip_noise(text: str) -> str:
+    """去掉飞书 @提及 与斜杠前缀，便于统一匹配命令。"""
+    t = re.sub(r'@_user_\d+', '', text or '')
+    t = t.strip()
+    if t.startswith('/'):
+        t = t[1:].strip()
+    return t
+
+
+def _match_command(text: str):
+    """把一条文本解析成命令，返回 `(name, arg)`；**不是命令则返回 None**。
+
+    `name` ∈ {'help', 'list', 'cancel'}
+
+    ⚠️ 判据必须**严格**，因为图图的主用法是"发一句话出图"：
+      误判成命令 = 吞掉用户的提示词；漏判 = 把命令当提示词提交（扣额度出废图）。
+        · 用户提示词「取消一切杂乱背景，画面干净」以"取消"二字开头 —— 这是**真实**
+          的误判风险。所以「取消」后面**必须**是序号或任务短码才算命令，
+          否则回落为提示词。
+        · 与小白一致：**裸「取消」= 看列表**（不当提示词），这样用户忘带序号时
+          不会白扣一次额度。
+        · 「取消任务 <非序号>」按小白惯例仍走取消分支（由它给出人话用法提示），
+          因为"取消任务"这三个字几乎不可能是提示词的开头。
+    """
+    t = _strip_noise(text)
+    if not t:
+        return None
+
+    if t in ('帮助', 'help'):
+        return ('help', '')
+
+    # 裸「取消」/「我的任务」→ 列表（供用户拿到序号）
+    if t in ('我的任务', '我的排队', '我的生图', '取消'):
+        return ('list', '')
+
+    # 「取消任务 01」/「取消 01」/「取消01」
+    for prefix in ('取消任务', '取消'):
+        if t.startswith(prefix):
+            rest = t[len(prefix):].strip()
+            if not rest:
+                # 「取消任务」不带参数 → 当列表处理（比报用法更顺手）
+                return ('list', '')
+            if rest.isdigit() and len(rest) <= SEQ_MAX_LEN:
+                return ('cancel', rest)
+            # 任务短码（job_id 前 6~16 位十六进制）
+            if re.fullmatch(r'[0-9a-fA-F]{6,16}', rest):
+                return ('cancel', rest)
+            # ★ 既非序号也非短码 → **不是命令**，回落为提示词
+            #   （这样「取消一切杂乱背景」仍能正常出图）
+            return None
+    return None
 
 
 class FeishuBot:
@@ -240,10 +329,37 @@ class FeishuBot:
                     pass
 
     def _handle_prompt(self, open_id: str, prompt: str):
-        """提交提示词到队列，并回确认消息。"""
-        # 斜杠开头 → 提示语（首版不实现命令）
+        """处理一条用户消息：**先判命令，再当提示词**。"""
+        # ★★ 命令识别必须在最前面（2026-09-24 P1）：
+        #    图图的主用法是"发一句话出图"，如果把「取消 01」当提示词提交，
+        #    就会**真的扣一次额度并生成一张毫不相干的图** —— 用户想撤回，
+        #    结果反而多花一次。这个顺序是硬要求，不是风格问题。
+        cmd = _match_command(prompt)
+        if cmd:
+            name, arg = cmd
+            try:
+                if name == 'help':
+                    self._cmd_help(open_id)
+                elif name == 'list':
+                    self._cmd_list(open_id)
+                elif name == 'cancel':
+                    self._cmd_cancel(open_id, arg)
+                else:                      # 防御：登记了名字却忘了分支
+                    logger.error(f'🤖 命令 {name!r} 已解析但没有处理分支')
+                    self.n.send_direct(open_id, '内部错误：命令未实现，已记录')
+            except Exception as e:
+                logger.error(f'🤖 命令 {name} 执行异常: {type(e).__name__}: {e}', exc_info=True)
+                try:
+                    self.n.send_direct(open_id, f'❌ 命令执行失败：{str(e)[:120]}')
+                except Exception:
+                    pass
+            return
+
+        # 走到这里才说明"不是命令"。未知的斜杠写法给一次指引（别静默当提示词）
         if prompt.startswith('/'):
-            self.n.send_direct(open_id, '📝 直接发提示词即可出图，例如：一只橘猫坐在窗台上，阳光洒落')
+            self.n.send_direct(open_id,
+                               '📝 直接发提示词即可出图，例如：一只橘猫坐在窗台上，阳光洒落\n'
+                               '（发「帮助」看全部命令）')
             return
 
         # ★ P0-4：**先**判断上限再提交 —— 原来的顺序（先提交、超限就不跟踪）
@@ -258,6 +374,118 @@ class FeishuBot:
         finally:
             with self._lock:
                 self._submitting.discard(open_id)
+
+    # ── 命令实现（2026-09-24 P1）──────────────────────────────────────
+    def _cmd_help(self, open_id: str):
+        self.n.send_direct(open_id, HELP_TEXT)
+
+    @staticmethod
+    def _fmt_job_line(idx: int, job: dict) -> str:
+        """列表一行：`01 ⏳ 一只橘猫坐在窗台上（排队中 · 3ada124e）`"""
+        st = job.get('status') or ''
+        icon, label = STATUS_LABELS.get(st, ('❔', st or '未知'))
+        prompt = re.sub(r'\s+', ' ', (job.get('prompt') or '')).strip()[:24] or '(无提示词)'
+        short = (job.get('job_id') or '')[:8]
+        return f'{idx:02d} {icon} {prompt}（{label} · {short}）'
+
+    def _cmd_list(self, open_id: str):
+        """列出我在途的任务（供「取消 N」定位）。**只列自己的**（SQL 层钉死 user_id）。"""
+        rows = self.db.jobs_inflight_by_user(open_id, limit=LIST_LIMIT)
+        if not rows:
+            self.n.send_direct(open_id,
+                               '📭 你当前没有排队 / 生成中的任务。\n\n'
+                               '直接发一句话就能出图，例如：一只橘猫坐在窗台上，阳光洒落')
+            return
+        jobs = [dict(r) for r in rows]
+        lines = [self._fmt_job_line(i, j) for i, j in enumerate(jobs, 1)]
+        first_short = (jobs[0].get('job_id') or '')[:8]
+        self.n.send_direct(
+            open_id,
+            '📋 我的任务（在途）：\n' + '\n'.join(lines) +
+            f'\n\n✖️ 取消：发「取消 01」取消第 1 个，或「取消 {first_short}」按任务号取消。'
+            '\n⚠️ 取消不退还额度（与网页端一致）。')
+
+    def _cmd_cancel(self, open_id: str, arg: str):
+        """取消自己的在途任务。`arg` 为序号或 job_id 短码。
+
+        **权限**：`db.job_mark_deleted()` 的 SQL 钉死 `user_id=?`，
+        所以"越权取消别人的任务"在**数据层就不可能发生** —— 这里不需要再鉴权，
+        上层也不依赖"记得校验"（这是刻意设计，见该方法的 docstring）。
+        """
+        jobs = [dict(r) for r in self.db.jobs_inflight_by_user(open_id, limit=50)]
+        if not jobs:
+            self.n.send_direct(open_id, '📭 你当前没有可取消的任务。')
+            return
+
+        # ① 定位目标（序号优先 —— 序号是上一条「我的任务」的展示顺序，新→旧）
+        target = None
+        if arg.isdigit():
+            idx = int(arg)
+            if idx < 1 or idx > len(jobs):
+                self.n.send_direct(open_id,
+                                   f'⚠️ 序号 {idx} 超出范围：你当前有 {len(jobs)} 个在途任务，'
+                                   f'发「我的任务」查看最新列表')
+                return
+            target = jobs[idx - 1]
+        else:
+            hits = [j for j in jobs if (j.get('job_id') or '').lower().startswith(arg.lower())]
+            if not hits:
+                # 措辞要覆盖「刚取消过又点一次」这个**很常见**的情形：
+                # 列表已排除墓碑，所以重复取消必然走这条分支 —— 若只说"没找到"，
+                # 用户会以为任务号打错了（其实他刚成功取消过）。
+                self.n.send_direct(open_id,
+                                   f'⚠️ 在途任务里没有以 {arg} 开头的（可能已取消或已完成）。\n'
+                                   f'发「我的任务」看当前在途列表')
+                return
+            if len(hits) > 1:
+                self.n.send_direct(open_id,
+                                   f'⚠️ 任务号 {arg} 匹配到 {len(hits)} 个，请多给几位，'
+                                   f'或发「我的任务」用序号取消')
+                return
+            target = hits[0]
+
+        job_id = target.get('job_id') or ''
+        status = target.get('status') or ''
+        _, label = STATUS_LABELS.get(status, ('❔', status))
+
+        # ② 打墓碑（幂等 / 只许删自己的 / 不退额度 —— 三条都由 db 层保证）
+        try:
+            marked = self.db.job_mark_deleted(job_id, open_id)
+        except Exception as e:
+            logger.error(f'🤖 取消任务打墓碑失败 {job_id}: {type(e).__name__}: {e}', exc_info=True)
+            self.n.send_direct(open_id, f'❌ 取消失败：{str(e)[:120]}')
+            return
+        if not marked:
+            # 幂等：已删过（可能是网页端删的）。不是错误，如实告知即可。
+            self.n.send_direct(open_id, f'ℹ️ 任务 {job_id[:8]} 此前已取消，无需重复操作。')
+            return
+
+        # ③ 从调度器内存剔除（队列 / 等待池 / 去重键）。
+        #    剔除失败**不回滚**墓碑：worker 与恢复入口都有兜底检查会收尾
+        #    （与 `/api/delete` 同一策略 —— 宁可留个后台收尾，也不要半死状态）。
+        try:
+            self.scheduler.drop_job(job_id, target)
+        except Exception as e:
+            logger.warning(f'🤖 取消 {job_id} 时从调度器剔除失败（worker 会兜住）: {e}')
+
+        # ④ 终止飞书侧跟踪，别让轮询线程继续盯一个已取消的任务
+        try:
+            self.db.feishu_track_set(job_id, phase='cancelled')
+        except Exception as e:
+            logger.warning(f'🤖 取消 {job_id} 后标记跟踪终态失败: {e}')
+
+        logger.info(f'🗑️  图图用户 {open_id} 取消任务 {job_id}（原状态 {status}）')
+
+        # ⑤ 按原状态给不同措辞 —— 尤其是 generating：用户需要知道"撤不回来，但产物会丢"
+        if status == 'generating':
+            tail = '⚠️ 它已在生成中，无法中途打断；后台会在跑完后丢弃产物，你不需要做什么。'
+        elif status == 'waiting':
+            tail = '✅ 已从「等机器恢复」池中移除，机器上线后不会再跑它。'
+        else:
+            tail = '✅ 已从队列移除，不会消耗 GPU。'
+        self.n.send_direct(open_id,
+                           f'✖️ 已取消「{label}」的任务 {job_id[:8]}\n{tail}\n'
+                           f'⚠️ 额度不退还（与网页端一致）。')
 
     def _submit_locked(self, open_id: str, prompt: str):
         """真正提交（已被 `_submitting` 短锁保护，同一用户不会并发进来）。"""
@@ -334,6 +562,16 @@ class FeishuBot:
                 continue
             job = dict(job)
             st = job.get('status') or ''
+
+            # ★ 墓碑优先（2026-09-24）：任务已被取消/删除 → 立即终止跟踪。
+            #   必须在这里判，因为**取消可能来自网页端**（`/api/delete`）——
+            #   那种情况下飞书这张跟踪表完全不知情，不判就会每 5 秒空转、永不收敛
+            #   （正是 P0-1 那种"永不收敛"的病：一条坏记录钉住整个轮询）。
+            if job.get('deleted_at') is not None:
+                if t['phase'] != 'cancelled':
+                    self.db.feishu_track_set(job_id, phase='cancelled')
+                    logger.info(f'🗑️  任务 {job_id} 已被取消/删除，停止跟踪')
+                continue
 
             if st == 'done':
                 self._send_result(sender, job)
