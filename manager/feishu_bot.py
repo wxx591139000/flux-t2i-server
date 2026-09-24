@@ -45,6 +45,7 @@ import os
 import sys
 import json
 import time
+import queue
 import logging
 import threading
 from pathlib import Path
@@ -62,6 +63,7 @@ MAX_INFLIGHT_GLOBAL = 200  # 全局在途上限（超出 = 拒绝提交 + 明确
 MAX_INFLIGHT_PER_USER = 1  # 每用户在途上限
 TRACK_BATCH = 50           # 单轮最多处理多少条在途（防止积压把轮询线程拖住）
 DEDUP_KEEP_DAYS = 7        # 去重记录保留天数
+MAX_QUEUE = 200            # 待处理消息队列上限（满了明确回绝，不无声丢弃）
 
 
 class FeishuBot:
@@ -79,6 +81,17 @@ class FeishuBot:
         #    「查在途 → 提交」之间的竞态窗口（两条消息几乎同时到达会双双通过检查）。
         self._submitting = set()
         self._lock = threading.Lock()
+        # ★ 消息队列 + 工作线程（2026-09-24 实测事故后加）：
+        #   lark 的 WS 客户端是在 **asyncio 事件循环里同步调用** `_on_message` 的。
+        #   如果在那里直接 `scheduler.submit()`（中文翻译最坏要重试 3 次、耗时几十秒），
+        #   事件循环就被占住 → **心跳 ping/pong 发不出去** → 飞书按
+        #   `3003 (registered) ping timeout` **把连接踢掉**，并且因为没及时 ACK
+        #   **把同一条事件重投一遍**（日志里「重复事件，已忽略」就是它的脚印）。
+        #   实测：一条"你好"卡了 68 秒，连接被踢。
+        #   → 所以 WS 回调里只做**毫秒级**的活（去重 + 过滤 + 取文本），
+        #     真正耗时的提交丢进这个队列，由工作线程慢慢做。
+        self._q = queue.Queue(maxsize=MAX_QUEUE)
+        self._workers = 2
 
     # ── 启动 ──
     def start(self) -> bool:
@@ -109,7 +122,11 @@ class FeishuBot:
 
         threading.Thread(target=self._ws_listen, daemon=True, name='feishu-bot-ws').start()
         threading.Thread(target=self._poll_loop, daemon=True, name='feishu-bot-poll').start()
-        logger.info('🤖 飞书图图机器人已启动（WebSocket 监听 + 任务轮询）')
+        # ★ 工作线程：把"提交"从 WS 事件循环里挪出来（否则翻译一慢就掉线，见 __init__ 注释）
+        for i in range(self._workers):
+            threading.Thread(target=self._work_loop, daemon=True,
+                             name=f'feishu-bot-work{i}').start()
+        logger.info(f'🤖 飞书图图机器人已启动（WebSocket 监听 + 任务轮询 + {self._workers} 个工作线程）')
         return True
 
     # ── WebSocket 监听（借鉴转录bot feishu_channel._start_ws_listener）──
@@ -189,9 +206,38 @@ class FeishuBot:
             if not text:
                 return
             logger.info(f'📩 图图收到 {open_id}: {text[:60]}')
-            self._handle_prompt(open_id, text)
+            # ★ 只入队、不在这里干活 —— 见 __init__ 里"为什么必须有工作线程"的实测事故
+            self._enqueue(open_id, text)
         except Exception as e:
-            logger.error(f'🤖 消息处理异常: {e}')
+            logger.error(f'🤖 消息处理异常: {type(e).__name__}: {e}', exc_info=True)
+
+    def _enqueue(self, open_id: str, text: str):
+        """把耗时工作交给工作线程。队列满时**明确回绝**，绝不无声丢弃。"""
+        try:
+            self._q.put_nowait((open_id, text))
+        except queue.Full:
+            logger.warning('🤖 待处理队列已满，拒绝并回执')
+            try:
+                self.n.send_direct(open_id, '⚠️ 消息处理队列已满，请稍后再发一次～')
+            except Exception:
+                pass
+
+    def _work_loop(self):
+        while True:
+            try:
+                open_id, text = self._q.get()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            try:
+                self._handle_prompt(open_id, text)
+            except Exception as e:
+                logger.error(f'🤖 工作线程异常: {type(e).__name__}: {e}', exc_info=True)
+            finally:
+                try:
+                    self._q.task_done()
+                except Exception:
+                    pass
 
     def _handle_prompt(self, open_id: str, prompt: str):
         """提交提示词到队列，并回确认消息。"""
@@ -229,6 +275,11 @@ class FeishuBot:
                     f'⚠️ 当前在途任务较多（{inflight} 个），为免你白等，这次**没有提交**。\n'
                     f'稍后再发一次即可。')
                 return
+
+            # ★ 立即回执（2026-09-24 实测教训）：提交里含**中文翻译**，最坏要重试 3 次、
+            #   实测耗时 68 秒。这期间用户屏幕上什么都没有，只会以为"机器人坏了"。
+            #   先给一条即时反馈，让他知道消息收到了、正在解析。
+            self.n.send_direct(open_id, '⏳ 收到！正在解析提示词…（中文会先翻译成英文，通常十几秒）')
 
             # 确保用户存在（飞书 open_id 即 user_id）
             self.db.user_ensure(open_id)
@@ -290,15 +341,23 @@ class FeishuBot:
             elif st == 'failed':
                 err = (job.get('error') or '未知错误')[:200]
                 if not notified.get('failed'):
-                    self.n.send_direct(sender, f'❌ 生成失败: {err}')
-                    notified['failed'] = True
+                    if self.n.send_direct(sender, f'❌ 生成失败: {err}'):
+                        notified['failed'] = True
+                    else:
+                        logger.warning(f'🤖 {job_id} 的失败通知发送失败（无法重试：任务已终态）')
+                # phase 仍要进终态 —— 否则每 5 秒重发一次，且真的失败原因早就成为噪音
                 self.db.feishu_track_set(job_id, phase='failed',
                                          notified=json.dumps(notified, ensure_ascii=False))
             elif st == 'waiting':
                 if not notified.get('waiting'):
-                    self.n.send_direct(sender, '🔴 服务器暂不可达，任务已进入等待恢复队列，恢复后自动继续～')
-                    notified['waiting'] = True
-                    self.db.feishu_track_set(job_id, notified=json.dumps(notified, ensure_ascii=False))
+                    # ⚠️ 只有**真的发出去**才置位（2026-09-24）：原写法无条件置位，
+                    #    一旦这次发送失败（网络/限流），用户就**永远收不到**这条说明，
+                    #    而跟踪表却认为"已经通知过了" —— 又一个"看起来做了其实没做"。
+                    if self.n.send_direct(sender, '🔴 服务器暂不可达，任务已进入等待恢复队列，恢复后自动继续～'):
+                        notified['waiting'] = True
+                        self.db.feishu_track_set(job_id, notified=json.dumps(notified, ensure_ascii=False))
+                    else:
+                        logger.warning(f'🤖 {job_id} 的 waiting 通知发送失败，下一轮重试')
             elif st in ('queued', 'generating'):
                 # 推进 phase（便于运维看进度），但不打扰用户 —— 进度播报是 P1/P4 的事
                 if t['phase'] != st:

@@ -96,11 +96,19 @@ def make_event(open_id='ou_user1', text='一只橘猫', event_id='evt_1', messag
     return types.SimpleNamespace(header=hdr, event=types.SimpleNamespace(sender=sender, message=msg))
 
 
-def new_bot(db, sched=None, notif=None):
+def new_bot(db, sched=None, notif=None, sync=True):
+    """造一个 bot。
+
+    `sync=True`（默认）把 `_enqueue` 换成**同步处理** —— 绝大多数用例关心的是
+    「消息处理逻辑对不对」，同步执行才确定（不用起线程 + sleep 猜它跑完没）。
+    「WS 回调不阻塞」这条必须验真实路径，所以那一条用 `sync=False`。
+    """
     import manager.feishu_bot as fb
     sched = sched or StubScheduler()
     notif = notif or StubNotifier()
     bot = fb.FeishuBot(sched, db, StubQuota(), notifier=notif)
+    if sync:
+        bot._enqueue = lambda oid, text: bot._handle_prompt(oid, text)
     return fb, bot, sched, notif
 
 
@@ -254,6 +262,68 @@ def main():
         db._conn.commit()
     safe_poll(bot5)
     check('done 但图片不存在 → 明确回执（不静默）', len(notif5.text_containing('图片回传失败')) == 1)
+
+    print()
+    print('─' * 78)
+    print('P0-5 2026-09-24 实测事故：WS 回调阻塞 → 飞书踢连接；通知未判发送结果')
+    print('─' * 78)
+
+    # ── 5a. WS 回调绝不能阻塞（lark 在 asyncio 事件循环里同步调用 _on_message）──
+    class SlowScheduler(StubScheduler):
+        def submit(self, user_id, prompt, *a, **kw):
+            time.sleep(2.5)                      # 模拟中文翻译最坏耗时
+            return super().submit(user_id, prompt, *a, **kw)
+
+    fb7, bot7, sched7, notif7 = new_bot(db, sched=SlowScheduler(), sync=False)
+    import threading as _th
+    for _ in range(bot7._workers):               # start() 里会起；测试里手工起
+        _th.Thread(target=bot7._work_loop, daemon=True).start()
+
+    t0 = time.time()
+    bot7._on_message(make_event(open_id='ou_fast', event_id='evt_fast',
+                                message_id='m_fast', text='慢翻译测试'))
+    dt = time.time() - t0
+    check('WS 回调不阻塞事件循环（提交慢也不拖住它）', dt < 1.0, f'{dt * 1000:.0f} ms')
+    for _ in range(80):
+        if sched7.submits:
+            break
+        time.sleep(0.1)
+    check('入队的消息最终由工作线程处理', len(sched7.submits) == 1, f'实际 {len(sched7.submits)}')
+    check('提交前先发即时回执（用户不会以为机器人坏了）',
+          len(notif7.text_containing('正在解析提示词')) == 1,
+          f"实际 {len(notif7.text_containing('正在解析提示词'))} 条")
+
+    # ── 5b. 通知只在**真的发出去**之后才置位 ──
+    class GateNotifier(StubNotifier):
+        def __init__(self):
+            super().__init__()
+            self.allow = False
+
+        def send_direct(self, uid, text):
+            if not self.allow:
+                return False                     # 模拟发送失败（限流/网络）
+            return super().send_direct(uid, text)
+
+    uid3 = 'ou_notify'
+    db.user_ensure(uid3)
+    db.feishu_track_add('job_notify_1', uid3, prompt='等待中', phase='queued')
+    with db._lock:
+        db._conn.execute(
+            'INSERT OR REPLACE INTO jobs(job_id,user_id,prompt,status,created_at) VALUES(?,?,?,?,?)',
+            ('job_notify_1', uid3, '等待中', 'waiting', int(time.time())))
+        db._conn.commit()
+
+    gn = GateNotifier()
+    fb8, bot8, _, _ = new_bot(db, notif=gn)
+    safe_poll(bot8)
+    n1 = json.loads(db.feishu_track_get('job_notify_1')['notified'] or '{}').get('waiting')
+    check('发送失败时**不**置位 notified（否则用户永远收不到）', n1 is not True, f'notified.waiting={n1}')
+
+    gn.allow = True
+    safe_poll(bot8)
+    n2 = json.loads(db.feishu_track_get('job_notify_1')['notified'] or '{}').get('waiting')
+    check('发送成功后置位 notified，且下一轮不再重发', n2 is True and len(gn.text_containing('暂不可达')) == 1,
+          f'notified.waiting={n2} 文本={len(gn.text_containing("暂不可达"))} 条')
 
     print()
     print('─' * 78)
