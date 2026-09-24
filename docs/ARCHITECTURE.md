@@ -302,3 +302,62 @@ worker: pop → SSH生成 → 拉图 web_out/<jobid>/ → done；服务器down �
 - 现状能力：单聊 + 纯文本 + 一句话直出 + 回图；**群聊/图片/文件被硬过滤**
 - 目标形态与分阶段计划：见 `docs/图图-飞书完整互动-设计方案.md`
 - 架构约束：**随本机启停**（决策 1 选 A）；渠道层/编排层按"只依赖 HTTP"设计，便于将来迁 VPS
+
+## 增量（2026-09-24）：图图命令面与取消链路（v2.10.0）
+
+### 输入分流：命令 vs 提示词（共用同一条通道）
+
+图图只有一条输入通道（飞书文本消息），命令与提示词共用它，所以**分流必须在最前面**：
+
+```
+飞书文本
+  └─► _handle_prompt(open_id, text)
+        ├─ ① _match_command(text) → ('help'|'list'|'cancel', arg)   ← ★ 必须最先
+        │     ├─ help   → _cmd_help
+        │     ├─ list   → _cmd_list       （读 db.jobs_inflight_by_user）
+        │     └─ cancel → _cmd_cancel     （打墓碑 + drop_job + 跟踪终态）
+        ├─ ② 未知斜杠写法 → 给指引（不静默当提示词）
+        └─ ③ 否则 → 当提示词提交（_submit_locked）
+```
+
+判据严格性（`_match_command`）：只有「取消 + 纯数字序号（≤3 位）」或
+「取消 + 6~16 位十六进制」才算命令 —— 后者对应 job_id 前缀
+（`job_id = uuid.uuid4().hex[:16]`，见 `flux_queue.py`）。其余**回落为提示词**。
+
+### 取消的写入链路（三道闸 + 一个独立闸）
+
+```
+_cmd_cancel（飞书） / POST /api/delete（网页）
+  └─► db.job_mark_deleted(job_id, user_id)     ← 闸1：SQL 钉死 user_id（越权在数据层不可能）
+  └─► scheduler.drop_job(job_id, job)          ← 闸2：剔调度器内存三处
+        ├─ _waiting.discard     ★ waiting 也走这里，否则机器恢复会复活它
+        ├─ _inflight.discard    （去重键，不清则同参数再也提交不了）
+        └─ _pq 重建回填          （PriorityQueue 不支持按值删，取出后必须放回没删的）
+  └─► db.feishu_track_set(phase='cancelled')   ← 终止飞书侧轮询
+```
+
+- **闸3 在 worker**：`_process()` 开头与提交结果前各查一次 `deleted_at` ——
+  拿到已删任务**不调 GPU**；生成期间被删则**丢弃产物 + 物理清墓碑行**
+- **独立闸（2026-09-24 补）**：`_recover_waiting_tasks()` 从内存等待池 pop 后
+  **自己再判一次墓碑**。理由：调用方"应当"做的事不能当唯一防线 ——
+  实测过漏掉它的后果（已删任务被复活，并在 4 小时超时分支**拿到退款**，
+  等于开了「删了重传刷额度」的口子）
+
+### ★ 两个判据不能合并
+
+`/api/delete` 里：
+
+```python
+inflight = status in ('queued', 'generating')            # 有产物语义（决定"要不要立即清图"）
+pooled   = status in ('queued', 'generating', 'waiting') # 调度器内存里可能有它（决定"要不要 drop"）
+```
+
+原本两者共用一个 `inflight`，而 `waiting` 不在其中 → 删 waiting 任务时不调 `drop_job`
+→ 内存池留幽灵。**范围不同的两个判据绝不能共用一个变量。**
+
+### 跨渠道取消
+
+取消有两个入口（飞书命令 / 网页按钮），彼此不知道对方。
+所以 `_poll_once()` 遇到 `deleted_at` 非空即终止跟踪（`phase='cancelled'`），
+且 `feishu_tracks_pending()` 把 `'cancelled'` 计入终态 ——
+否则网页端删了任务，飞书轮询会**每 5 秒空转、永不收敛**（P0-1 同款病）。
