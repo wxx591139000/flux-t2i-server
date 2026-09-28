@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## [v2.14.0] - 2026-09-28
+
+**Qwen-Image-2.1 图片参考/编辑能力优化 + 飞书图图参数状态机 + B 链任务状态误报修复**
+
+### 1) Qwen-Image-2.1 参考图/编辑优化（resident 侧）
+
+- `DIM_MULTIPLE` 16→32，对齐官方 7 档尺寸（修图分辨率档位错位）
+- 新增 `_edit_follow_dims`：`/edit` **不传尺寸**时画布跟随参考图宽高比，修「灰边」根因（官方 `ratio_follow`）
+- `_prepare_ref_image` 支持可选 `canvas` 参数（默认方形不变，向后兼容）
+- `transparent=true` 自动套官方 RGBA 模板 + `params['transparent']` 留痕
+- `DEFAULT_MODEL_DIRS` 补 `/root/autodl-tmp/qwen-models`（修下拉框漏 Qwen）
+- `start_resident.sh` 持久化 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（修 32G 显存 OOM）
+
+### 2) 飞书「图图」参数状态机（新功能）
+
+- 新增 `manager/figu_state.py`：纯逻辑、无 IO 的状态机，判「这条文本是否对上一次提问的回答」
+- 配套回归门 `tests/test_figu_confirm.py` / `test_figu_group.py` / `test_figu_params.py`
+
+### 3) B 链任务状态误报修复（前后端配合）
+
+- 后端 `flux_queue.py`：任务 `done` 时清空 `error` 字段（消除历史 `[SERVER_DOWN] [RETRY:N]` 残留误导）
+- 前端 `image-gen-site`（独立仓）：新增 `unreachable` 状态，区分「服务不可达」与「任务真失败」
+
+### 4) 上线排查修复
+
+- `flux_server_manager.py` probe：`curl /health` 后加 `printf '\n'`（修无尾换行黏连 `MODELS_BEGIN` → 探活误判 `resident=False`）
+- `servers.json` flux7 地址修正 + `offload=model`
+- 新增回归门 `test_probe_newline_guard.py` / `test_edit_follow_dims.py`
+
+全量回归门 25/25 通过。
+
 ## [v2.13.0] - 2026-09-28
 
 **Qwen-Image-2.1 放行到 B 链 + flux7 纳入看门狗**（用户需求原话：「qwen放到B链。flux7纳入看门狗。」）
