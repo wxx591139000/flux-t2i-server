@@ -838,6 +838,11 @@ def probe_full(server=None, force: bool = False) -> dict:
               f"test -f {s['remote_model']}/DOWNLOAD_DONE && echo MODEL_OK || echo MODEL_MISSING; "
               f"{remote_files}"
               f"curl -s -m 5 http://127.0.0.1:{port}/health || echo HEALTH_FAIL; "
+              # ★ 强制换行：/health 的 JSON 是 curl 裸输出、结尾无 '\n'，若不加这句，
+              #   下一行的 `echo MODELS_BEGIN` 会黏在 `}` 后面变成 `...}MODELS_BEGIN`，
+              #   导致解析侧 `endswith('}')` 判 False → resident=False → server_down。
+              #   （2026-09-28 Qwen 上线时 10/10 探活失败的真因，藏得很深。）
+              f"printf '\\n'; "
               # ★ 2026-09-22：把 /models 也问掉（同一次 SSH，零额外往返）。
               #   为什么必须问：能力过滤（need_caps）的**权威数据源**是 resident
               #   按 model_index.json 的 _class_name 现算的 capabilities ——

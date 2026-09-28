@@ -48,6 +48,29 @@ def get_owner_open_id() -> str:
     return os.environ.get('FEISHU_OWNER_OPEN_ID', '')
 
 
+def get_bot_open_id() -> str:
+    """机器人自己的 open_id（群聊判断「@的是不是我」用）。
+
+    ⚠️ 没配 `FEISHU_BOT_OPEN_ID` 时返回 ''，此时群聊的 @ 判定会**退化为
+      "任意 @ 即响应"**（见 `feishu_bot._mentioned_bot`）。白名单群内可接受，
+      但严格来说会误响应"@别人"的消息 —— 所以配了更好。
+    """
+    _load_env()
+    return os.environ.get('FEISHU_BOT_OPEN_ID', '')
+
+
+def get_allowed_chats() -> set:
+    """允许服务的**群** chat_id 集合（逗号分隔）。
+
+    决策 3（2026-09-23 用户拍板）：「只服务 owner 自己 + owner 自己的群」。
+    **默认空集合 = 一个群都不服务**（连 owner 的群也要显式登记）——
+    这是刻意的安全默认：宁可"配了才生效"，也不要"忘了配就对外裸奔"。
+    """
+    _load_env()
+    raw = os.environ.get('FEISHU_ALLOWED_CHATS', '') or ''
+    return {x.strip() for x in raw.replace(';', ',').split(',') if x.strip()}
+
+
 class FeishuNotifier:
     """飞书私信通知器（独立新机器人）"""
 
@@ -82,8 +105,11 @@ class FeishuNotifier:
     # ── 私聊发送（复制借鉴转录bot feishu_channel.send_direct）──
     def send_direct(self, user_id: str, text: str) -> bool:
         if not get_owner_open_id():
-            logger.warning('FEISHU_OWNER_OPEN_ID 未配置，无法私信通知')
-            raise RuntimeError('FEISHU_OWNER_OPEN_ID 未配置')
+            # ⚠️ 2026-09-28：这里原先 **raise**（一个"奇怪守卫"，见设计方案 §0.2）——
+            #    它检查的是"owner 配了没"，却**对发给别人的消息也一样生效**，
+            #    于是没配 owner 时连普通回复都发不出去。改成只告警不抛：
+            #    真正需要在意的（收件人是否合法）由调用方与白名单负责。
+            logger.warning('FEISHU_OWNER_OPEN_ID 未配置（不影响给指定 user_id 发消息）')
         if len(text) > 1900:
             text = text[:1850] + '\n\n...（内容较长，已截断）'
         result = self._post(
@@ -94,6 +120,50 @@ class FeishuNotifier:
             return True
         logger.error(f'飞书私聊发送失败: {result}')
         return False
+
+    # ── 群聊发送（2026-09-28 P2）──
+    def send_to(self, chat_id: str, text: str) -> bool:
+        """往**群**（或任意 chat）发文本。`receive_id_type=chat_id`。
+
+        与 `send_direct` 的唯一差别就是 receive_id_type —— 飞书要求"发群"必须用
+        chat_id 口径，给 open_id 口径传群 id 会报 `receive_id invalid`。
+        """
+        if not chat_id:
+            logger.error('飞书群消息发送失败：chat_id 为空')
+            return False
+        if len(text) > 1900:
+            text = text[:1850] + '\n\n...（内容较长，已截断）'
+        result = self._post(
+            '/open-apis/im/v1/messages?receive_id_type=chat_id',
+            {'receive_id': chat_id, 'msg_type': 'text',
+             'content': json.dumps({'text': text}, ensure_ascii=False)})
+        if result.get('code') == 0:
+            return True
+        logger.error(f'飞书群消息发送失败: {result}')
+        return False
+
+    def send_image_to(self, chat_id: str, image_key: str) -> bool:
+        """往群发图片消息。"""
+        if not chat_id or not image_key:
+            return False
+        result = self._post(
+            '/open-apis/im/v1/messages?receive_id_type=chat_id',
+            {'receive_id': chat_id, 'msg_type': 'image',
+             'content': json.dumps({'image_key': image_key})})
+        if result.get('code') == 0:
+            return True
+        logger.error(f'飞书群图片发送失败: {result}')
+        return False
+
+    @staticmethod
+    def at_text(open_id: str, name: str = '') -> str:
+        """群里 @某人 的文本片段（飞书 text 消息用 `<at user_id="ou_xxx"></at>`）。
+
+        `name` 只是给不渲染 at 的客户端看的兜底文案。
+        """
+        if not open_id:
+            return (f'@{name} ' if name else '')
+        return f'<at user_id="{open_id}">{name or ""}</at> '
 
     def notify_owner(self, text: str) -> bool:
         """给 owner 发私信通知"""

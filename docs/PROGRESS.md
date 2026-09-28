@@ -194,3 +194,111 @@
 - 待选状态机的 key 用**三元组** `(channel, chat_id, sender_id)`，
   而不是小白的二元组 —— 小白后来只能靠"跨会话校验 + 冷却"打补丁
 - 待选状态机必须有**回归测试**（对齐小白 `test_video_omni.py`）
+
+### 2026-09-28 追加 · 图图 P1 剩余 + 群聊（v2.11.0）
+
+**P1 剩余（已完成）**
+- 参数状态机：`比例 / 张数 / 模型 / 参数 / 额度` + `/size /n /model /params /quota`
+- `/bind <激活码>`：飞书身份与网页账户**共享同一份额度**（不做两套账，`code_activate` 复用）
+- 会话默认值落库 `feishu_prefs`，key = **三元组** `(channel, chat_id, sender_id)`
+  → 群与私聊**在数据层就不可能串**（不是靠守卫打补丁）
+- 待选状态机 `feishu_pending`（同三元组 + `kind`，TTL 300s）
+- 多图 = **「一次翻译、多张候选」**：第 2..n 张从库读回第 1 张**实际落地**的英文 + 显式不同 seed
+  （不复制 `submit()` 的翻译策略 → 不会漂移；不 n 次翻译 → 不 n×68s 拖住线程）
+
+**P2 群聊（**代码完成，上线待办**）**
+- 两道门：白名单 `FEISHU_ALLOWED_CHATS`（**默认空 = 一个群都不服务**）+ 必须 @图图本人
+  （比对 `mentions[].id.open_id`，**不是**文本里的 `@` —— 否则 @别人 也会被响应）
+- 回程路由：群→群（只 @ 发起人）/ 私聊→私聊；`chat_id/is_group` **落库**（重启后仍回对地方）
+- ⏸️ **未上线**：飞书开放平台侧 4 项配置未做 → `docs/待办-群聊上线-20260928.md`
+
+**★ 顺手修掉的真缺陷（第 18 号陷阱又一实例）**
+- `feishu_tracks_inflight()` / `feishu_track_gc()` 判据**漏了 `cancelled`**
+  → ① 取消后该行仍算"在途"，配合 `MAX_INFLIGHT_PER_USER=1` = **取消一次就再也提交不了**
+    ② GC 永不清理 `cancelled` → 表只增不减
+- 修法：收敛为**单一事实源** `FEISHU_TERMINAL_PHASES = ('done','failed','cancelled')`
+
+**门**
+- 新增 `tests/test_figu_params.py`（第 21 道，**133/0**）
+- 新增 `tests/test_figu_group.py`（第 22 道，**46/0/0**）
+- 全量 **22/22**，74.3s
+
+---
+
+## v2.12.0（2026-09-28）：图图提交前确认
+
+**需求（用户原话）**：「给图图发消息时并不都是生图的提示词，建生图任务前要在对话里
+进行确认是否发送"XXXX"生图任务」。
+
+**改动**
+- 非命令文本**不再直接提交** → 先弹确认（原文 + 本次参数），回「是」才建任务
+- 新增 `figu_state.parse_confirm`（**全等**判据）+ `CONFIRM_KIND = 'confirm_submit'`
+- 复用 `feishu_pending` 存**参数快照**；`_submit_locked(prefs_override=...)` **整体替换**
+- 开关 `FIGU_CONFIRM_SUBMIT`（默认开，设 `0` 回退旧行为）
+- 顺带修：`ARCHITECTURE.md` 的输入分流图还是 v2.10.0 的三步旧图（v2.11.0 漏改），已更新为五步
+
+**门**
+- 新增 `tests/test_figu_confirm.py`（第 23 道，**95/0**）
+- ★ 既有 4 道门（cancel / p0 / params / group）显式 `bot.confirm_enabled = False` ——
+  它们不是测确认流程的，不关会**假红**。已进 `PITFALLS.md`
+- 全量 **23/23**，61.6s
+
+**未验证**
+- 飞书端到端（真发消息 → 弹确认 → 回「是」→ 出图）**没跑过**：
+  GPU 机全离线，且需真人在飞书操作。本版结论全部来自离线门
+
+**下一步**
+- 群聊**上线**（飞书后台 4 项配置，用户明确"目前不需上线，存待办"）
+- 图生图 P3（按约定延后）
+- **网页用 Qwen-Image-2.1 出图**：链路已通（B 链模型选择器 → `/api/models` → GPU 侧实时扫描），
+  断在 ① **GPU 机全部离线** ② ~~flux7 不在看门狗巡检名单~~（**v2.13.0 已解决**）
+  ③ flux7 的 host/port 是**无卡期地址**、已失效（实测 Connection refused）
+- commit / tag（等授权）
+
+---
+
+## v2.13.0 — Qwen 放行到 B 链 + flux7 纳入看门狗（2026-09-28 下午）
+
+**需求原话**：「qwen放到B链。flux7纳入看门狗。」
+
+**做了什么**
+
+- **许可事实与业主决定拆成两个正交字段**：
+  `commercial_ok`（许可允不允许商用，**事实**，仍为 `false`）
+  + `expose_to_customers` / `expose_note`（**业主决定** + 留依据）
+- 闸门判据（`manager/flux_resident_client.py` → `_pick_from`）由单条改**或关系**两条；
+  位置仍在**能力过滤之前**；`need_model` / `DIRECT_BASE` 两个既有豁免不动
+- 放行的机器首次被选中打 `WARNING`（按机器名去重，防刷屏）
+- flux7：`watchdog: false` → `true`；`targets.conf` 重新生成并上传 VPS
+- 顺带修：`gen_targets.py:89` 的文件头漏了第 7 段 `name`（与 `deploy_vps.py:97` 不一致）
+
+**生效证据（都可复跑）**
+
+| 判据 | 证据 |
+|---|---|
+| 看门狗认到 flux7 | VPS `active.json` 含 `"flux7":{...,"state":"offline"}`（`checked_at` 为本轮） |
+| 无需重启看门狗 | `flux_watchdog.sh:85` 每轮重读 `targets.conf` |
+| 部署一致 | VPS 与本地 `targets.conf` md5 均 `c8b663fa`，LF 行尾，4 台 |
+| 纳入不会用错环境 | VPS mirror `start_resident.sh` md5 `02ef7b5d` == 本地（含 `pick_python`） |
+
+**门**
+
+- `tests/test_commercial_gate.py` 13 → **17 项**（新增：放行对自动选机生效 / 放行必须留依据 /
+  放行分支的变异测试）
+- `tests/test_model_capabilities.py` 的 `t_license` 增一条"放行必须写 `expose_note`"
+- 全量 **23/23**，95.0s
+
+**未验证（本轮最大缺口）**
+
+- ★ **端到端一次都没跑**：flux7 **未开机**，且注册表里是**无卡期地址**（实测 `Connection refused`）
+  → 地址不对 ⇒ 看门狗探不到 ⇒ flux7 不进 `active` 列表 ⇒ manager 看不见它
+  ⇒ **B 链下拉框仍然不会有 Qwen**。本版只把"门"打开
+- Qwen 显存未实测（bf16 约 30-35GB vs 32G 卡）
+
+**下一步（本轮新增）**
+
+- ★ **拿到 flux7 的有效 `host:port`** → 改 `servers.json` → 重新生成并上传 `targets.conf`
+  → 等看门狗把它写进 `active.json` 的 `active` 列表（需连续 2 轮确认）
+  → 再开 B 链看下拉框
+- 若要**合法**对外经营 Qwen，需向杭州通义实验室申请商业授权（无自助通道）——
+  见 `docs/许可决策-20260928.md`

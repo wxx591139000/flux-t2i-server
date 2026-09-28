@@ -8,12 +8,16 @@ FLUX 对外文生图服务 — SQLite 存储层（单文件，对标转录bot st
   usage  — 月度用量(user_id, ym, count)
 """
 import os
+import json
 import time
 import sqlite3
 import logging
 from pathlib import Path
 
 logger = logging.getLogger('manager.flux_db')
+
+# 局部更新用的哨兵：区分「没传这个字段」与「显式传 None（= 清空该字段）」
+_UNSET = object()
 
 BASE_DIR = Path(__file__).parent.parent
 DB_PATH = Path(os.environ.get('FLUX_DB_PATH', BASE_DIR / 'data' / 'flux_service.db'))
@@ -92,7 +96,47 @@ CREATE TABLE IF NOT EXISTS feishu_tracks (
 );
 CREATE INDEX IF NOT EXISTS idx_feishu_tracks_phase ON feishu_tracks(phase);
 CREATE INDEX IF NOT EXISTS idx_feishu_tracks_sender ON feishu_tracks(sender_id);
+-- ── 飞书机器人「图图」：参数默认值 + 待选状态机（2026-09-28 P1）──────────
+-- ★ 两张表的 key 都是**三元组** (channel, chat_id, sender_id)，不是二元组。
+--   小白（transcribe-bot）用的是 (channel, sender_id) 二元组，结果「群里 A 的待选项
+--   被 B 的回复消费」只能靠「额外跨会话校验 + 冷却」打补丁（orchestrator.py:380-383/:470）。
+--   我们直接把 chat_id 编进 key —— 跨会话误消费在数据层就不可能发生
+--   （设计方案 §2.2 决策 2：把这个补丁变成模型本身的一部分）。
+--   channel 预留给多渠道，现在恒为 'feishu'。
+CREATE TABLE IF NOT EXISTS feishu_prefs (
+    channel    TEXT NOT NULL,
+    chat_id    TEXT NOT NULL,      -- 单聊 = 飞书 chat_id（缺失时兜底 'p2p:<open_id>'）；群聊 = 群 id
+    sender_id  TEXT NOT NULL,      -- 飞书 open_id = A 链 user_id
+    size       TEXT,               -- 默认比例，如 '16:9'（可空 = 用服务端默认）
+    n          INTEGER,            -- 默认张数 1..4（可空 = 1）
+    model      TEXT,               -- 默认模型 id，如 'FLUX.2-klein-4B'（可空 = 用机器当前已加载）
+    updated_at INTEGER,
+    PRIMARY KEY (channel, chat_id, sender_id)
+);
+CREATE TABLE IF NOT EXISTS feishu_pending (
+    channel    TEXT NOT NULL,
+    chat_id    TEXT NOT NULL,
+    sender_id  TEXT NOT NULL,
+    kind       TEXT NOT NULL,      -- 'size' | 'count' | 'model'
+    payload    TEXT,               -- JSON：本次待选的选项清单（回执与解析共用一份事实源）
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,   -- 超时自动失效；默认 300s（对齐小白）
+    PRIMARY KEY (channel, chat_id, sender_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_pending_exp ON feishu_pending(expires_at);
 """
+
+# 飞书跟踪的**终态**阶段 —— 单一事实源（2026-09-28）。
+#
+# 为什么抽成常量：09-24 引入 `cancelled` 时只在 `feishu_tracks_pending` 里加了它，
+# 另外两处（`feishu_tracks_inflight` 的计数、`feishu_track_gc` 的清理）漏了 ——
+# 这正是本仓库第 18 号陷阱「判据里有 status in (...) 的地方，每加一个状态都要回头审」。
+# 漏掉的后果是**真缺陷**（不只是垃圾数据）：
+#   `feishu_tracks_inflight` 把 cancelled 仍计为在途，而 `MAX_INFLIGHT_PER_USER = 1`
+#   → **用户取消一次后就再也提交不了**（永远收到「你有一个任务还在生成中」），
+#   且 cancelled 行不被 GC → 永不自愈。
+# 收敛成一个常量后，「加状态」只需改这里一行，三处自动同步。
+FEISHU_TERMINAL_PHASES = ('done', 'failed', 'cancelled')
 
 
 class FluxDB:
@@ -604,27 +648,143 @@ class FluxDB:
         ★ `cancelled` 也是终态（2026-09-24）：用户取消/删除任务后，轮询线程必须
           停止盯它，否则每 5 秒空转一次、永不收敛（就是 P0-1 那种"永不收敛"的病）。
         """
+        ph = ','.join('?' * len(FEISHU_TERMINAL_PHASES))
         return self._all(
-            "SELECT * FROM feishu_tracks WHERE phase NOT IN ('done','failed','cancelled') "
-            "ORDER BY created_at ASC LIMIT ?", (int(limit),))
+            f"SELECT * FROM feishu_tracks WHERE phase NOT IN ({ph}) "
+            f"ORDER BY created_at ASC LIMIT ?", (*FEISHU_TERMINAL_PHASES, int(limit)))
 
     def feishu_tracks_inflight(self, sender_id: str = None, limit: int = 500) -> int:
-        """在途任务数。传 sender_id = 该用户的在途数（**落库口径，重启后依然准**）。"""
+        """在途任务数。传 sender_id = 该用户的在途数（**落库口径，重启后依然准**）。
+
+        ★ 2026-09-28 修：判据原先写死 `phase NOT IN ('done','failed')` ——
+          `cancelled` 不在其中，于是**取消过的任务仍被算作在途**。配合
+          `MAX_INFLIGHT_PER_USER = 1`，后果是**用户取消一次后就再也提交不了**
+          （永远收到「你有一个任务还在生成中」），且 `feishu_track_gc` 也不清
+          cancelled → 永远不会自愈。这正是本仓库第 18 号陷阱（加状态时漏审分支）。
+          现在三处统一走 `FEISHU_TERMINAL_PHASES`，加状态只改一处。
+        """
+        ph = ','.join('?' * len(FEISHU_TERMINAL_PHASES))
         if sender_id:
             row = self._one(
-                "SELECT COUNT(*) AS n FROM feishu_tracks "
-                "WHERE sender_id=? AND phase NOT IN ('done','failed')", (str(sender_id),))
+                f"SELECT COUNT(*) AS n FROM feishu_tracks "
+                f"WHERE sender_id=? AND phase NOT IN ({ph})",
+                (str(sender_id), *FEISHU_TERMINAL_PHASES))
         else:
             row = self._one(
-                "SELECT COUNT(*) AS n FROM feishu_tracks WHERE phase NOT IN ('done','failed')")
+                f"SELECT COUNT(*) AS n FROM feishu_tracks WHERE phase NOT IN ({ph})",
+                (*FEISHU_TERMINAL_PHASES,))
         return int(row['n']) if row else 0
 
     def feishu_track_gc(self, keep_seconds: int = 30 * 86400) -> int:
-        """只清**已到终态**且很久以前的记录（在途的绝不动）。"""
+        """只清**已到终态**且很久以前的记录（在途的绝不动）。
+
+        ★ 2026-09-28：终态集合同样改走 `FEISHU_TERMINAL_PHASES` —— 原先只清
+          `done/failed`，`cancelled` 的行会**永久堆积**（表只增不减）。
+        """
+        ph = ','.join('?' * len(FEISHU_TERMINAL_PHASES))
         cur = self._exec(
-            "DELETE FROM feishu_tracks WHERE phase IN ('done','failed') AND updated_at < ?",
-            (int(time.time()) - int(keep_seconds),))
+            f"DELETE FROM feishu_tracks WHERE phase IN ({ph}) AND updated_at < ?",
+            (*FEISHU_TERMINAL_PHASES, int(time.time()) - int(keep_seconds)))
         return cur.rowcount
+
+    # ── 飞书机器人「图图」：会话参数默认值（2026-09-28 P1）──────────────────
+    def feishu_prefs_get(self, channel: str, chat_id: str, sender_id: str) -> dict:
+        """取会话参数默认值（/size /n /model）。没有记录 → 返回 `{}`（调用方给默认值）。
+
+        ★ key 是**三元组** (channel, chat_id, sender_id)，与待选状态机同一口径 ——
+          同一个人在私聊与不同群里可以有各自的默认比例，互不串味。
+        """
+        row = self._one(
+            'SELECT * FROM feishu_prefs WHERE channel=? AND chat_id=? AND sender_id=?',
+            (str(channel), str(chat_id or ''), str(sender_id)))
+        return dict(row) if row else {}
+
+    def feishu_prefs_set(self, channel: str, chat_id: str, sender_id: str,
+                         size=_UNSET, n=_UNSET, model=_UNSET):
+        """局部更新会话默认值（只改传入的字段，未传的保持原值）。
+
+        为什么用哨兵而不是 `None` 默认：`None` 是**有意义的取值**（= 显式重置为
+        “用服务端默认”），与“这次不改这个字段”必须区分开 —— 混起来会导致
+        `/model` 顺手把用户的 `/size` 清掉。
+        """
+        updates = {}
+        if size is not _UNSET:
+            updates['size'] = size
+        if n is not _UNSET:
+            updates['n'] = int(n) if n is not None else None
+        if model is not _UNSET:
+            updates['model'] = model
+        if not updates:
+            return
+        now = int(time.time())
+        key = (str(channel), str(chat_id or ''), str(sender_id))
+        with self._lock:
+            exists = self._conn.execute(
+                'SELECT 1 FROM feishu_prefs WHERE channel=? AND chat_id=? AND sender_id=?',
+                key).fetchone()
+            if exists:
+                sets = ', '.join(f'{k}=?' for k in updates) + ', updated_at=?'
+                self._conn.execute(
+                    f'UPDATE feishu_prefs SET {sets} '
+                    f'WHERE channel=? AND chat_id=? AND sender_id=?',
+                    (*updates.values(), now, *key))
+            else:
+                cols = ['channel', 'chat_id', 'sender_id', *updates.keys(), 'updated_at']
+                vals = [*key, *updates.values(), now]
+                self._conn.execute(
+                    f"INSERT INTO feishu_prefs({','.join(cols)}) "
+                    f"VALUES({','.join('?' * len(cols))})", tuple(vals))
+            self._conn.commit()
+
+    # ── 飞书机器人「图图」：待选状态机（2026-09-28 P1）─────────────────────
+    def feishu_pending_set(self, channel: str, chat_id: str, sender_id: str,
+                           kind: str, payload=None, ttl: int = 300):
+        """登记一个待选状态（覆盖同会话同 kind 的旧记录）。
+
+        `ttl` 默认 300s，对齐小白（`orchestrator.py` 的待选超时）。
+        同一会话**只保留一个待选**（调用方在登记前先 clear，避免“回 2 到底选了哪个”
+        的歧义）—— 表结构允许并存（PK 含 kind），是调用方约定收敛成单个。
+        """
+        now = int(time.time())
+        self._exec(
+            'INSERT OR REPLACE INTO feishu_pending'
+            '(channel,chat_id,sender_id,kind,payload,created_at,expires_at) VALUES(?,?,?,?,?,?,?)',
+            (str(channel), str(chat_id or ''), str(sender_id), str(kind),
+             json.dumps(payload or {}, ensure_ascii=False), now, now + int(ttl)))
+
+    def feishu_pending_get(self, channel: str, chat_id: str, sender_id: str,
+                           kind: str = None, now: float = None):
+        """取**未过期**的待选状态；没有/已过期 → None。
+
+        `kind=None` 时取最近登记的那条（正常只有一个）。`now` 可注入，便于测超时。
+        """
+        now = int(now if now is not None else time.time())
+        base = ('SELECT * FROM feishu_pending WHERE channel=? AND chat_id=? AND sender_id=? '
+                'AND expires_at > ?')
+        key = (str(channel), str(chat_id or ''), str(sender_id))
+        if kind:
+            row = self._one(base + ' AND kind=?', (*key, now, str(kind)))
+        else:
+            row = self._one(base + ' ORDER BY created_at DESC LIMIT 1', (*key, now))
+        return dict(row) if row else None
+
+    def feishu_pending_clear(self, channel: str, chat_id: str, sender_id: str,
+                             kind: str = None) -> int:
+        """清掉待选状态（`kind=None` = 清该会话全部）。返回删除行数。"""
+        key = (str(channel), str(chat_id or ''), str(sender_id))
+        if kind:
+            cur = self._exec(
+                'DELETE FROM feishu_pending WHERE channel=? AND chat_id=? AND sender_id=? AND kind=?',
+                (*key, str(kind)))
+        else:
+            cur = self._exec(
+                'DELETE FROM feishu_pending WHERE channel=? AND chat_id=? AND sender_id=?', key)
+        return cur.rowcount
+
+    def feishu_pending_gc(self, now: float = None) -> int:
+        """清理已过期的待选状态（表只增不减会拖慢主键查询）。"""
+        return self._exec('DELETE FROM feishu_pending WHERE expires_at < ?',
+                          (int(now if now is not None else time.time()),)).rowcount
 
 
 def threading_lock():

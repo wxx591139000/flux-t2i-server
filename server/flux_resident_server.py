@@ -75,7 +75,11 @@ DEFAULT_SEED = 42
 DEFAULT_GUIDANCE = 3.5
 
 # 尺寸/步数硬边界：防止客户传 8192x8192 把显存打爆（FLUX 要求 16 的倍数）
-MIN_DIM, MAX_DIM, DIM_MULTIPLE = 256, 2048, 16
+# ★ 2026-09-28 由 16 改为 32：Qwen-Image-2.1 官方「Supported Aspect Ratios」的
+#   7 档尺寸**全部是 32 的倍数**（2048/2400/1792/2528/1696/2752/1536），
+#   而 16 会产出非 32 倍数的尺寸（如 1010 → 1008 = 63×16，不是 32 倍数）。
+#   FLUX 系原生尺寸（1024 等）同样是 32 倍数 → 对既有模型无回归。
+MIN_DIM, MAX_DIM, DIM_MULTIPLE = 256, 2048, 32
 MAX_STEPS = 100
 MAX_REQ_BYTES = 64 * 1024
 # 【2026-09-18 新增】/edit 要带参考图：base64 后体积膨胀约 1.37 倍。
@@ -660,12 +664,16 @@ class FluxWorker(threading.Thread):
                         f'{self.holder.get("class_name") or "?"}）'
                     )
                 from PIL import Image as _Img
+                # ★ 2026-09-28：参考图画布按**目标输出宽高比**填充，不再恒用方形。
+                #   参考图与画布同比时 pad 归零 → 模型不会再把中灰复现进输出
+                #   （实锤：3:2 参考图输出灰带 171/172 == 方形 pad 预测值）。
+                _tw = int(kw.get('width') or DEFAULT_WIDTH)
+                _th = int(kw.get('height') or DEFAULT_HEIGHT)
                 ref_imgs = []
                 for rp in ref_paths:
                     _im = _Img.open(rp)
                     # 保持宽高比 + 色彩管理（与 klein-setup/ab_klein_dev.py 的 load_ref_image 一致）
-                    ref_imgs.append(_prepare_ref_image(
-                        _im, int(kw.get('width') or DEFAULT_WIDTH)))
+                    ref_imgs.append(_prepare_ref_image(_im, _tw, canvas=(_tw, _th)))
                 # 单张 → 传 PIL（klein 唯一能接受的形态，也是 Qwen 的子集）
                 kw[img_param] = ref_imgs[0] if len(ref_imgs) == 1 else ref_imgs
                 print(f'[fluxd] edit 模式：{len(ref_paths)} 张参考图 → 参数名 {img_param!r}'
@@ -726,8 +734,19 @@ class FluxWorker(threading.Thread):
                 pass
 
 
-def _prepare_ref_image(im, size: int):
+def _prepare_ref_image(im, size: int, canvas=None):
     """把参考图规整成能喂给模型的图。
+
+    【2026-09-28 新增 `canvas` 参数 —— 消掉被模型复现的灰带】
+      `canvas=(W, H)` 时按该宽高比做「零裁切等比适配 + 居中 pad」；默认 None
+      等价于方形 `(size, size)`，**既有契约与回归门的不变量全部不变**。
+      ★ 为什么需要它：以前图生图恒用方形画布，非方形参考图会被垫上中灰；
+        而 Qwen-Image-2.1 会把灰带**原样复现到输出**（实锤：3:2 的参考图
+        1024×681 → 预测灰带 (1024-681)//2 = 171，实测输出灰带 171/172，
+        像素级吻合）。跟随参考图宽高比后参考图与画布同比，**pad 归零**，
+        灰带消失，且不再把分辨率浪费在灰底上（3:2 时白白浪费 33%）。
+      注意：`min(cw/w, ch/h)` 才是「装进画布」的正确基准；对方形画布它恒等于
+        旧写法的 `size / max(w, h)`，所以历史行为逐位一致。
 
     【2026-09-18 新增，修掉两个实测问题】
       1. 「宽高比被破坏 → 人腿变短」：原做法强制 resize 成正方形，1200×1800 的竖构图
@@ -766,17 +785,21 @@ def _prepare_ref_image(im, size: int):
         im = im.convert('RGB')
 
     w, h = im.size
-    if w == h:
-        return im.resize((size, size), _Img.LANCZOS)
-    # ⚠️ 必须用 max：用 min 会让长边溢出画布，paste 的负偏移被 PIL 静默裁掉
-    #    （2026-09-18 的版本就是这个错，2026-09-19 修，详见上面 docstring）
-    #    不变量：max(nw, nh) == size，故 paste 偏移恒 >= 0，内容零裁切。
-    scale = size / max(w, h)
+    cw, ch = (int(canvas[0]), int(canvas[1])) if canvas else (size, size)
+    if w == h and cw == ch:
+        return im.resize((cw, ch), _Img.LANCZOS)
+    # ⚠️ 必须用「装进画布」的基准 `min(cw/w, ch/h)`：
+    #    对它的误用（旧写法 `size / min(w,h)`）会让长边溢出画布，paste 的负偏移
+    #    被 PIL **静默裁掉**（2026-09-18 的版本就是这个错，2026-09-19 修）。
+    #    不变量：max(nw/cw, nh/ch) <= 1 → paste 偏移恒 >= 0，内容零裁切。
+    #    ★ 方形画布下 min(cw/w, ch/h) ≡ size / max(w, h)，与旧实现**逐位一致**
+    #      —— 所以既有的 test_prepare_ref_image 四条不变量继续成立。
+    scale = min(cw / w, ch / h)
     nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
     im = im.resize((nw, nh), _Img.LANCZOS)
-    canvas = _Img.new('RGB', (size, size), (127, 127, 127))   # 中灰填充，不引入色彩倾向
-    canvas.paste(im, ((size - nw) // 2, (size - nh) // 2))
-    return canvas
+    plate = _Img.new('RGB', (cw, ch), (127, 127, 127))   # 中灰填充，不引入色彩倾向
+    plate.paste(im, ((cw - nw) // 2, (ch - nh) // 2))
+    return plate
 
 
 def _resolve_pipe_class(model_path: str):
@@ -996,7 +1019,7 @@ def model_profile(cls_name: str):
 #   FLUX_MODEL_DIRS（冒号分隔）下的一级子目录，且含 model_index.json（diffusers 格式）。
 #   没有 DOWNLOAD_DONE 的**也列出但标 ready=false** —— 半下载的模型要能看见，
 #   否则用户选了才发现跑不了，比直接不列更糟。
-DEFAULT_MODEL_DIRS = '/root/klein-models:/root/autodl-tmp/models'
+DEFAULT_MODEL_DIRS = '/root/klein-models:/root/autodl-tmp/models:/root/autodl-tmp/qwen-models'
 
 
 def _split_dirs(raw: str) -> list:
@@ -1249,6 +1272,86 @@ def load_model_async(holder: dict, model_path: str, offload: str, stub: bool):
 
 
 # ══════════════════════════ HTTP 层 ══════════════════════════
+# ── Qwen-Image-2.1 官方最佳实践（2026-09-28 依据官方 README 落地）──────────
+# 来源：https://github.com/QwenLM/Qwen-Image-2.1
+#
+#  1) 透明图提示词模板 —— README「Transparent Image Generation」原文：
+#     "For best results, use the recommended prompt format"。Qwen 是**按提示词
+#     自行决定是否输出 alpha 通道**的模型：不套模板时用户拿不到稳定透明输出
+#     （实测：自造措辞 a0 占比 15.65%；官方模板下更高且更稳）。
+TRANSPARENT_PROMPT_TPL = ('This is an RGBA image with transparency. {desc} '
+                          'The image has alpha channel and the background is transparent.')
+
+#  2) 官方推荐尺寸**全为 32 的倍数**（README「Supported Aspect Ratios」）：
+#     1:1 2048² / 4:3 2400×1792 / 3:4 1792×2400 / 3:2 2528×1696 /
+#     2:3 1696×2528 / 16:9 2752×1536 / 9:16 1536×2752。
+QWEN_OFFICIAL_MULTIPLE = 32
+
+#  3) 图生图跟随参考图宽高比（官方 `ratio_follow` 语义）时的**长边上限**。
+#     为什么不是官方的 2048：32G 卡上 2048 需 expandable_segments，单张 200s+
+#     （实测 211.55s），对客户站点太慢；1024 是本机实测的稳妥档（基线 70.7s）。
+EDIT_FOLLOW_MAX_SIDE = int(os.environ.get('FLUX_EDIT_FOLLOW_MAX') or 1024)
+
+
+def _snap_multiple(v, mult: int = QWEN_OFFICIAL_MULTIPLE,
+                   lo: int = MIN_DIM, hi: int = MAX_DIM) -> int:
+    """把尺寸吸附到 mult 的倍数，并夹在 [lo, hi]。"""
+    return int(max(lo, min(hi, round(v / mult) * mult)))
+
+
+def _edit_follow_dims(ref_path, max_side=None,
+                      mult: int = QWEN_OFFICIAL_MULTIPLE):
+    """参考图宽高比 → 输出画布 `(W, H)`（官方 `ratio_follow` 语义）。
+
+    本站此前图生图**恒用方形画布**，后果有两条，第二条是实锤的：
+      · 非方形参考图被 `_prepare_ref_image` 垫上中灰；
+      · **模型把灰带原样复现到输出** —— 3:2 参考图 1024×681 →
+        预测灰带 (1024-681)//2 = 171；实测输出灰带 top=171 / bot=172，像素级吻合。
+    跟随参考图宽高比后参考图与画布同比，pad 归零，灰带消失。
+
+    ★ 为什么是「搜索」而不是「两个方向各自吸附 32」：
+      各自吸附会让短边被四舍五入到最近的 32 倍数，与原比例产生残差。
+      例：1024×681（比例 1.5037）→ 短边吸附成 672 → 画布比例 1.5238，
+      差 1.34% → 仍会留下 13px 灰条。
+      所以这里在基准缩放的 ±8% 内搜一圈，取「两边都是 mult 倍数、
+      且宽高比最接近原图」的组合（1024×681 → 1056×704，比例 1.5，差 0.25%）。
+      允许长边最多超过 `max_side` 一个 mult，以换取比例精度。
+    """
+    from PIL import Image as _Img
+    with _Img.open(ref_path) as im:
+        w, h = im.size
+    if not w or not h:
+        raise ValueError('参考图尺寸为 0')
+    cap = int(max_side or EDIT_FOLLOW_MAX_SIDE)
+    ratio = w / h
+    base = min(1.0, cap / max(w, h))
+    lo = min(mult, MIN_DIM)
+    cands = set()
+    for i in range(-16, 17):                      # ±8%，步长 0.5%
+        s = base * (1 + i * 0.005)
+        cands.add((_snap_multiple(w * s, mult, lo=lo, hi=MAX_DIM),
+                   _snap_multiple(h * s, mult, lo=lo, hi=MAX_DIM)))
+
+    def _pick(pool):
+        """在「比例误差接近最优（+0.3% 内）」的候选里取**面积最大**者。
+
+        为什么要并列时取最大：只按误差取第一会命中更小的画布
+        （1:1 参考图曾被选成 928×928 == 29×32，白白丢分辨率）。
+        """
+        if not pool:
+            return None
+        errs = {c: abs(c[0] / c[1] - ratio) / ratio for c in pool}
+        floor = min(errs.values()) + 0.003
+        return max((c for c in pool if errs[c] <= floor), key=lambda c: c[0] * c[1])
+
+    # 优先「长边不超过 cap」的候选；一个都没有时才放宽到 cap + mult
+    got = _pick([c for c in cands if max(c) <= cap]) \
+        or _pick([c for c in cands if max(c) <= cap + mult])
+    if got:
+        return got
+    return (_snap_multiple(w * base, mult, lo=lo), _snap_multiple(h * base, mult, lo=lo))
+
+
 def _norm_dim(v, default: int) -> int:
     """把尺寸归一到 16 的倍数并夹在 [MIN_DIM, MAX_DIM]。"""
     if v in (None, ''):
@@ -1470,6 +1573,22 @@ class Handler(BaseHTTPRequestHandler):
                                   f'请改用支持图生图的模型（klein 系列 / Qwen-Image-2.1），'
                                   f'或去掉参考图用文生图。')
 
+        # ── ★ 透明图开关（2026-09-28 新增，依据官方 README）──────────────
+        # Qwen 靠**提示词**决定是否输出 alpha 通道，官方明确要求套固定模板才稳
+        # （README「Transparent Image Generation」：For best results, use the
+        #  recommended prompt format）。此前本站**没有任何入口**能表达「我要透明图」
+        # → 用户拿不到稳定透明输出。这里把开关翻译成官方模板。
+        # ⚠️ 判据用**能力表**（tgt_caps），不是模型名 —— 不依赖调用方自觉，
+        #    将来加别的透明模型也不用改这里。
+        if body.get('transparent'):
+            if not (tgt_caps or {}).get('transparent'):
+                who = model_id or self.holder.get('class_name') or '当前模型'
+                return self._err(400, f'目标模型不支持透明输出（{who}）。'
+                                      f'目前仅 Qwen-Image-2.1 原生支持 RGBA；'
+                                      f'请换模型或去掉 transparent 参数。')
+            prompt = TRANSPARENT_PROMPT_TPL.format(desc=prompt)
+            print('[fluxd] 透明模式：已套官方 RGBA 提示词模板', flush=True)
+
         # ⚠️ 这里的 ready/error 校验只用「不换模型」时把门。
         #    换模型时，当前 holder 可能就是**另一个**模型的状态（比如当前是 dev、
         #    用户要 klein，而 dev 正加载失败）—— 拿它去拒绝一个本来能跑的任务是错的。
@@ -1486,6 +1605,27 @@ class Handler(BaseHTTPRequestHandler):
             max_steps = int(prof.get('max_steps') or MAX_STEPS)
         except BadRequest as e:
             return self._err(400, str(e))
+
+        # ── 图生图：参考图**先落盘**（★ 尺寸跟随需要它的宽高比，故提前到这里）──
+        # 2026-09-28 调整顺序。以前参考图在下面 params 构造**之后**才落盘，
+        # 于是"跟随参考图宽高比"根本拿不到参考图 —— 只能恒用方形画布，
+        # 把非方形参考图垫上中灰；而 Qwen 会把灰带**原样复现进输出**
+        # （像素级实锤：3:2 参考图 → 输出灰带 171/172 == 方形 pad 预测值）。
+        ref_paths = []
+        if is_edit:
+            try:
+                ref_paths = self._save_ref_images(body, tgt_caps)
+            except BadRequest as e:
+                return self._err(400, str(e))
+            # 用户**未显式**指定尺寸 → 跟随参考图宽高比（官方 `ratio_follow` 语义）。
+            # 为什么只在这时跟随：用户既然指定了尺寸，就该尊重用户意图。
+            if body.get('width') in (None, '') and body.get('height') in (None, ''):
+                try:
+                    width, height = _edit_follow_dims(ref_paths[0])
+                    print(f'[fluxd] edit 尺寸跟随参考图：{width}×{height}'
+                          f'（替代默认 {DEFAULT_WIDTH}×{DEFAULT_HEIGHT}）', flush=True)
+                except Exception as e:            # noqa: BLE001 —— 跟随失败不阻断出图
+                    print(f'[fluxd] 跟随参考图尺寸失败，回退默认尺寸：{e}', flush=True)
         # 上限跟着**目标模型**走：klein 蒸馏版给 8（官方 4 步，>8 反而劣化），dev 给 100。
         # 这里**仍允许显式超出建议值**（只卡硬上限），因为用户可能确实在试参数；
         # 但不再允许 100 步这种对蒸馏模型毫无意义、只烧 GPU 的请求。
@@ -1530,13 +1670,15 @@ class Handler(BaseHTTPRequestHandler):
             'guidance_scale': cfg_value,     # 统一键：worker 侧按目标模型改名
             'cfg_param': tgt_cfg_param,      # 告诉 worker 该用哪个参数名
         }
+        if body.get('transparent'):
+            # 留痕：prompt 里已套官方 RGBA 模板，这里记下开关便于事后核对出图为何是 RGBA
+            params['transparent'] = True
         if model_id:
             params['model_id'] = model_id           # worker 据此决定要不要换模型
         if is_edit:
-            try:
-                ref_paths = self._save_ref_images(body, tgt_caps)
-            except BadRequest as e:
-                return self._err(400, str(e))
+            # ⚠️ 参考图**已在上方落盘**（ref_paths）—— 尺寸跟随需要提前拿到它的
+            #    宽高比。这里只做参数装配，**不再重复落盘**（重复落盘会在 refs/
+            #    里产生孤立文件，且万一失败会浪费一次写盘）。
             if len(ref_paths) == 1:
                 params['image_path'] = ref_paths[0]     # 向后兼容：老 worker/老任务形态
             else:

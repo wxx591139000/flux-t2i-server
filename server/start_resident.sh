@@ -99,6 +99,14 @@ fi
 OFFLOAD=${FLUX_OFFLOAD:-model}
 TOKEN=${FLUX_RESIDENT_TOKEN:-}
 
+# 显存分配策略（2026-09-28 新增，A/B 实测）：
+#   Qwen-Image-2.1 出 2048×2048 时，默认分配器在 **14/20 步** OOM ——
+#   属于「总量够但拿不到连续块」的碎片化，不是真的显存不足。
+#   加 expandable_segments 后同一请求 **211.55s 通过**（对照实验）。
+#   对 1024 档无副作用（本轮 A1/B/C/D 全部用例仍正常），故设为默认。
+#   ⚠️ 此前只在手工重启时临时设过，脚本里没写 → 重启即丢，是真实缺陷。
+CUDA_ALLOC=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 MODE=${1:-}
 
 # ── 就绪判定（只读）：进程活着 + /health 有响应 ──
@@ -176,7 +184,7 @@ screen -wipe >/dev/null 2>&1
 sleep 1
 mkdir -p "$OUT"
 
-ENVPREFIX="FLUX_OFFLOAD=$OFFLOAD FLUX_RESIDENT_PORT=$PORT"
+ENVPREFIX="FLUX_OFFLOAD=$OFFLOAD FLUX_RESIDENT_PORT=$PORT PYTORCH_CUDA_ALLOC_CONF=$CUDA_ALLOC"
 [ -n "$TOKEN" ] && ENVPREFIX="$ENVPREFIX FLUX_RESIDENT_TOKEN=$TOKEN"
 
 screen -dmS "$SCREEN" bash -c "cd $WORKDIR && $ENVPREFIX \

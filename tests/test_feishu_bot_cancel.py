@@ -90,6 +90,10 @@ def fresh():
     sched = FluxQueueScheduler(db, quota)
     notif = StubNotifier()
     bot = fb.FeishuBot(sched, db, quota, notifier=notif)
+    # ★ 本门覆盖**取消命令面**，显式关掉「提交前确认」（v2.12.0 起默认开）：
+    #   不关的话提示词只会弹确认、不进队列，取消相关的断言会全红（且原因不在取消逻辑上）。
+    #   确认流程见 `tests/test_figu_confirm.py`。
+    bot.confirm_enabled = False
     # 同步处理（不起工作线程），断言才确定
     bot._enqueue = lambda oid, text: bot._handle_prompt(oid, text)
     return fb, bot, db, sched, notif

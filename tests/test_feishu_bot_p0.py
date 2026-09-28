@@ -107,8 +107,18 @@ def new_bot(db, sched=None, notif=None, sync=True):
     sched = sched or StubScheduler()
     notif = notif or StubNotifier()
     bot = fb.FeishuBot(sched, db, StubQuota(), notifier=notif)
+    # ★ 本门覆盖 P0 边界（去重 / 上限 / 回执 / 恢复），显式关掉「提交前确认」
+    #   （v2.12.0 起默认开）：不关的话提示词只会弹确认、不进队列，
+    #   会让「重放只提交 1 次」这类断言以**假红**的形式失败（原因不在被测逻辑上）。
+    #   确认流程见 `tests/test_figu_confirm.py`（那道门也钉住了"默认是开"）。
+    bot.confirm_enabled = False
     if sync:
-        bot._enqueue = lambda oid, text: bot._handle_prompt(oid, text)
+        # 2026-09-28（P2 群聊）：`_on_message` 现在会把**来源会话**（chat_id / is_group）
+        # 一起入队（群里发起的要回群里）。同步替身必须接得住这两个参数。
+        # ⚠️ 本门**所有断言一个字都没改** —— 这只是让替身与被替身的签名对齐；
+        #    对齐不上会直接 TypeError 报出来，不会静默变绿。
+        bot._enqueue = lambda oid, text, chat_id='', is_group=0: bot._handle_prompt(
+            oid, text, chat_id=chat_id, is_group=is_group)
     return fb, bot, sched, notif
 
 
@@ -333,7 +343,10 @@ def main():
     bot6._on_message(make_event(event_id='evt_img', message_id='m_img',
                                 message_type='image', content={'image_key': 'k'}))
     bot6._on_message(make_event(event_id='evt_grp', message_id='m_grp', chat_type='group'))
-    check('图片/群聊消息不提交任务（P0 范围外，P2/P3 再接）', len(sched6.submits) == 0,
+    # 2026-09-28（P2 之后）：群聊**已经接了**，但下面这条造的群消息既没 chat_id
+    # 也不在白名单里 → 仍然必须被拒。这条断言因此变成了"白名单默认空 = 一个群都不服务"
+    # 的守门检查（真正的群聊正例在 test_figu_group.py）。
+    check('白名单外的群消息 / 图片消息都不提交任务', len(sched6.submits) == 0,
           f'实际 {len(sched6.submits)}')
     check('被忽略的消息也已登记去重（重放不会二次处理）',
           db.feishu_seen('evt:evt_img') is True and db.feishu_seen('evt:evt_grp') is True)

@@ -338,6 +338,25 @@ def probe_all(force: bool = False) -> list:
     return fsm.probe_all(force=force)
 
 
+_EXPOSED_WARNED = set()
+
+
+def _warn_exposed(name) -> None:
+    """把「非商用模型被放行对外」这件事记一条 warning —— 每台机器每进程只记一次。
+
+    为什么需要它：`expose_to_customers` 是一个**法律风险开关**（依据写在注册表的
+    expose_note 里）。这类开关最糟的形态是「生效了但没人看得见」。
+    但每轮都刷日志同样是伤害 —— 本项目的看门狗专门为日志刷屏做过节流，因为刷屏会
+    把真正的故障日志淹掉。所以：记，但按机器名去重。
+    """
+    if not name or name in _EXPOSED_WARNED:
+        return
+    _EXPOSED_WARNED.add(name)
+    logger.warning(
+        f'⚠️ 许可闸：{name} 的模型**非商用**，但注册表标了 expose_to_customers=true '
+        f'→ 已按业主决定放行对外使用（依据见注册表 expose_note）')
+
+
 def _pick_from(cands: list, need_edit: bool = False,
                need_model: str = None, need_caps: dict = None) -> tuple:
     """从 [(server, probe)] 里按分级规则挑一台。返回 (server|None, probe|None)。
@@ -391,10 +410,17 @@ def _pick_from(cands: list, need_edit: bool = False,
     #   对外访客（朋友 / B 链客户）的任务可能被派到 flux7 上跑，
     #   而 flux7 的许可明确不允许这样做。这是**法律风险，不是质量偏好**。
     #
-    # 判据取 server 字典的 commercial_ok（注册表声明）：
-    #   · False  → 出局（明确不许商用）
-    #   · True   → 保留
-    #   · 缺字段 → 保留（**向后兼容**：老部署没这个字段，剔除会让全部机器消失）
+    # 判据（2026-09-28 起是**两条或关系**，任一成立即放行）：
+    #   ① commercial_ok —— **许可事实**（注册表声明，客观）
+    #        · False  → 不放行（明确非商用）
+    #        · True   → 放行
+    #        · 缺字段 → 放行（**向后兼容**：老部署没这字段，剔除会让全部机器消失）
+    #   ② expose_to_customers —— **业主决定**（2026-09-28 新增，主观）
+    #        · True   → 放行（明知许可受限仍要对外；依据见注册表 expose_note）
+    #        · 其他   → 不放行
+    #   ⚠️ 两条为什么要分开：① 回答「许可证允不允许」，② 回答「业主愿不愿意承担」。
+    #      合成一个字段就再也分不清两者，而它们的法律含义完全不同 ——
+    #      前者无风险，后者是明知故犯且需要留证。
     #
     # ⚠️ 为什么直连模式要跳过这道闸（2026-09-22 实测踩到，代价是一道门变红）：
     #   直连模式（FLUX_RESIDENT_BASE 有值）下 `probe_all` 返回的候选机是
@@ -408,8 +434,18 @@ def _pick_from(cands: list, need_edit: bool = False,
     #   语义上：**直连模式用户已显式指定了后端**，许可合规由他自己负责
     #   （他知道自己连的是哪台）—— 平台不该替他猜，更不该拿别处的标签拦他。
     if not need_model and not DIRECT_BASE:
+        # 放行判据是**两条或关系**（2026-09-28 新增第 ② 条）：
+        #   ① commercial_ok is not False —— **许可事实**本身允许商用
+        #      （True 放行；缺字段也放行，向后兼容：老部署没这字段，剔除会让机器全消失）
+        #   ② expose_to_customers is True —— **业主显式决定**放行
+        #      （明知许可受限仍要对外，依据写在注册表的 expose_note 里）
+        # ★ 为什么不干脆把 commercial_ok 改成 true：那会让**事实字段撒谎**。
+        #   下一个接手的人就分不清「这模型本来就能商用」和「业主决定不管许可」，
+        #   而这两件事的法律含义完全不同（前者无风险，后者是明知故犯）。
+        #   两个字段正交，是刻意的。
         allowed = [c for c in cands
-                   if c[0].get('commercial_ok') is not False]
+                   if c[0].get('commercial_ok') is not False
+                   or c[0].get('expose_to_customers') is True]
         if allowed and len(allowed) != len(cands):
             # 用 id() 判断而不是 `c not in allowed`：dict 的 == 比较是**值比较**，
             # 两台机器配置相同时会被误判成「在 allowed 里」→ 漏报排除项。
@@ -421,6 +457,12 @@ def _pick_from(cands: list, need_edit: bool = False,
             # 全都不许商用 —— 不硬挑，交给调用方报准确原因
             logger.warning('🔴 许可闸：所有候选机的模型均不允许对外经营')
             return None, (cands[0][1] if cands else None)
+        # ★ 靠 ② 放行的机器：必须留下一条**看得见**的日志。
+        #   理由：这是法律风险开关，最糟的形态是「悄悄生效」。日志刷屏同样是伤害
+        #   （本项目已被刷屏淹过真正的故障日志），所以按机器名去重、每进程一次。
+        for c in allowed:
+            if c[0].get('commercial_ok') is False:
+                _warn_exposed(c[0].get('name'))
 
     # need_edit 是 need_caps 的便捷写法，合并成一份能力要求（别写两段过滤）
     caps_req = dict(need_caps or {})

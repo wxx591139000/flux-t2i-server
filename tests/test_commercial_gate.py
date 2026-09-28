@@ -22,6 +22,17 @@
 3. need_model 显式指定时**绕过**许可闸（自用不受商用限制，这是刻意语义）
 4. 全都不许商用 → 返回 None（不硬挑，避免「提交成功→排队→报错」白等一轮）
 5. 变异测试：把闸拆掉 → 门必须变红
+
+## 2026-09-28 追加：业主放行（expose_to_customers）
+
+背景：Dancing 明确要求把 Qwen-Image-2.1（Qwen Research License，非商用）放到
+B 链面向客户的站点上。放行不能靠改 `commercial_ok`（那是**许可事实**，改了就是让
+事实字段撒谎），新增正交字段 `expose_to_customers`（**业主决定**）。
+
+6. `expose_to_customers=true` 的非商用机器**可以**被自动选机选中
+   （否则 flux7 单独在线时 `/api/models` 返回空清单，客户连选都没得选）
+7. 但**必须**同时写 `expose_note` —— 允许放开，不允许「悄悄放开」
+8. 变异：删掉放行分支 → 第 6 条用例必须变红
 """
 
 import ast
@@ -102,6 +113,12 @@ class TestCommercialGate(unittest.TestCase):
         """_pick_from 里必须读 commercial_ok（不只看 servers.json 声明）。"""
         self.assertIn("get('commercial_ok')", self.norm,
                       '源码里没有任何一处读 commercial_ok —— 许可闸被删了')
+
+    def test_source_has_expose_branch(self):
+        """放行分支必须真的在源码里（业主放行靠它生效，不是靠改 commercial_ok）。"""
+        self.assertIn("get('expose_to_customers')isTrue", self.norm,
+                      '源码里没有 expose_to_customers 的放行判据 —— '
+                      '要么放行被删了，要么被写成了别的形态（会静默失效）')
 
     def test_gate_checks_is_not_false(self):
         """判据必须是 `is not False`，不是真值判断。
@@ -271,6 +288,41 @@ class TestCommercialGate(unittest.TestCase):
         s, _p = mod._pick_from(cands)
         self.assertIsNone(s, '全是非商用机器时不该硬挑一台')
 
+    def test_exposed_machine_is_selectable(self):
+        """业主显式放行（expose_to_customers=true）的非商用机器，自动选机**可以**选中。
+
+        为什么必须对**自动选机**生效（而不是只在 need_model 路径）：
+          `/api/models`（B 链下拉框的数据源）走的是 `find_available_server()`
+          ——**不带 need_model**。若放行只作用于 need_model 路径，flux7 单独在线时
+          `/api/models` 会返回空清单，客户连"选"的机会都没有 → 需求落空。
+        """
+        mod = self._build_pick()
+        c = self._mk_cand('flux7_qwen', False)
+        c[0]['expose_to_customers'] = True
+        s, _p = mod._pick_from([c])
+        self.assertIsNotNone(s, 'expose_to_customers=true 的机器被排除 —— 业主放行没生效')
+        self.assertEqual(s['name'], 'flux7_qwen')
+
+    def test_exposed_machine_must_have_note(self):
+        """允许放开，但**不允许悄悄放开**：expose_to_customers=true 必须配 expose_note。
+
+        为什么单独钉一条：这是个**法律风险开关**。不钉的话，任何人往 servers.json
+        加一行 true 就能把非商用模型推给客户，且事后无人能回答「谁决定的、依据是什么」。
+        钉住它，放开就必然留下依据。
+        """
+        import json
+        p = os.path.join(ROOT, 'manager', 'servers.json')
+        with open(p, encoding='utf-8') as f:
+            data = json.load(f)
+        exposed = [s for s in data['servers'] if s.get('expose_to_customers') is True]
+        for s in exposed:
+            self.assertTrue((s.get('expose_note') or '').strip(),
+                            f"{s['name']} 标了 expose_to_customers=true 但没写 expose_note"
+                            ' —— 不许悄悄把非商用模型放给客户')
+            self.assertIsNot(s.get('commercial_ok'), True,
+                             f"{s['name']} 已是 commercial_ok=true（许可本就允许商用），"
+                             ' 不该再标 expose_to_customers —— 会让人误以为它有许可问题')
+
     # ── 第 3 组：变异测试 ──
     #
     # 变异在 **去注释后的源码** 上做（self.code），因为注释里含同样的锚点串。
@@ -287,6 +339,15 @@ class TestCommercialGate(unittest.TestCase):
     def _mutate_truthy_check(self, code):
         """把 `is not False` 去掉 → 变成真值判断（会误剔缺字段机器）。"""
         new, n = self.GATE_COND.subn("if c[0].get('commercial_ok')", code, count=1)
+        return new, n
+
+    # 2026-09-28 新增：业主放行那条分支的变异锚点。
+    EXPOSE_CLAUSE = re.compile(
+        r"or\s+c\s*\[\s*0\s*\]\s*\.\s*get\s*\(\s*'expose_to_customers'\s*\)\s*is\s+True")
+
+    def _mutate_drop_expose_clause(self, code):
+        """删掉「业主放行」分支（`or X is True` → `or False`）。"""
+        new, n = self.EXPOSE_CLAUSE.subn('or False', code, count=1)
         return new, n
 
     def test_mutation_removing_gate_turns_red(self):
@@ -315,9 +376,37 @@ class TestCommercialGate(unittest.TestCase):
         self.assertIsNotNone(s_ok, '正常源码应保留缺字段机器')
         self.assertIsNone(s_bad, '变异后缺字段机器未被剔 —— 判据断言没测到真东西')
 
+    def test_mutation_dropping_expose_turns_red(self):
+        """删掉「业主放行」分支 → 被放行的机器必须重新出局。
+
+        为什么值得单独做变异：新增的放行分支如果写错（比如写成 `and`、
+        或漏进 `is not False` 的另一侧），`test_exposed_machine_is_selectable`
+        会红；但如果是**整个分支被删**（有人"清理"掉了它），那条用例也会红。
+        本变异证明的就是「那条用例真的在看这个分支」，而不是恰好因为别的原因通过。
+        """
+        broken, n = self._mutate_drop_expose_clause(self.code)
+        self.assertEqual(n, 1, f'变异锚点未匹配（命中 {n} 处）—— 需同步更新本门')
+        mod_ok = self._build_pick()
+        mod_broken = self._build_pick(src_override=broken)
+        c = self._mk_cand('flux7_qwen', False)
+        c[0]['expose_to_customers'] = True
+        s_ok, _ = mod_ok._pick_from([c])
+        s_bad, _ = mod_broken._pick_from([c])
+        self.assertIsNotNone(s_ok, '正常源码应放行 expose_to_customers=true 的机器')
+        self.assertEqual(s_ok['name'], 'flux7_qwen')
+        self.assertIsNone(s_bad,
+                          '删掉放行分支后该机器仍被选中 —— 本门的放行用例没在测它')
+
     # ── 第 4 组：声明侧仍然正确（与能力门呼应，防止只改一边）──
     def test_registry_still_declares_qwen_noncommercial(self):
-        """servers.json 里 Qwen 机仍标 commercial_ok=False。"""
+        """servers.json 里 Qwen 机仍标 commercial_ok=False。
+
+        ★ 2026-09-28 仍成立，且**刻意不因"放到 B 链"而改**：
+          业主放行走的是新增的 `expose_to_customers`，`commercial_ok` 记录的是
+          **许可事实**（Qwen Research License 非商用）—— 事实没变就不该变。
+          改它会让后来者分不清「本来就允许商用」和「业主决定不管许可」。
+          所以：这条断言在"已放行"之后**依然必须绿**。
+        """
         import json
         p = os.path.join(ROOT, 'manager', 'servers.json')
         with open(p, encoding='utf-8') as f:

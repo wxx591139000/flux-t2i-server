@@ -160,3 +160,131 @@
 门的第一版用了 `gen00001` 这类**非十六进制**假 job_id（真实是 `uuid4().hex[:16]`），
 被严格判据**正确地**判为"不是命令" → 误判成"实现有 bug"。
 **实现是对的，测试数据是错的。** 写"按格式识别"的测试时，夹具必须满足格式约束。
+
+## 增量（2026-09-28）：第 21、22 道门（v2.11.0）
+
+全量 **22/22**（`tests/run_all.py` 扫 `tests/test_*.py` 全跑 —— 防漏跑）。
+
+### 第 21 道 · `tests/test_figu_params.py`（133 项，全绿）
+
+| 分组 | 钉住的东西 |
+|---|---|
+| `t_command_parsing` | **31 条命令全部命中 / 18 条"像命令但不是"的提示词 0 误吞** ★ |
+| `t_params_effective` | `/size /n /model` 真的落到 `jobs` 表的 `width/height/seed/model` 列（不是只回执好看） ★ |
+| `t_pending_state_machine` | 待选落库 → 回 1 条号码 → 消费 → 清除；过期不消费 |
+| `t_cross_session_isolation` | **三元组隔离**：A 会话的待选，B 会话回复无效 ★ |
+| `t_guards` | 张数越界截断 / 认不出的模型名不是命令 |
+| `t_multi_image` | **n 张复用同一份英文提示词**（打桩翻译函数 → 断言只翻译 1 次）+ seed 各不相同 ★ |
+| `t_model` | 别名 → 完整 model id 透传到 `jobs.model`（**选机靠它**，不同模型在不同机器上） |
+| `t_bind_and_quota` | 无效码明确失败不建账户 / 同码再绑并入已有账户 / **两个 open_id 共享同一份用量** |
+| `t_cancelled_not_inflight` | **取消后的任务不再计入在途 → 取消完还能再提交**（v2.10.0 真缺陷回归）★ |
+
+### 第 22 道 · `tests/test_figu_group.py`（46 项，全绿，0 跳过）
+
+| 分组 | 钉住的东西 |
+|---|---|
+| `t_whitelist_parsing` | 逗号/分号/空格混合解析；**默认空集合**（安全默认） |
+| `t_whitelist_gate` | 非白名单群 + @ 也**不提交、连回执都不发** ★ |
+| `t_mention_judgement` | @图图 → 响应；**只 @别人 → 不响应** ★；未配 `FEISHU_BOT_OPEN_ID` 时降级为"任意 @"并放行 |
+| `t_group_end_to_end` | 两道门都过 → 提交；回执**回群**且 @ 发起人；`chat_id/is_group` **落库** ★ |
+| `t_p2p_unaffected` | **私聊不需要 @、仍走私聊**（P2 不得改坏 P0/P1） |
+| `t_reply_routing` | `_reply` 群/私聊分流；`is_group=1` 但 `chat_id` 空 → 退化私聊（不静默丢） |
+| `t_result_routing` | `_send_result` 群 → `send_image_to` / 私聊 → `send_image` |
+| `t_dedup_before_group_filter` | **被忽略的群消息也登记去重**（重放不二次处理） |
+| `t_session_isolation_group_vs_p2p` | 同一个人在群/私聊设的参数**互不影响**（三元组 key）★ |
+
+### ★ 本轮门的写错一次（值得记）
+
+`t_group_end_to_end` 第一版断言「未 @ 的消息**不产生回执**」时用了
+`len(notif.to_chat) == 1` —— **假红**。原因：图图提交路径**固有发 2 条**回执
+（即时「正在解析」+ 排队确认，见 `_submit_locked` 的「★ 立即回执」设计）。
+
+> **判据：断言"某动作不产生副作用"时，写成「**不产生新增**」（前后差值 == 0），
+> 不要写成「总数 == 某个数」。** 总数型断言会把已有的、无关的副作用一起算进来 →
+> 一改实现就假红（而实现是对的）。
+>
+> 这与上面那条 `gen00001` 夹具教训是**同一类病**：**测试数据/断言与实现契约不符 → 假红**。
+> 两条都已进 `docs/PITFALLS.md`。
+
+---
+
+## v2.12.0 新增：第 23 道门 `tests/test_figu_confirm.py`（**95/0**）
+
+覆盖**提交前确认**状态机，12 组：
+
+| # | 组 | 钉住的点 |
+|---|---|---|
+| 1 | `t_confirm_words` | **全等**判据：`好` 是确认、`好可爱的一只猫` 不是（35 条用例） |
+| 2 | `t_default_on` | 线上默认**开**（断言 `fb.CONFIRM_SUBMIT is True`） |
+| 3 | `t_flow_happy` | ★★ 发提示词**不提交** → 回「是」才提交；提交后待确认被清 |
+| 4 | `t_decline` | 回「否」→ 不建任务，且**额度口径未变** |
+| 5 | `t_new_prompt_discards` | 连发两句 → 只留最新；回「是」提交的是**最新**那句 |
+| 6 | `t_snapshot_params` | ★★ 库里参数被改，仍按**快照**提交（3 张 / 1280×720） |
+| 7 | `t_order_commands_first` | ★★ 顺序：命令不被确认拦；待选不被确认吃；有待确认时命令照常执行 |
+| 8 | `t_isolation` | ★★ 别人 / 别的会话回「是」都无效（三元组 key） |
+| 9 | `t_expired` | 过期后回「是」→ 不提交（且仍有回执，不静默丢弃） |
+| 10 | `t_inflight_guard` | 在途超限 → **不发确认**（不让用户白等一场） |
+| 11 | `t_switch_off` | `confirm_enabled=False` → 旧行为（回退保护） |
+| 12 | `t_group_route` | 确认请求发到**群**并 @ 发起人 |
+
+### ★ 这道门连带的"既有门修正"（值得记的经验）
+
+默认行为一改，**既有 4 道门立刻红了**（cancel 1 项、p0 7 项）——
+失败原因全部是「提示词不再直接进队列」，**不是**被测逻辑坏了。
+
+处理：这 4 道门各自显式 `bot.confirm_enabled = False`（它们分别覆盖命令面 / P0 边界 /
+参数 / 群聊），并各自注明「确认流程见 `test_figu_confirm.py`」。
+**没有**改动那 4 道门的任何断言 —— 断言是对的，变的只是**前提**。
+
+> 判据：改默认行为时先问「**有多少道门依赖这个默认值**」，再决定是"改门"还是"改断言"。
+> 一律改断言会把真缺陷一起改掉（第 12 号陷阱的变体）。
+
+### 变异测试（建议下次补）
+
+本版**没做变异测试**（v2.10.0 做了 7/7）。高价值变异点：
+① `FEISHU_TERMINAL_PHASES` 去掉 `'cancelled'` → 21 道门应红；
+② `_mentioned_bot` 改成"文本里找 `@`" → 22 道门应红；
+③ `session_key` 去掉 `chat_id`（退回二元组）→ 21/22 道门都应红；
+④ `parse_confirm` 改成**子串匹配** → 23 道门应红（吞提示词）；
+⑤ `_consume_confirm` 未知回复改 `return True` → 23 道门应红（新提示词被吃）；
+⑥ `_start_confirm` 去掉 `feishu_pending_clear` → 23 道门的顺序组应红。
+
+---
+
+## v2.13.0 — 许可闸放行分支（2026-09-28）
+
+**门文件数不变（仍 23）**，而是**扩了两道既有门** —— 契约改了，门必须跟着改。
+
+| 门 | 变化 |
+|---|---|
+| `tests/test_commercial_gate.py` | 13 → **17 项** |
+| `tests/test_model_capabilities.py` | `t_license` 增 1 条 |
+
+**新增的 4 项**
+
+1. `test_source_has_expose_branch` —— 放行分支必须真在源码里（断言 `get('expose_to_customers')isTrue`）；
+2. `test_exposed_machine_is_selectable` —— 放行必须对**自动选机**生效（理由见下）；
+3. `test_exposed_machine_must_have_note` —— 放行必须配 `expose_note`（**允许放开，不允许悄悄放开**）；
+4. `test_mutation_dropping_expose_turns_red` —— 删掉放行分支 → 第 2 项必须变红。
+
+### ★ 为什么第 2 项必须钉住「自动选机」而不是「need_model 路径」
+
+`/api/models`（B 链下拉框的数据源）走的是 `find_available_server()`，**不带 `need_model`**。
+如果放行只在 `need_model` 路径生效，那么 flux7 单独在线时 `/api/models` 会返回**空清单** →
+客户连"选"的机会都没有 → 需求落空。
+
+> 判据：门要钉**真实的调用路径**，不是"看起来等价"的路径。
+> 这两条路径在源码里只差一个参数，行为却完全不同。
+
+### ★ 既有的两条断言为什么**仍然必须绿**
+
+`commercial_ok is False`（声明侧）**不因放行而改** —— 它记录的是**许可事实**，
+业主放行走的是新增的 `expose_to_customers`。
+
+所以「Qwen 必须标 `commercial_ok=False`」这条断言**在放行之后依然要绿**；
+若有人为了"让它能用"去把 `commercial_ok` 改成 `true`，这道门会红 —— 这正是要拦的
+（见 `PITFALLS.md`「为了让功能生效去改记录事实的字段」）。
+
+### 本版没做的变异
+
+上表第 4 项（放行分支）做了；其余建议变异点见上一节，本版仍未补。

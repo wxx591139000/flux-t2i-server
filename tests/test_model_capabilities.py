@@ -311,6 +311,12 @@ def t_license():
               ' —— Qwen Research License 非商用，用于对外接单有法律风险')
         check(f"{s['name']} 有 license 字段（留下依据，便于评审）",
               bool(s.get('license')), str(s.get('license'))[:80])
+        # 2026-09-28 新增：许可事实（commercial_ok）与业主决定（expose_to_customers）正交。
+        # 允许业主把非商用模型放给客户，但**必须**留下书面依据。
+        if s.get('expose_to_customers') is True:
+            check(f"★ {s['name']} 已放行对外（expose_to_customers=true）且写了 expose_note",
+                  bool((s.get('expose_note') or '').strip()),
+                  ' —— 允许放开，不允许悄悄放开')
     # 反向：klein 机必须标注可商用（Apache 2.0），否则对外经营会被误拦
     klein = [s for s in srvs if 'klein' in (s.get('remote_model', '') or '').lower()
              and s.get('enabled', True)]

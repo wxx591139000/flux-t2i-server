@@ -312,13 +312,18 @@ worker: pop → SSH生成 → 拉图 web_out/<jobid>/ → done；服务器down �
 ```
 飞书文本
   └─► _handle_prompt(open_id, text)
-        ├─ ① _match_command(text) → ('help'|'list'|'cancel', arg)   ← ★ 必须最先
-        │     ├─ help   → _cmd_help
-        │     ├─ list   → _cmd_list       （读 db.jobs_inflight_by_user）
-        │     └─ cancel → _cmd_cancel     （打墓碑 + drop_job + 跟踪终态）
-        ├─ ② 未知斜杠写法 → 给指引（不静默当提示词）
-        └─ ③ 否则 → 当提示词提交（_submit_locked）
+        ├─ ① _match_command(text) → ('help'|'list'|'cancel'|'size'|'count'|'model'|'bind'|'quota'|'params', arg)
+        │     ★ 必须最先 —— 命令被当提示词会**真扣额度出一张废图**
+        │     ★ 顺带 feishu_pending_clear（命令 = 用户已翻篇，待选/待确认作废）
+        ├─ ② _try_consume_pending → 消费"待选/待确认"（回「2」/回「是」这类回答）
+        ├─ ③ 未知斜杠写法 → 给指引（不静默当提示词）
+        ├─ ④ 提交前确认（v2.12.0）→ 发确认 + 记待确认，**本条消息到此为止**
+        └─ ⑤ 否则 → 当提示词提交（_submit_locked）
 ```
+
+> ⚠️ 这五步的**顺序本身就是契约**，每一步错位都有实测过的后果：
+> ①晚于⑤ → 命令被当提示词（白扣额度）；②晚于① → 「取消」被当"选第 N 项"；
+> ④早于② → 用户回「是」被当新提示词 → 又弹确认 → **永远出不了图**。
 
 判据严格性（`_match_command`）：只有「取消 + 纯数字序号（≤3 位）」或
 「取消 + 6~16 位十六进制」才算命令 —— 后者对应 job_id 前缀
@@ -361,3 +366,147 @@ pooled   = status in ('queued', 'generating', 'waiting') # 调度器内存里可
 所以 `_poll_once()` 遇到 `deleted_at` 非空即终止跟踪（`phase='cancelled'`），
 且 `feishu_tracks_pending()` 把 `'cancelled'` 计入终态 ——
 否则网页端删了任务，飞书轮询会**每 5 秒空转、永不收敛**（P0-1 同款病）。
+
+---
+
+## 增量（2026-09-28）：图图状态机与群聊（v2.11.0）
+
+### 模块划分：把纯逻辑抽出来，才能离线验
+
+```
+manager/figu_state.py     ← 新增：纯逻辑、无 IO、无网络
+  命令解析（parse_size / parse_count / parse_model_arg / parse_code）
+  会话 key（session_key）+ 尺寸表（SIZE_OPTIONS / SIZE_MAP）
+  待选消费（resolve_choice）+ 冷却（should_consume）+ 命令识别（is_slash_command）
+
+manager/feishu_bot.py     ← 编排：读库 / 发消息 / 调调度器
+manager/flux_db.py        ← 持久化：feishu_prefs / feishu_pending / feishu_tracks
+manager/feishu_notify.py  ← 外发：send_to / send_image_to / at_text
+```
+
+**为什么这么切**：命令识别与状态机是"最容易写错、也最该被钉住"的部分。
+把它做成**无 IO 纯函数**后，第 21 道门可以在**没有 GPU、没有飞书、没有 DB 事务**的情况下
+把 31 条命令与 18 条"像命令的提示词"逐条比对（0 误吞）。
+
+### 会话 key：三元组 `(channel, chat_id, sender_id)`
+
+两张表的主键都含 `chat_id`：
+
+```sql
+-- feishu_prefs：会话默认值（比例/张数/模型）
+PRIMARY KEY (channel, chat_id, sender_id)
+-- feishu_pending：待选状态机
+PRIMARY KEY (channel, chat_id, sender_id, kind)
+```
+
+★ **隔离做在主键里，不做在守卫里。** 前者跨会话误消费**不可能发生**；
+后者要求"每个调用点都记得校验"（小白后期就是靠"跨会话校验 + 冷却"打补丁的）。
+
+**单聊的 `chat_id`**：飞书单聊也有 `chat_id`；消息里缺失时兜底成 `p2p:<open_id>`
+（保证非空 —— 主键列 `NOT NULL`）。
+
+### 群聊的两道门（顺序敏感）
+
+```
+_on_message
+  ├─ ① 事件去重（feishu_seen）        ← **必须最前**：任何副作用之前
+  ├─ ② chat_type 白名单（p2p / group / ''）
+  ├─ ③ 群 → 白名单门（_group_allowed）
+  ├─ ④ 群 → @门（_mentioned_bot）
+  ├─ ⑤ message_type == 'text'        ← 非文本（图片/文件）P3 才接，现在显式忽略并留痕
+  └─ ⑥ 取文本 → 入队（带 chat_id / is_group）
+```
+
+**为什么去重排在最前**：一旦提交出去就来不及了（P0-2：飞书重放 = 重复出图 + 重复扣额度）。
+
+**为什么 @门不能用"文本里有 `@`"**：群里 @别人 同样产生 at 占位符 → 会**误响应不属于它的消息**
+（用户会觉得机器人乱插话）。正确判据在飞书事件的 `message.mentions[].id.open_id`。
+
+**为什么群聊要留痕 `chat_id` / `is_group`**：`feishu_tracks` 是**重启后唯一的记忆**。
+不记这两个字段，9620 一重启（改代码就要重启）结果就会**回错地方**（丢进私聊）。
+
+### 回程路由
+
+```python
+_reply(open_id, chat_id, is_group, text)
+    is_group and chat_id → n.send_to(chat_id, _at_prefix(open_id) + text)   # 群：回群 + @发起人
+    否则                  → n.send_direct(open_id, text)                    # 私聊
+
+_send_result(open_id, job, chat_id, is_group)
+    is_group and chat_id → n.send_image_to(chat_id, key)
+    否则                  → n.send_image(open_id, key)
+```
+
+⚠️ `is_group=1` 但 `chat_id` 为空（异常数据）→ **退化为私聊**，不静默丢消息（门已钉）。
+
+### 多图：一次翻译、多张候选
+
+```
+第 1 张：scheduler.submit(user, 用户原文)          # 翻译由调度器完成
+         ↓ 从 jobs 表读回 row['prompt']            # **实际落地**的英文
+第 2..n 张：scheduler.submit(user, 落地英文, seed=随机)  # 显式不同 seed
+```
+
+**显式给 seed 是必需的**：去重键含 seed，全传 `None` 会被"相同提示词与参数正在排队"挡住第 2 张起。
+
+### 终态判据的单一事实源
+
+```python
+FEISHU_TERMINAL_PHASES = ('done', 'failed', 'cancelled')   # flux_db 一处定义
+```
+
+`feishu_tracks_inflight()` / `feishu_track_gc()` / `feishu_tracks_pending()` 全部引用它。
+
+> 第 18 号陷阱：`status in (...)` 这类判据**每加一个状态都要回头审全部分支**。
+> 本版修的就是两处漏了 `cancelled` —— DB 侧加了墓碑过滤，**内存/跟踪侧没加**。
+
+---
+
+## 增量（2026-09-28）：图图提交前确认（v2.12.0）
+
+### 为什么需要
+
+图图的唯一入口是飞书文本，而用户发来的**不都是生图提示词** —— 可能是随口一句、
+可能打错字。原行为「凡不是命令的文本一律直接提交」意味着**一次误发就真扣一次额度**。
+现在插一步确认：非命令文本先回一条（含原文 + 本次参数），回「是」才建任务。
+
+### 状态机（复用 `feishu_pending` 表，`kind = 'confirm_submit'`）
+
+```
+用户发「一只橘猫坐在窗台上」
+  └─► _start_confirm
+        ├─ 在途预检（MAX_INFLIGHT_PER_USER）→ 超限则直接回执，**不发确认**（不让用户白等）
+        ├─ 读 prefs → **快照** {prompt, n, size, model}
+        ├─ feishu_pending_clear(*ses)          # 一个会话只留一个待选/待确认
+        ├─ feishu_pending_set(kind='confirm_submit', payload=快照, ttl=300)
+        └─ 回确认：原文 + 「本次参数：n 张 · 比例 X · 模型 Y」+ 回是 / 回否
+
+用户回「是」
+  └─► _try_consume_pending → 按 kind 分派 _consume_confirm
+        ├─ parse_confirm → True  → 清 pending → _submit_locked(prefs_override=快照)
+        ├─ parse_confirm → False → 清 pending → 回「好的，这次不出了」
+        └─ parse_confirm → None  → 清 pending → **返回 False**（按新提示词继续走）
+```
+
+### 三个判据（都别放松）
+
+| 判据 | 为什么 |
+|---|---|
+| `parse_confirm` **全等** | `好` 是确认，`好可爱的一只猫` **不是** —— 确认词与提示词共用一条通道，判松就吞提示词 |
+| 参数走**快照**（`prefs_override` 整体替换） | 确认消息显示什么就提交什么；否则用户中途改张数 →「说 2 张实际出 3 张」= 虚假陈述 |
+| 未知回复**返回 False**（不消费） | 用户改主意直接发新提示词时，旧的作废、新的重新确认；这里若 return True 就把新提示词吃了 |
+
+### 与"参数待选"的关系
+
+两者**共用 `feishu_pending` 表**（PK 含 `kind`），但语义不同：
+
+- `kind ∈ {size, count, model}` → payload 含 `options`，用户回**序号/标签**，消费后写 prefs
+- `kind = 'confirm_submit'` → payload 是**参数快照**，用户回**是/否**，消费后提交任务
+
+因此 `_try_consume_pending` **必须先按 kind 分派**再走 `resolve_choice` ——
+否则 `options` 为空 → `resolve_choice` 恒返 None → 「是」永远不被消费（表现为"回是没反应"）。
+
+### 回退开关
+
+`FIGU_CONFIRM_SUBMIT`（默认**开**）。设 `0` 回退旧行为。
+⚠️ 显式留空（`FIGU_CONFIRM_SUBMIT=`）按「未设」处理 = 开 ——「空值当关」是本仓库踩过的坑。

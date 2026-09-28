@@ -458,7 +458,11 @@ class FluxQueueScheduler:
                 return
 
             if ok:
-                self.db.job_update(job_id, status='done', completed_at=int(time.time()))
+                # ★ 成功时清空 error：任务中途可能经历过 [SERVER_DOWN] 重试（error 里
+                #   累积 [RETRY:N] 等历史记录）。若不清，前端 /api/status 会把「已完成」
+                #   连同那些陈年重试记录一起返回，误导排查者以为任务最终是失败的。
+                self.db.job_update(job_id, status='done', error=None,
+                                   completed_at=int(time.time()))
                 self._drop_ref(job_id)
                 logger.info(f'✅ {job_id} 完成')
             else:

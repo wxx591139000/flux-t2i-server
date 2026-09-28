@@ -7,7 +7,10 @@
   负担，漏一处就表现为「网站一直转圈」且极难定位。
   现在：servers.json 是唯一事实来源，看门狗的 targets.conf 由本脚本生成。
 
-生成格式（每行）：host:port:user:workdir:model:offload
+生成格式（每行）：host:port:user:workdir:model:offload:name
+  ⚠️ 第 7 段 name 是 2026-09-21 加的（看门狗用它回报「哪台开机」）。
+     原本这里的注释与写出的文件头都漏了它，而 deploy_vps.py 写的是带 name 的版本
+     → 两份生成器描述不一致。2026-09-28 对齐（只是注释，不影响行为）。
 
 用法：
   python watchdog/gen_targets.py                    # 写到 watchdog/targets.conf
@@ -86,7 +89,7 @@ def main():
         return 1
 
     body = '# 由 watchdog/gen_targets.py 从 manager/servers.json 生成 —— **不要手改**\n' \
-           '# 格式: host:port:user:workdir:model:offload\n' + '\n'.join(lines) + '\n'
+           '# 格式: host:port:user:workdir:model:offload:name\n' + '\n'.join(lines) + '\n'
 
     if a.print:
         print(body, end='')
