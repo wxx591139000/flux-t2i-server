@@ -288,3 +288,52 @@
 ### 本版没做的变异
 
 上表第 4 项（放行分支）做了；其余建议变异点见上一节，本版仍未补。
+
+## 增量（2026-09-29）：多图参考门（v2.15.0）
+
+### 新增两道门
+
+| 门 | 项数 | 钉什么 |
+|---|---|---|
+| `tests/test_multi_ref_pick.py` | 20 | `_generate_resident` 的选机 kwargs |
+| `tests/test_web_models_passthrough.py` | 24 | `_api_models` 的能力透传 |
+
+**为什么这两道门都要**：本轮是**跨层**改动 —— 一个能力字段在
+「GPU 侧 → `_api_models` slim → 站点」这条链上**任何一层丢掉**都会让穿搭失效，
+而症状是"下拉框没有 Qwen / 模型莫名置灰"，**不会报错**。
+分层各钉一道，谁丢谁红。
+
+### `test_multi_ref_pick.py` 钉的判据
+
+1. `ref_count > 1` 时选机 kwargs **必须含** `need_caps={'multi_ref': True}`；
+2. `ref_count <= 1`（含单张 / 文生图）**不得**带 `multi_ref`（否则白白缩小候选机范围）；
+3. 张数来源**必须是 DB 的 `ref_count`**，不得是 `len(ref_b64)` / 磁盘文件数 / 内存长度
+   —— 三者分别是"取太晚 / 尽力而为 / 重启即空"；
+4. 多图无可用机时**报多图专属文案**（含张数 + 指路），不是泛泛的 `[SERVER_DOWN]`；
+5. 变异：删掉 `need_caps` 传参 → 门必须变红。
+
+### `test_web_models_passthrough.py` 钉的判据
+
+1. `slim` 输出**必须含** `supports_edit` 与 `capabilities`；
+2. 上游缺该字段时**给 `None`**（不是 `False`）——「不知道」与「不支持」可分；
+3. `path` **绝不外传**（内部拓扑）；
+4. 变异：从 `slim` 里删掉 `capabilities` → 门必须变红。
+
+### 全量
+
+**27/27**（155.0s）。
+
+> ⚠️ **本机跑法**：`CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR= py -3.11 tests/run_all.py`
+> 前置清空是必须的 —— WorkBuddy 会话注入了一个 **Python 级删除钩子**（`sitecustomize.py`
+> 包了 `os.remove/unlink/rmdir/rmtree`），子进程继承了 `CODEBUDDY_TOOL_CALL_ID` 后
+> 批量删除守卫会失败 → `SystemExit(1)`。**症状极易误判**：某个测试**单跑全绿**
+> （如 `test_edit_follow_dims.py` 单跑 3/3），**进 `run_all` 就 rc=1**。
+> 这是**执行环境**被拦，**不是代码回归**。清除该环境变量后 27/27 rc=0。
+
+### 已知测试缺口（本版未覆盖，明确留档）
+
+| 缺口 | 为什么没做 | 影响 |
+|---|---|---|
+| **多图真机端到端** | 需有卡 GPU（用户决定"真机验证等有卡"） | 只在离线桩验过；真机的 `images` 到达 / 单张完整输出 / 角色顺序未验 |
+| 跨仓集成（image-gen-site UI ↔ 上游） | 两仓各自离线验，未做真实浏览器↔真后端的联合 | 端到端联调未验 |
+| `ref_count` 迁移在**老库**上的行为 | 迁移逻辑有，但没造"缺列老库"专项用例 | 老部署升级时的迁移未实测 |

@@ -1,9 +1,10 @@
 # 项目推进进度 — FLUX 文生图服务（通用）
 
-> 版本：v2.14.0 · 2026-09-28
+> 版本：v2.15.0 · 2026-09-29
 
 ## 里程碑回顾
 
+- **2026-09-29（v2.15.0）**：**多图参考（模特穿搭）全链路打通 + `_api_models` 能力透传根因修复**——`/api/edit` 支持 `images[]`，`submit` / `generate_via_resident` 归一化多图；选机按 `ref_count>1` 要求 `multi_ref` 机器；`jobs.ref_count` 持久化（提交那刻落库）；`_put_ref/_get_ref/_drop_ref` 支持 list（单张仍 `ref.png`，多张 `ref_<i>.png`）；★ 补回 `_api_models` slim 丢掉的 `supports_edit` / `capabilities`。新增门 `test_multi_ref_pick`(20) / `test_web_models_passthrough`(24)。全量回归门 **27/27**
 - **2026-09-28（v2.14.0）**：**Qwen-Image-2.1 参考图/编辑能力优化 + 飞书图图参数状态机 + B 链误报修复**——resident 侧对齐官方 7 档尺寸、修灰边根因、透明图套官方 RGBA 模板、持久化 expandable_segments 修 OOM；新增 `figu_state.py` 参数状态机；后端 done 清 error + 前端 unreachable 状态区分「服务不可达」vs「任务真失败」；上线排查修 curl 无尾换行黏连 + flux7 地址。全量回归门 25/25
 
 - **2026-08-14**：小红书场景下最初部署 FLUX（山西旅游配图），踩坑记录到方案文档
@@ -304,3 +305,60 @@
   → 再开 B 链看下拉框
 - 若要**合法**对外经营 Qwen，需向杭州通义实验室申请商业授权（无自助通道）——
   见 `docs/许可决策-20260928.md`
+
+## v2.15.0 — 多图参考（模特穿搭）全链路 + 能力透传根因修复（2026-09-29）
+
+**需求原话**：「把多个产品的图穿到一个模特图上」（B 链「模特穿搭」场景）。
+
+### 做了什么
+
+| # | 层 | 改动 |
+|---|---|---|
+| 1 | 后端 API | `/api/edit` 支持 `images`（list）；新增 `_extract_ref_images`；缺图仍 400 |
+| 2 | 调度 | `submit(..., ref_images=list)`（`ref_images` 优先、`ref_image` 兼容）；入口归一成 list |
+| 3 | **选机** | `ref_count > 1` → `find_available_server(need_caps={'multi_ref': True})` |
+| 4 | **持久化** | `jobs.ref_count` 新列 + 迁移；**提交那刻**落库 |
+| 5 | 参考图存储 | `_put_ref/_get_ref/_drop_ref` 支持 list（单张 `ref.png` / 多张 `ref_<i>.png`） |
+| 6 | RPC | `generate_via_resident(ref_images=list)`：单张发 `image`、多张发 `images` |
+| 7 | ★ **能力透传** | `_api_models` slim **补回** `supports_edit` + `capabilities` |
+
+### ★ 本轮最关键的一处（根因 = 中间层丢字段）
+
+站点模型下拉一直拿不到 `supports_edit`，注释以为是「上游版本旧没这字段」。
+实际是 `_api_models` 的 `slim` **只留 5 个字段**，把 GPU 侧**明明给了的**
+`supports_edit` / `capabilities` **过滤掉了**。
+
+- 为什么现在必须补：穿搭要靠 `capabilities.multi_ref` 判「当前模型能不能真多图」；
+  拿不到就只能**猜模型名**，而"猜"正是这条链路一直想消灭的东西。
+- 判据：`supports_edit` / `capabilities` **缺失给 `None`**（不是 `False`）——
+  「不知道」与「不支持」必须可分（前端口径：`=== false` 才禁用，`undefined` 放行给上游硬闸）。
+- `path` 仍然**不外传**（内部拓扑）。
+
+### 为什么张数必须单独落库（`ref_count`）
+
+三个候选来源全不可靠：① 磁盘 `ref_*.png` 个数 —— 落盘是**尽力而为**（吞异常只 warning）；
+② `len(内存 ref_images)` —— 重启后必为空；③ 等取到 `ref_b64` 再数 —— 选机在它之前。
+⇒ 只能用**提交那一刻**写进 DB 的 `ref_count`，它也是选机前唯一可靠可读的来源。
+
+### 门
+
+| 门 | 项数 | 钉什么 |
+|---|---|---|
+| `tests/test_multi_ref_pick.py`（新） | 20 | `_generate_resident` 的选机 kwargs（多图必须带 `multi_ref`） |
+| `tests/test_web_models_passthrough.py`（新） | 24 | `_api_models` 透传能力字段（含"不许丢字段"的变异） |
+
+全量 **27/27**，155.0s。
+
+### 未验证（本轮最大缺口）
+
+- ★ **有卡真机端到端一次都没跑**：多图链路只在**离线桩**上验过（`flux-stub-server.js` +
+  `edit-client-preprocess-check.js` 32/32 + `offline-e2e-check.js` 73/73）。
+  真机（Qwen-Image-2.1，需 GPU 卡）上的**多图实际出图**未验证
+  —— 用户当时的决定是「现在实现 + 离线验证，真机验证等有卡」。
+- B 链下拉框实际是否出现 Qwen：仍取决于 flux7 有效地址（见 v2.13.0 遗留）。
+
+### 下一步
+
+- ★ **有卡后在真机跑一次「模特 + 2~3 单品」端到端**，确认：多图分支的 `images` 真的到 GPU、
+  输出是**单张完整照片**（不是拼板/网格）、角色顺序与缩略图标注一致。
+- 姊妹仓 `image-gen-site` 的「模特穿搭」UI 与本版**必须成对发布**（跨仓特性）。

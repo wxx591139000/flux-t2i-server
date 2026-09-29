@@ -769,7 +769,7 @@ def wait_model_loaded(server: dict, timeout: int = None, interval: float = 5) ->
 # ══════════════════ 高层入口：生成一张 ══════════════════
 def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1800,
                           wait_model: int = None, ref_image_b64: str = None,
-                          **gen_kwargs) -> dict:
+                          ref_images: list = None, **gen_kwargs) -> dict:
     """提交 → 等模型就绪 → 轮询完成 →（给了 dest 才）拉图。返回 status dict（含 path / seed）。
 
     `dest` 可省略（None）：`bench` 只关心推理耗时，不需要把 PNG 拉回本地 —— 白花时间，
@@ -777,12 +777,14 @@ def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1
     会把吞吐数据完全淹没在传输耗时里。旧版 `dest` 是必填位置参数，导致
     `bench` 一调用就 `TypeError`（该命令此前从未跑通过）。
 
-    `ref_image_b64`（2026-09-18 新增）—— 给了它就走 **`POST /edit`**（图生图），
-    不给就走 `POST /generate`（文生图）。两条路径除端点名与这一个字段外完全同构，
-    所以共用本函数，不做成两份代码。
+    参考图（二选一）：
+      · `ref_images`（list[str]）—— 多图（Qwen 最多 10 张，2026-09-28 新增）
+      · `ref_image_b64`（str）      —— 单张（向后兼容，klein 与老调用方）
+    给了任一就走 **`POST /edit`**（图生图），不给就走 `POST /generate`（文生图）。
+    两条路径除端点名与这一个字段外完全同构，所以共用本函数，不做成两份代码。
 
     参考图传**原样 base64**（可带 `data:` 前缀，服务端会剥）。不要在这里解码或
-    重新编码 —— 服务端 `_save_ref_image` 已经做了严格的图片校验与体积卡口，
+    重新编码 —— 服务端 `_save_ref_images` 已经做了严格的图片校验与体积卡口，
     客户端再动一次只会多一处口径漂移（这个项目在「体积换算」上已经栽过两次）。
     体积上限由**上游**兜底：`MAX_EDIT_BYTES=12MiB`(HTTP body) / `MAX_REF_BYTES=8MiB`
     (解码后)。超限时上游返回 400，本函数会把它转成 `TransportError(kind='failed')`
@@ -799,11 +801,24 @@ def generate_via_resident(server: dict, prompt: str, dest=None, timeout: int = 1
     if not h.get('model_loaded'):
         wait_model_loaded(server, timeout=wait_model)
 
+    # 归一化参考图：ref_images（list 或单张 str）优先，回退 ref_image_b64（单张）。
+    refs = None
+    if ref_images is not None:
+        if isinstance(ref_images, str):
+            refs = [ref_images.strip()] if ref_images.strip() else None
+        else:
+            refs = [str(x).strip() for x in ref_images if x and str(x).strip()]
+    if not refs and ref_image_b64:
+        refs = [str(ref_image_b64).strip()]
+
     body = {'prompt': prompt}
     body.update({k: v for k, v in gen_kwargs.items() if v not in (None, '')})
-    if ref_image_b64:
-        body['image'] = ref_image_b64
-    endpoint = '/edit' if ref_image_b64 else '/generate'
+    if refs:
+        if len(refs) == 1:
+            body['image'] = refs[0]          # 单张：klein 只接受这个形态
+        else:
+            body['images'] = refs            # 多张：Qwen 接受 list
+    endpoint = '/edit' if refs else '/generate'
     sub = t.post_json(endpoint, body, timeout=90)
     job_id = sub['job_id']
     # 把模型记进日志：出图与预期不符时，第一个要回答的问题就是「这张用的是哪个模型」。

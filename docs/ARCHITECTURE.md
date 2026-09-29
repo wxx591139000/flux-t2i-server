@@ -510,3 +510,69 @@ FEISHU_TERMINAL_PHASES = ('done', 'failed', 'cancelled')   # flux_db 一处定�
 
 `FIGU_CONFIRM_SUBMIT`（默认**开**）。设 `0` 回退旧行为。
 ⚠️ 显式留空（`FIGU_CONFIRM_SUBMIT=`）按「未设」处理 = 开 ——「空值当关」是本仓库踩过的坑。
+
+## 增量（2026-09-29）：多图参考链路（v2.15.0）
+
+### 调用链路（多图 = 一次 `/edit` 带 N 张，**不是拼板**）
+
+```
+B 链站点 image-gen-site（独立仓）
+  └─ POST /api/edit  { images: [模特, 单品1, 单品2, …] }   ← 多图数组
+      │
+      ▼
+manager 9620  flux_web_service._api_edit
+  └─ _extract_ref_images(data)   # images 优先 → list[str]；缺 → 400
+      │
+      ▼
+flux_queue.submit(..., ref_images=[...])
+  ├─ 入口归一成 list（去空 / 转 str）
+  ├─ job_insert(..., ref_count=len(ref_images))   ★ 提交那刻落库
+  ├─ _put_ref(job, [s1, s2, …])   # 内存 + 磁盘 ref_0.png / ref_1.png …
+  └─ _dedup_key(..., edit_mode=1)
+      │
+      ▼  worker（异步）
+flux_queue._generate_resident
+  ├─ job['ref_count'] > 1  ⇒  find_available_server(need_caps={'multi_ref': True})   ★ 选机闸
+  ├─ _get_ref(job)   → list[str]（单张 → str）
+  └─ flux_resident_client.generate_via_resident(ref_images=[...])
+        └─ len==1 → body['image']；len>1 → body['images']   ★ 形态归一
+            │
+            ▼
+resident 9630  /edit  →  GPU（Qwen-Image-2.1 最多 10 张）
+```
+
+### 关键设计决策
+
+| 决策 | 理由 |
+|---|---|
+| **不拼板，逐张交给模型** | 穿搭语义是「谁穿哪件」（role），拼成网格会**抹掉角色边界**；拼板只适合"同一商品多角度"（collage） |
+| **张数用 DB 的 `ref_count`** | 选机发生在取参考图**之前**；磁盘落盘尽力而为、内存重启必空，都不可靠 |
+| **`need_caps={'multi_ref'}` 而非 `need_edit`** | `edit` 只说"接受参考图"，不说"接受多张"；少要能力 = 每次穿搭白跑一轮 |
+| **单张恒返回 `str`** | 旧契约（M8/M9 直接 b64decode）；改 list 会静默打断老调用方 |
+| **`slim` 补回能力字段** | 前端要靠 `capabilities.multi_ref` 判多图，不能靠猜模型名 |
+| **`supports_edit`/`capabilities` 缺失给 `None`** | 「不知道」≠「不支持」；`undefined` 放行、`false` 才禁用 |
+| **`path` 不外传** | GPU 绝对路径属内部拓扑；`capabilities` 是能力声明、无拓扑信息 |
+
+### `_api_models` 的 slim 字段表（v2.15.0 起）
+
+| 字段 | 外传？ | 说明 |
+|---|---|---|
+| `id` / `name` | ✅ | 站点下拉显示 |
+| `ready` | ✅ | 未就绪要标注，不能假装可选 |
+| `class_name` / `size_gb` | ✅ | 展示用元信息 |
+| `supports_edit` | ✅（v2.15.0 补回） | 缺失 = `None` |
+| `capabilities` | ✅（v2.15.0 补回） | 含 `multi_ref` / `max_ref_images` / `transparent` |
+| `path` | ❌ | GPU 绝对路径，内部拓扑 |
+
+### 参考图存储契约
+
+```
+WEB_OUT/<job_id>/
+├── ref.png       ← 单张（旧契约，M8/M9 依赖）
+├── ref_0.png     ← 多张
+├── ref_1.png
+└── …
+```
+
+`_get_ref` 单张返回 `str`、多张返回 `list[str]`；`_drop_ref` 用 `glob('ref*.png')` 一把清，
+兼容新旧两种命名。`REF_CACHE_MAX` 按**任务数**封顶（多图时单任务占多张，仍算 1 个任务）。

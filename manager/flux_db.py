@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     model        TEXT,             -- 指定模型 id（如 FLUX.2-klein-4B）；可空 = 用 GPU 当前已加载的模型（2026-09-21）
     edit_mode    INTEGER NOT NULL DEFAULT 0,  -- 1 = 图生图（走 resident /edit，需带参考图）
     has_ref      INTEGER NOT NULL DEFAULT 0,  -- 1 = 该任务带了参考图（参考图本体只存 GPU 机，不入库）
+    ref_count    INTEGER NOT NULL DEFAULT 0,  -- 参考图**张数**（2026-09-29）。见下方迁移注释
     image_path   TEXT,
     error        TEXT,
     server       TEXT,              -- 任务执行所在 flux 服务器名 (flux1/flux2/...)；多服务器调度
@@ -194,6 +195,21 @@ class FluxDB:
                 if col not in jcols:
                     self._conn.execute(ddl)
                     logger.info(f'🗄️  jobs 表已加 {col} 列（图生图标记）')
+            # 参考图**张数**（2026-09-29）：必须持久化，理由与 edit_mode 完全相同 ——
+            # worker 是异步的，且重启后恢复孤儿任务时只能读 DB。
+            #
+            # ★ 为什么必须单独一列、不能拿"磁盘上 ref_*.png 的个数"顶替：
+            #   落盘是**尽力而为**（`_put_ref` 里 try/except 吞异常，失败只 warning），
+            #   一旦落盘失败或磁盘被清，张数就变成 0/1 而任务其实是多图 ——
+            #   而选机能力过滤**正是按张数判"要不要 multi_ref 机器"**，
+            #   判错就会把多图任务派给只有单图能力的机器，用户在 GPU 上白等一轮
+            #   才拿到「当前模型不支持多张参考图」。
+            #   同样地，也不能用 len(内存 ref_images)：重启后内存必然为空。
+            #   ⇒ 张数必须和 edit_mode 一样，在**提交那一刻**落库。
+            if 'ref_count' not in jcols:
+                self._conn.execute(
+                    'ALTER TABLE jobs ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0')
+                logger.info('🗄️  jobs 表已加 ref_count 列（参考图张数，选机能力过滤用）')
             # 用户删除任务（2026-09-21）：墓碑列。
             # 为什么不直接 DELETE 行 —— worker 是异步的，可能正持有这个 job_id 跑在 GPU 上。
             # 直接删行会让三件事失控：① worker 完成后 UPDATE 落到不存在的行（无害但看不出问题）；
@@ -415,13 +431,15 @@ class FluxDB:
     # ── jobs ──
     def job_insert(self, job_id, user_id, prompt, priority=0, original_prompt=None,
                    width=None, height=None, seed=None, steps=None, negative_prompt=None,
-                   edit_mode=0, has_ref=0, model=None):
+                   edit_mode=0, has_ref=0, ref_count=0, model=None):
         self._exec('INSERT INTO jobs(job_id, user_id, prompt, original_prompt, status, priority, '
-                   'width, height, seed, steps, negative_prompt, edit_mode, has_ref, model, created_at) '
-                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   'width, height, seed, steps, negative_prompt, edit_mode, has_ref, ref_count, '
+                   'model, created_at) '
+                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                    (job_id, user_id, prompt, original_prompt, 'queued', priority,
                     width, height, seed, steps, negative_prompt,
-                    1 if edit_mode else 0, 1 if has_ref else 0, model, int(time.time())))
+                    1 if edit_mode else 0, 1 if has_ref else 0, int(ref_count or 0),
+                    model, int(time.time())))
 
     def job_update(self, job_id, **fields):
         sets = ', '.join(f'{k}=?' for k in fields)

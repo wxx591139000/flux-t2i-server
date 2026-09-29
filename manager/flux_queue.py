@@ -148,14 +148,16 @@ class FluxQueueScheduler:
     # ── 提交（入口）──
     def submit(self, user_id: str, prompt: str, priority: int = 0,
                width=None, height=None, seed=None, steps=None, negative_prompt=None,
-               ref_image: str = None, model: str = None) -> dict:
+               ref_image: str = None, ref_images: list = None, model: str = None) -> dict:
         """提交一个生成任务。成功返回 job dict，失败返回 {error: reason}。
 
         width/height/seed/steps/negative_prompt 为可选生图参数，透传到底层常驻服务
         （legacy 链路固定尺寸，这些仅 resident 模式生效）。
 
-        `ref_image` = base64 参考图（可带 `data:image/...;base64,` 前缀）。
-        传了它 = 图生图（走 resident `POST /edit`）；不传 = 文生图。
+        `ref_image` / `ref_images` = base64 参考图（可带 `data:image/...;base64,` 前缀）。
+        · `ref_images`（list）优先 —— 多图（Qwen 最多 10 张）
+        · `ref_image`（str）向后兼容 —— 单张（klein 与所有老调用方）
+        传了任一 = 图生图（走 resident `POST /edit`）；都不传 = 文生图。
 
         `model` = 模型 id（如 `FLUX.2-klein-4B`），2026-09-21 新增。
         可空 = 用 GPU 上当前已加载的模型。**不在这里校验合法性** ——
@@ -165,6 +167,13 @@ class FluxQueueScheduler:
         prompt = (prompt or '').strip()
         if not prompt:
             return {'error': '提示词不能为空'}
+
+        # 归一化参考图为 list（多图优先，单图回退），供下游统一处理。
+        # 去空、去 None；两者都没有 = 文生图。
+        if ref_images is None:
+            ref_images = [ref_image] if (ref_image and str(ref_image).strip()) else []
+        else:
+            ref_images = [str(x).strip() for x in ref_images if x and str(x).strip()]
 
         # 0. 提示词处理：**只有中文才走翻译层；英文原样直传，一个字符都不改**。
         #
@@ -210,7 +219,7 @@ class FluxQueueScheduler:
             #    中文必须传 original_prompt —— 翻译结果会漂移，见 _dedup_key。
             key = _dedup_key(user_id, prompt, seed, width, height,
                              original_prompt=original_prompt,
-                             edit_mode=1 if ref_image else 0)
+                             edit_mode=1 if ref_images else 0)
             if key in self._inflight:
                 return {'error': '相同提示词与参数正在排队/生成中，请勿重复提交'}
             # 2. 配额
@@ -224,10 +233,11 @@ class FluxQueueScheduler:
             # 原先用毫秒时间戳当主键：同毫秒两次并发提交会 INSERT 冲突/互相覆盖。
             # 改 uuid4 前 16 位（32bit 十六进制 ≈ 64bit 熵），冲突概率可忽略。
             job_id = uuid.uuid4().hex[:16]
-            is_edit = bool(ref_image)
+            is_edit = bool(ref_images)
             self.db.job_insert(job_id, user_id, prompt, priority, original_prompt,
                                width, height, seed, steps, negative_prompt,
                                edit_mode=1 if is_edit else 0, has_ref=1 if is_edit else 0,
+                               ref_count=len(ref_images),
                                model=model)
             self.db.usage_add(user_id, current_ym(), 1)  # 入队即计费
             self._inflight.add(key)
@@ -237,13 +247,18 @@ class FluxQueueScheduler:
         # 放在锁外：既避开非可重入锁的自死锁，也避免这段（可能淘汰、可能抛异常）的逻辑
         # 在锁内把整把 _submit_lock 拖住 —— 那会让**所有**后续提交一起挂死。
         if is_edit:
-            self._put_ref(job_id, ref_image)
-        logger.info(f'📥 {user_id} 入队 {job_id}{"[edit]" if ref_image else ""}: {prompt[:40]}')
+            self._put_ref(job_id, ref_images)
+        logger.info(f'📥 {user_id} 入队 {job_id}{"[edit]" if ref_images else ""}: {prompt[:40]}')
         return {'job_id': job_id, 'status': 'queued'}
 
     # ── 参考图暂存（内存，不入库）──
-    def _put_ref(self, job_id: str, ref_image: str):
-        """登记待用参考图，并按 FIFO 淘汰，防止内存被拖爆。
+    def _put_ref(self, job_id: str, ref_images):
+        """登记待用参考图（list 或单张 str），并按 FIFO 淘汰，防止内存被拖爆。
+
+        入参两种形态（向后兼容）：
+          · list[str] —— 多图（Qwen，2026-09-28 新增）
+          · str       —— 单张（老调用方，如 tests/test_manager_edit_offline.py 的 M8）
+        入口处统一归一成 list 再处理，下游不再区分。
 
         ⚠️ **绝不能在 `_submit_lock` 内被调用**。这里曾经写成
         `with self._submit_lock:` —— 而 `submit` 已经持有同一把**非可重入**锁
@@ -254,58 +269,94 @@ class FluxQueueScheduler:
 
         上限 N 是按「单张 base64 ≤ 8 MiB（上游 MAX_REF_BYTES）+ 本站 6 MiB 上限」算的
         粗口径：N 张 × 6 MiB ≈ N×6 MiB 内存占用，N 取 32 时约 190 MiB 上限。
+        多图时每张同样 ≤ 6 MiB，总占用 = 张数 × 单张，仍由 REF_CACHE_MAX 按「任务数」封顶。
         超出说明「提交了但 worker 还没跑到」的积压过多 —— 宁可丢最老的（让那个任务
         明确失败，用户重提），也不能让 web 进程 OOM。
         """
+        if isinstance(ref_images, str):
+            ref_images = [ref_images]             # 单张 str → 单元素 list（向后兼容）
+        else:
+            ref_images = [str(x).strip() for x in ref_images if x and str(x).strip()]
+        if not ref_images:
+            return
         with self._ref_lock:
             self._order.append(job_id)
-            self._refs[job_id] = ref_image
+            self._refs[job_id] = list(ref_images)
             while len(self._order) > REF_CACHE_MAX:
                 old = self._order.popleft()
                 if old != job_id:
                     self._refs.pop(old, None)
         # 落盘（2026-09-20 补）：只放内存时，manager 一重启 → 所有在途编辑任务必失败
         # 「参考图已失效，请重新提交图生图任务」；FIFO 淘汰也会静默吃掉参考图。
-        # 现在同时写一份到 web_out/<job_id>/ref.png：内存快路径仍在，
-        # 重启 / 被淘汰后从磁盘读回，编辑任务不会因为 infra 抖动白扣一张配额。
+        # 现在同时写一份到 web_out/<job_id>/：单张写 ref.png（保持 M8/M9 旧契约），
+        # 多张写 ref_0.png / ref_1.png ...。重启 / 被淘汰后从磁盘读回。
         try:
-            raw = base64.b64decode(_strip_data_uri(ref_image))
-            p = self._ref_dir(job_id)
-            # ⚠️ 必须 mkdir：WEB_OUT/<job_id>/ 此时**还不存在**（目录是生成阶段才建的）。
-            # 少了这一行就是 FileNotFoundError，被下面 except 吞成一条 warning ——
-            # 于是「重启不丢参考图」的承诺**从来没真正兑现过**（2026-09-20 查卡死任务
-            # ceff1b2c 时才发现：web_out/ceff1b2c116b4c95/ 整个目录都不存在）。
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(raw)
+            if len(ref_images) == 1:
+                p = self._ref_dir(job_id)             # 单张 → ref.png（旧契约）
+                raw = base64.b64decode(_strip_data_uri(ref_images[0]))
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(raw)
+            else:
+                for i, one in enumerate(ref_images):  # 多张 → ref_0.png / ref_1.png ...
+                    raw = base64.b64decode(_strip_data_uri(one))
+                    p = WEB_OUT / job_id / f'ref_{i}.png'
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(raw)
         except Exception as e:                       # noqa: BLE001 落盘失败不该阻断提交
             logger.warning(f'参考图落盘失败（仅内存可用，重启后会失效）: '
                            f'{type(e).__name__}: {e}')
 
     # 参考图：路径 / 取用 / 清理
     def _ref_dir(self, job_id: str) -> Path:
+        """单张参考图磁盘路径（旧契约 ref.png，M8/M9 依赖）。多图不用它，直接拼 ref_<i>.png。"""
         return WEB_OUT / job_id / 'ref.png'
 
     def _get_ref(self, job_id: str):
-        """取参考图 base64：内存优先；没有则从磁盘读回（重启 / FIFO 淘汰后仍可用）。"""
+        """取参考图：内存优先；没有则从磁盘读回（重启 / FIFO 淘汰后仍可用）。
+
+        返回：
+          · str       —— 单张（向后兼容，老调用方 / M8 测试直接 b64decode）
+          · list[str] —— 多张
+          · []        —— 无参考图
+        单张恒返回 str（不是 [str]），多张才返回 list —— 这是与旧调用方的契约。
+        """
         with self._ref_lock:
-            b64 = self._refs.pop(job_id, None)
-        if b64:
-            return b64
-        f = self._ref_dir(job_id)
+            cached = self._refs.pop(job_id, None)
+        if cached is not None:
+            if isinstance(cached, list):
+                return cached if len(cached) != 1 else cached[0]
+            return cached                     # 老进程遗留：单字符串 → 直接返回
+        # 磁盘读回：ref_0.png / ref_1.png ...（多图），并兼容老任务的 ref.png。
+        base = WEB_OUT / job_id
+        out = []
         try:
-            if f.exists():
-                return base64.b64encode(f.read_bytes()).decode('ascii')
-        except Exception as e:                       # noqa: BLE001
+            if not base.exists():
+                return []
+            # 多图：ref_<i>.png（i=0,1,2...）
+            for f in sorted(base.glob('ref_*.png')):
+                try:
+                    out.append(base64.b64encode(f.read_bytes()).decode('ascii'))
+                except Exception:              # noqa: BLE001
+                    logger.warning(f'读取磁盘参考图失败: {f.name}')
+            if out:
+                return out if len(out) != 1 else out[0]
+            # 旧兼容：老任务单图 ref.png
+            legacy = base / 'ref.png'
+            if legacy.exists():
+                return base64.b64encode(legacy.read_bytes()).decode('ascii')
+        except Exception as e:                 # noqa: BLE001
             logger.warning(f'读取磁盘参考图失败: {type(e).__name__}: {e}')
-        return None
+        return []
 
     def _drop_ref(self, job_id: str):
-        """终态清理：内存 + 磁盘各删一份，避免 ref.png 无限堆积。"""
+        """终态清理：内存 + 磁盘各删一份，避免 ref_*.png 无限堆积。"""
         with self._ref_lock:
             self._refs.pop(job_id, None)
         try:
-            self._ref_dir(job_id).unlink(missing_ok=True)
-        except Exception:                            # noqa: BLE001
+            base = WEB_OUT / job_id
+            for f in base.glob('ref*.png'):      # ref.png + ref_0.png + ref_1.png ...
+                f.unlink(missing_ok=True)
+        except Exception:                        # noqa: BLE001
             pass
 
     def drop_job(self, job_id: str, job: dict = None):
@@ -560,14 +611,38 @@ class FluxQueueScheduler:
             _want_model = job['model'] if 'model' in job.keys() else None
             # need_edit：图生图只有装了 klein 的机器能跑（dev 的 FluxPipeline 没有 image 参数），
             # 让选机阶段就避开不支持的机器，而不是等 GPU 上跑一遍才报错。
-            server, p = fr.find_available_server(need_edit=is_edit,
-                                                 need_model=_want_model or None)
+            #
+            # ★ need_caps 多图闸（2026-09-29）：**张数 > 1 时额外要求 multi_ref**。
+            #   为什么 need_edit 不够：edit=True 只说明"接受参考图"，不说明"接受多张"。
+            #   实测画像 —— klein: edit=True / multi_ref=False / max_ref_images=1；
+            #   Qwen: edit=True / multi_ref=True / max_ref_images=10。
+            #   只按 need_edit 过滤 → 穿搭任务（模特+单品）会被派给 klein 机 →
+            #   GPU 侧 `len(ref_paths) > 1 and not caps.get('multi_ref')` 硬闸拒绝 →
+            #   用户排队 + SSH + 冷启动全白费，最后只拿到一句「不支持多张参考图」。
+            #   代价不对称：多要一个能力最多是"少几台候选机"（真没有就明确报错），
+            #   少要则是"每次穿搭都白跑一轮"。
+            #
+            #   判据用 DB 的 ref_count 而不是 len(ref_b64)：ref_b64 要等下面才取，
+            #   而且重启恢复时它靠磁盘、可能不足（落盘是尽力而为）。
+            #   张数在提交那一刻就落库了，是这条判断唯一可靠、可在选机前读到的来源。
+            _ref_count = job['ref_count'] if 'ref_count' in job.keys() else 0
+            _multi_ref = is_edit and int(_ref_count or 0) > 1
+            server, p = fr.find_available_server(
+                need_edit=is_edit,
+                need_model=_want_model or None,
+                need_caps={'multi_ref': True} if _multi_ref else None)
             if not server:
                 # 区分「机器都关机」与「机器在、但没装这个模型」——
                 # 前者等机器回来就行，后者必须让用户换模型，等多久都没用。
                 if _want_model:
                     return False, (f'没有可用的 flux 服务器能跑模型「{_want_model}」'
                                    f'（候选机都没装它，或机器均关机）')
+                if _multi_ref:
+                    # 多图专属文案：别让用户以为"多试几次就好"，这是能力缺失。
+                    return False, (
+                        f'没有支持多张参考图的机器（本任务带 {_ref_count} 张）。'
+                        f'多图需要 Qwen-Image-2.1，请确认对应 GPU 机已开机；'
+                        f'或改为只传 1 张参考图重试。')
                 return False, '[SERVER_DOWN] 无可用 flux 服务器（均关机 / SSH 不通）'
 
             r = fr.ensure_resident(server, p)          # 幂等：在跑则直接返回
@@ -580,7 +655,7 @@ class FluxQueueScheduler:
                 # 参考图只存在于「提交那一刻」的内存里（不入库，见 flux_db 的 edit_mode 注释）。
                 # 进程重启后孤儿任务恢复会走到这里且 ref_b64 为 None → **明确失败**，
                 # 绝不静默降级成文生图：那会照常出图、照常扣费，但完全不是用户要的东西。
-                ref_b64 = self._get_ref(job_id)
+                ref_b64 = self._get_ref(job_id)     # list[str]，可能多张
                 if not ref_b64:
                     return False, ('参考图已失效（内存与磁盘均无留存），'
                                    '请重新提交图生图任务')
@@ -592,7 +667,7 @@ class FluxQueueScheduler:
                 if v not in (None, ''):
                     gen_kwargs[k] = v
             st = fr.generate_via_resident(server, job['prompt'], dest,
-                                          ref_image_b64=ref_b64, **gen_kwargs)
+                                          ref_images=ref_b64, **gen_kwargs)
             seed_out = st.get('seed')
             self.db.job_update(job_id, image_path=str(dest), server=server['name'], seed=seed_out)
             logger.info(f'🗄️  任务 {job_id} 由 {server["name"]} 常驻服务完成'

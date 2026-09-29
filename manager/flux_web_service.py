@@ -335,21 +335,25 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(result)
 
     def _api_edit(self, token, body):
-        """图生图提交（2026-09-18 新增）。
+        """图生图提交（2026-09-18 新增，2026-09-28 支持多图）。
 
-        与 `/api/submit` 唯一的差别 = body 多一个 `image`（base64 参考图）。
+        与 `/api/submit` 唯一的差别 = body 多一张或多张参考图：
+          · `image`  : str         —— 单张（klein 与所有老调用方）
+          · `images` : list[str]   —— 多张（Qwen 最多 10 张）
         参数解析、翻译、计费、配额、队列全部复用 `scheduler.submit`，本条只负责
         「把参考图取出来 + 把参数异常翻译成 400」。
 
-        ⚠️ 缺 `image` 时**明确 400 拒绝，不静默降级成文生图** —— 那会照常出图、
+        ⚠️ 两张都缺时**明确 400 拒绝，不静默降级成文生图** —— 那会照常出图、
         照常扣费，但完全不是用户要的东西，是最难被发现的一类错误。
         """
         data = json.loads(body or '{}')
         prompt = data.get('prompt', '')
         priority = int(data.get('priority', 0) or 0)
-        ref_image = (data.get('image') or '').strip()
-        if not ref_image:
-            self._json({'error': '缺少参考图（image 字段，base64 或 data URL）'}, 400)
+
+        # 多图：`images`（list）优先；没有则回退单张 `image`（向后兼容老调用方）。
+        ref_images = self._extract_ref_images(data)
+        if not ref_images:
+            self._json({'error': '缺少参考图（image 单张或 images 列表，base64 或 data URL）'}, 400)
             return
 
         def _pint(name):
@@ -383,8 +387,26 @@ class _Handler(BaseHTTPRequestHandler):
         self._resolve_user(token)
         result = self.scheduler.submit(token, prompt, priority,
                                        width, height, seed, steps, negative_prompt,
-                                       ref_image=ref_image, model=model)
+                                       ref_images=ref_images, model=model)
         self._json(result)
+
+    @staticmethod
+    def _extract_ref_images(data: dict) -> list:
+        """从 /edit body 里抽出参考图列表（2026-09-28 支持多图）。
+
+        `images`（list）优先，回退单张 `image`（str）。两者都没有 → 空 list。
+        只做「取出来 + 去空 + 转 str」，不在这里校验体积/格式 —— 那些交给下游
+        （resident 的 _save_ref_images 有 PIL 校验 + 体积卡口，口径不能两处漂移）。
+        """
+        raw_list = data.get('images')
+        refs = []
+        if isinstance(raw_list, list):
+            refs = [str(x).strip() for x in raw_list if x and str(x).strip()]
+        if not refs:
+            single = data.get('image')
+            if single and str(single).strip():
+                refs = [str(single).strip()]
+        return refs
 
     def _api_models(self):
         """透传 GPU 侧的可选模型清单（站点「选择模型」下拉的数据源）。
@@ -436,10 +458,24 @@ class _Handler(BaseHTTPRequestHandler):
         # 只给站点它真正需要的东西：id / name / 就绪 / 能否图生图都够了。
         # **不外传 path**：那是 GPU 机的绝对路径，对前端毫无用处，
         # 且属于内部拓扑信息。
+        #
+        # ★ 2026-09-29：补回 supports_edit + capabilities。
+        #   原先 slim 只留 5 个字段，把 GPU 侧明明给了的 supports_edit /
+        #   capabilities **过滤掉了** → 站点的 ModelInfo.supports_edit 恒为
+        #   undefined（注释里写的"上游版本较旧没这个字段"其实一直成立，
+        #   但原因不是版本旧，是**中间层把它丢了**）。
+        #   为什么现在必须补：穿搭场景（多产品穿到模特身上）要靠
+        #   capabilities.multi_ref 判断当前模型能不能真多图，
+        #   拿不到就只能退回"猜"，而那正是这条链路要避免的。
+        #   path 仍然不外传（内部拓扑），capabilities 是能力声明、无拓扑信息。
         slim = [{'id': m.get('id'), 'name': m.get('name') or m.get('id'),
                  'ready': bool(m.get('ready')),
                  'class_name': m.get('class_name'),
-                 'size_gb': m.get('size_gb')}
+                 'size_gb': m.get('size_gb'),
+                 # 缺失时给 None 而不是 False —— 「不知道」与「不支持」必须可分，
+                 # 前者前端应放行交给上游硬闸，后者才该置灰（与站点注释同口径）。
+                 'supports_edit': m.get('supports_edit'),
+                 'capabilities': m.get('capabilities')}
                 for m in models if m.get('id')]
         self._json({
             'models': slim,

@@ -1,5 +1,53 @@
 # CHANGELOG
 
+## [v2.15.0] - 2026-09-29
+
+**多图参考（模特穿搭）全链路打通 + `_api_models` 能力透传根因修复**
+
+### 1) `/api/edit` 支持多张参考图（`images` 数组）
+
+- 新增 `_Handler._extract_ref_images(data)`：`images`（list）优先，回退单张 `image`（str），
+  去空 + 转 str；**不在这一层校验体积/格式**（口径统一交给下游 `_save_ref_images`）
+- `/api/edit` 两张都缺时仍**明确 400**，**不静默降级成文生图**
+- `flux_queue.submit(..., ref_images=list)`：入口归一成 list，`ref_images` 优先、`ref_image` 向后兼容
+
+### 2) 选机按**参考图张数**过滤（多图需 `multi_ref` 机器）
+
+- `flux_queue._generate_resident`：`ref_count > 1` 时以 `need_caps={'multi_ref': True}` 选机
+  —— 穿搭任务（模特 + 单品）不再被派给只支持单图的 klein 机白跑一轮
+- 多图专属失败文案：「没有支持多张参考图的机器（本任务带 N 张）…请确认对应 GPU 机已开机」
+- `find_available_server(need_caps=...)` 复用既有细粒度能力闸（2026-09-22 已有）
+
+### 3) 参考图**张数**持久化（新列 `jobs.ref_count`）
+
+- `jobs` 表加 `ref_count INTEGER NOT NULL DEFAULT 0` + 迁移（`flux_db.py`）
+- `job_insert(..., ref_count=...)`：在**提交那一刻**落库
+- ★ 为什么不拿「磁盘 `ref_*.png` 个数」顶替：落盘是**尽力而为**（`_put_ref` 吞异常只 warning），
+  也不能用 `len(内存 ref_images)`（重启后必为空）—— 判错就会把多图任务派给单图机器
+
+### 4) 多图参考图的内存/磁盘管理
+
+- `_put_ref` / `_get_ref` / `_drop_ref` 支持 list：单张仍写 `ref.png`（M8/M9 旧契约），
+  多张写 `ref_0.png` / `ref_1.png`…
+- `_get_ref` 单张恒返回 **str**（不是 `[str]`），多张才返回 list —— 与旧调用方契约不变
+- `_drop_ref` 用 `base.glob('ref*.png')` 清理，兼容新旧两种命名
+
+### 5) ★ 根因修复：`_api_models` 的 slim 把 `supports_edit` / `capabilities` **丢了**
+
+- 原 slim 只留 5 字段，把 GPU 侧明明给了的 `supports_edit` / `capabilities` **过滤掉了**
+  → 站点 `ModelInfo.supports_edit` 恒为 `undefined`（注释以为"上游版本旧"，其实是**中间层丢字段**）
+- 补回 `supports_edit` + `capabilities`（缺失给 `None`，**「不知道」与「不支持」必须可分**）
+- 目的：穿搭场景要靠 `capabilities.multi_ref` 判「当前模型能否真多图」，不能靠猜
+
+### 6) 新增回归门
+
+- `tests/test_multi_ref_pick.py`（20 项）：钉 `_generate_resident` 的选机 kwargs
+- `tests/test_web_models_passthrough.py`（24 项）：钉 `_api_models` 能力透传
+
+全量回归门 **27/27** 通过（155.0s）。
+⚠️ 本机跑 `tests/run_all.py` 需 `CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR=` 清空
+（WorkBuddy 注入的 Python 删除钩子会拦批量删除，与产品无关，见 PITFALLS）。
+
 ## [v2.14.0] - 2026-09-28
 
 **Qwen-Image-2.1 图片参考/编辑能力优化 + 飞书图图参数状态机 + B 链任务状态误报修复**

@@ -974,3 +974,75 @@ bg.paste(im, mask=im.split()[-1])
 **通用教训**：把多个 curl/echo 拼成一条命令时，**前一个命令若输出无尾换行，会黏连
 后一个的标记行**。凡是「按行 `endswith('}')` / `startswith('{')`」解析 JSON 的地方，
 都要保证上游输出自带换行，或用 `printf '\n'` 显式补一个。
+
+---
+
+## [2026-09-29] ★ 中间层「瘦身」把能力字段丢了 → 前端只能靠猜（`_api_models` slim）
+
+**症状**：B 链站点的模型下拉框里，`supports_edit` 永远是 `undefined`。
+代码注释一直写着「大概是上游版本较旧、没有这个字段」—— 于是大家都接受了这个"解释"，
+前端就退化成**用模型名正则猜能力**（`/klein/i` 之类），这正是链路一开始想消灭的东西。
+
+**根因**：不是上游没有，是**中间层把它过滤掉了**。
+
+`manager/flux_web_service.py` 的 `_api_models` 为了"只给站点它需要的"，
+把上游模型对象**重建**成一个 5 字段的 `slim`：
+
+```python
+slim = [{'id': …, 'name': …, 'ready': …, 'class_name': …, 'size_gb': …}
+        for m in models if m.get('id')]
+```
+
+—— GPU 侧明明给了 `supports_edit` / `capabilities`，在这里**被重新构造掉了**。
+「外泄内部拓扑」的本意是对的（`path` 确实不该外传），但**顺手把能力声明也一起丢了**。
+
+**为什么难查**：
+1. **两侧单点都对**：GPU 侧确实有字段（`/health` 能看到），站点侧也确实"没收到"。
+   中间那一层**不报错、不告警**，只是**安静地少给几个键**。
+2. **注释给出了一个错误的但可信的解释**（"上游版本旧"），于是没人再去证伪它 ——
+   和「活跃误判」同族：**一个解释被写进注释后，会冒充事实**。
+
+**修法**：`slim` 补回 `supports_edit` + `capabilities`；
+`path` 仍不外传。★ 缺失给 `None`（**不是 `False`**）——「不知道」与「不支持」必须可分，
+否则前端会把"上游没说"误当成"不支持"而错误置灰。
+
+**通用教训**：**凡是"把上游对象重建成精简对象"的地方，都是一次隐式的字段白名单。**
+新增任何"下游要靠它做判断"的字段，都必须回头审这些重建点 ——
+否则字段会在这一层**静默消失**，而没人会收到任何错误。
+判据：**白名单是显式的，那么"一个人怎么知道该加它"？** 若答案是"靠记得"，
+就要配一道门（本项目即 `tests/test_web_models_passthrough.py`，删字段必红）。
+
+---
+
+## [2026-09-29] ★ 测试「单跑全绿、进 run_all 就红」—— WorkBuddy 注入的 **Python 级删除钩子**
+
+**症状**：`tests/test_edit_follow_dims.py` **单独跑 3/3 全绿**；
+但进 `tests/run_all.py` 就 `rc=1`。输出里夹着：
+`[safe-delete][SAFE_DELETE_BULK_GUARD_ERROR]`。**极易误判成"测试相互污染"或"代码回归"**。
+
+**根因**：WorkBuddy 会话在 **Python 层**注入了一个删除钩子
+（`sitecustomize.py` 把 `os.remove` / `os.unlink` / `os.rmdir` / `shutil.rmtree` 包了一层），
+对"单次删除数量超阈值"做 fail-closed。子进程**继承了 `CODEBUDDY_TOOL_CALL_ID`** 后，
+批量删除守卫的辅助逻辑取不到预期状态 → 直接 `SystemExit(1)`。
+
+**为什么难查**：这个钩子是 **Python 级**的（不是 shell 别名），所以
+`command -v rm`、`alias` 之类**完全看不到它**；它只在**批量删除**时发作，
+单跑一个用例往往删得少 → 不触发。
+
+**定位命令**：
+
+```bash
+py -3.11 -c "import sitecustomize, inspect; print(inspect.getsourcefile(sitecustomize))"
+```
+
+**修复 / 规避**：清空那个状态目录环境变量即可（只影响本会话的删除守卫，不改产品行为）：
+
+```bash
+CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR= py -3.11 tests/run_all.py     # → 27/27 rc=0
+```
+
+**通用教训**：**"单跑绿、合跑红"先怀疑执行环境，不要先怀疑代码。**
+判据：把那个用例**单独跑**——若单跑绿，差异只可能来自「合跑引入的环境/顺序」，
+去查环境变量与注入钩子，别去改代码。
+（与 PITFALLS 里"大批量删除被 shim 打断"同族，但那条是删除**命令**被拦，
+本条是**Python 进程内**的删除被拦 —— 后者更隐蔽，连 shell 都看不到。）

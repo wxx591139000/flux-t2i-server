@@ -69,6 +69,7 @@ _JOBS_DDL = """CREATE TABLE jobs (
     priority INTEGER DEFAULT 0, width INTEGER, height INTEGER, seed INTEGER,
     steps INTEGER, negative_prompt TEXT, model TEXT, status TEXT DEFAULT 'queued',
     edit_mode INTEGER NOT NULL DEFAULT 0, has_ref INTEGER NOT NULL DEFAULT 0,
+    ref_count INTEGER NOT NULL DEFAULT 0,
     error TEXT, image_path TEXT, server TEXT, created_at INTEGER,
     completed_at INTEGER, refunded_at INTEGER, deleted_at INTEGER)"""
 
@@ -101,14 +102,14 @@ class StubDB:
     # submit() 要用到（签名与真实 FluxDB.job_insert 一致）
     def job_insert(self, job_id, user_id, prompt, priority, original_prompt=None,
                    width=None, height=None, seed=None, steps=None, negative_prompt=None,
-                   edit_mode=0, has_ref=0, model=None):
+                   edit_mode=0, has_ref=0, ref_count=0, model=None):
         with self._lock:
             self._c.execute(
                 'INSERT INTO jobs (job_id,user_id,prompt,original_prompt,priority,'
-                'width,height,seed,steps,negative_prompt,edit_mode,has_ref,model,status) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                'width,height,seed,steps,negative_prompt,edit_mode,has_ref,ref_count,model,status) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (job_id, user_id, prompt, original_prompt, priority, width, height,
-                 seed, steps, negative_prompt, edit_mode, has_ref, model, 'queued'))
+                 seed, steps, negative_prompt, edit_mode, has_ref, ref_count, model, 'queued'))
             self._c.commit()
 
     # ── 与真实 FluxDB 对齐的读 ──

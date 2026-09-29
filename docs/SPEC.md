@@ -305,3 +305,51 @@ allowed = [c for c in cands
 3. 非商用机器在自动选机里出局；缺字段机器保留；全非商用返回 `None`；
 4. **放行分支在源码里 + 放行对自动选机生效 + 放行必须配 `expose_note`**（不许悄悄放开）；
 5. **变异测试**：拆掉闸 / 判据改成真值判断 / 删掉放行分支 —— 三种变异都必须让门变红。
+
+## 增量（2026-09-29）：多图参考与能力透传（v2.15.0）
+
+**新增能力**：`/api/edit` 接受**多张**参考图（`images` 数组），支撑 B 链「模特穿搭」
+（模特 + 多件单品，逐张交给模型，而不是拼成一板）。
+
+### 接口形态（两形态并存，`images` 优先）
+
+| 字段 | 类型 | 谁用 | 语义 |
+|---|---|---|---|
+| `images` | `list[str]` | Qwen（≤10 张） | **多图**（2026-09-29 新增） |
+| `image` | `str` | klein / 所有老调用方 | **单张**（向后兼容，不变） |
+
+两张都缺 → **明确 400**，**绝不静默降级成文生图**（那会照常出图、照常扣费，
+但完全不是用户要的东西 —— 本项目已明确禁止这类「静默降级」）。
+
+### 三条约束（进 SPEC 是因为它们约束了链路设计）
+
+1. **张数必须持久化（`jobs.ref_count`），且在提交那一刻落库。**
+   选机要按张数判「要不要 `multi_ref` 机器」，而这个判断发生在**取到参考图之前**；
+   能用的来源只有 DB（磁盘落盘是尽力而为、内存重启后必空）。
+2. **选机按能力过滤，不按 `edit` 布尔**。
+   `edit=True` 只说明"接受参考图"，不说明"接受多张"。
+   实测画像：klein `{edit:true, multi_ref:false, max_ref:1}`／Qwen `{edit:true, multi_ref:true, max_ref:10}`。
+   `ref_count > 1` ⇒ `find_available_server(need_caps={'multi_ref': True})`。
+   ★ 代价不对称：多要一个能力最多"少几台候选机"（没有就明确报错）；
+   少要则是"**每次穿搭都白跑一轮**"（用户排队+SSH+冷启动全白费，最后只得到一句"不支持多张"）。
+3. **能力字段必须透传到站点，且「不知道」与「不支持」可分。**
+   `/api/models` 的 `slim` 必须带 `supports_edit` / `capabilities`，
+   **缺失给 `None`**（不是 `False`）；前端口径 `=== false` 才禁用，`undefined` 放行给上游硬闸。
+   `path`（GPU 绝对路径）**不外传**（内部拓扑）。
+
+### 单张 vs 多张的存储契约（**不许改**）
+
+| | 内存 | 磁盘 | `_get_ref` 返回 |
+|---|---|---|---|
+| 单张 | `_refs[job] = [s]` | `ref.png` | **`str`**（不是 `[str]`） |
+| 多张 | `_refs[job] = [s1, s2, …]` | `ref_0.png` / `ref_1.png` … | `list[str]` |
+
+★ 单张**恒返回 str** 是既有契约（`M8/M9` 测试直接 `b64decode`），改它会静默打断老调用方。
+
+### 回归门
+
+- `tests/test_multi_ref_pick.py`（20 项）：钉 `_generate_resident` 的选机 kwargs
+  —— 多图必须带 `multi_ref`、单图不得带；张数来源必须是 DB 的 `ref_count`。
+- `tests/test_web_models_passthrough.py`（24 项）：钉 `_api_models` 透传
+  —— `supports_edit` / `capabilities` 必须在、缺失给 `None`、`path` 不许外传；
+  含"删字段让门变红"的变异。
